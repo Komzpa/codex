@@ -103,6 +103,65 @@ impl CodexMessageProcessor {
             thread.prepare_external_goal_mutation().await;
         }
 
+        if let Some(objective) = objective
+            && running_thread.is_some()
+        {
+            if let Err(err) = self.thread_store.persist_thread(thread_id).await {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to materialize thread before setting goal: {err}"),
+                )
+                .await;
+                return;
+            }
+
+            let first_user_message = match state_db.get_thread(thread_id).await {
+                Ok(metadata) => metadata.and_then(|metadata| metadata.first_user_message),
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!("failed to read thread metadata before setting goal: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if first_user_message
+                .as_deref()
+                .is_none_or(|message| message.trim().is_empty())
+            {
+                let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: format!("/goal {objective}"),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                }));
+                if let Err(err) = self
+                    .thread_store
+                    .append_items(StoreAppendThreadItemsParams {
+                        thread_id,
+                        items: vec![item],
+                    })
+                    .await
+                {
+                    self.send_internal_error(
+                        request_id,
+                        format!("failed to seed goal-started thread preview: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(err) = self.thread_store.flush_thread(thread_id).await {
+                    self.send_internal_error(
+                        request_id,
+                        format!("failed to flush goal-started thread preview: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
         let goal = if let Some(objective) = objective {
             match state_db.get_thread_goal(thread_id).await {
                 Ok(goal) => {

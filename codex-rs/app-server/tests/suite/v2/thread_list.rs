@@ -3,6 +3,7 @@ use app_test_support::McpProcess;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_fake_rollout_with_source;
 use app_test_support::create_final_assistant_message_sse_response;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
@@ -15,6 +16,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadSortKey;
@@ -35,6 +37,7 @@ use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::FileTimes;
@@ -194,6 +197,80 @@ async fn thread_list_basic_empty() -> Result<()> {
     .await?;
     assert!(data.is_empty());
     assert_eq!(next_cursor, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_list_includes_thread_started_with_goal() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_runtime_config(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "[model_providers.mock_provider]",
+            "[features]\ngoals = true\n\n[model_providers.mock_provider]",
+        ),
+    )?;
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(
+        !thread.path.as_ref().expect("thread path").exists(),
+        "fresh thread should still be lazily materialized"
+    );
+
+    let objective = "improve benchmark coverage";
+    let goal_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id.clone(),
+                "objective": objective,
+                "status": "active",
+            })),
+        )
+        .await?;
+    let goal_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(goal_id)),
+    )
+    .await??;
+    let _: ThreadGoalSetResponse = to_response(goal_resp)?;
+
+    let ThreadListResponse { data, .. } = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        /*source_kinds*/ None,
+        /*archived*/ None,
+    )
+    .await?;
+
+    let listed = data
+        .iter()
+        .find(|candidate| candidate.id == thread.id)
+        .expect("goal-started thread should be listed for resume");
+    assert_eq!(listed.preview, format!("/goal {objective}"));
+    assert!(
+        listed.path.as_ref().expect("listed thread path").exists(),
+        "setting the first goal should materialize the rollout"
+    );
 
     Ok(())
 }
