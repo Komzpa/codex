@@ -50,7 +50,7 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
-            StatusSurfacePreviewItem::FastMode => "Fast on",
+            StatusSurfacePreviewItem::FastMode => "Tier Fast",
             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
             StatusSurfacePreviewItem::TaskProgress => "Tasks 0/0",

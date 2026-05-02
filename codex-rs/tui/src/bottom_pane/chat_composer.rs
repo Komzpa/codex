@@ -183,6 +183,8 @@ use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands;
 use super::slash_commands::BuiltinCommandFlags;
+use super::slash_commands::ServiceTierCommand;
+use super::slash_commands::SlashCommandAction;
 use crate::bottom_pane::paste_burst::FlushResult;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::key_hint::KeyBindingListExt;
@@ -262,13 +264,13 @@ pub enum InputResult {
     ///
     /// Callers that dispatch this variant are also responsible for resolving any pending local
     /// command-history entry that the composer staged before clearing the visible input.
-    Command(SlashCommand),
+    Command(SlashCommandAction),
     /// An inline slash command and its trimmed argument text.
     ///
     /// The `TextElement` ranges are rebased into the argument string, while any pending local
     /// command-history entry still represents the original command invocation that should be
     /// committed only if dispatch accepts it.
-    CommandWithArgs(SlashCommand, String, Vec<TextElement>),
+    CommandWithArgs(SlashCommandAction, String, Vec<TextElement>),
     None,
 }
 
@@ -387,6 +389,7 @@ pub(crate) struct ChatComposer {
     ide_context_active: bool,
     connectors_enabled: bool,
     plugins_command_enabled: bool,
+    service_tier_commands: Vec<ServiceTierCommand>,
     fast_command_enabled: bool,
     goal_command_enabled: bool,
     personality_command_enabled: bool,
@@ -568,6 +571,7 @@ impl ChatComposer {
             ide_context_active: false,
             connectors_enabled: false,
             plugins_command_enabled: false,
+            service_tier_commands: Vec::new(),
             fast_command_enabled: false,
             goal_command_enabled: false,
             personality_command_enabled: false,
@@ -640,6 +644,11 @@ impl ChatComposer {
 
     pub fn set_plugins_command_enabled(&mut self, enabled: bool) {
         self.plugins_command_enabled = enabled;
+    }
+
+    pub fn set_service_tier_commands(&mut self, commands: Vec<ServiceTierCommand>) {
+        self.service_tier_commands = commands;
+        self.sync_popups();
     }
 
     /// Toggle composer-side image paste handling.
@@ -1730,13 +1739,10 @@ impl ChatComposer {
                 // before applying completion.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 popup.on_composer_text_change(first_line.to_string());
-                let selected_cmd = popup.selected_item().map(|sel| {
-                    let CommandItem::Builtin(cmd) = sel;
-                    cmd
-                });
+                let selected_cmd = popup.selected_item();
                 if let Some(cmd) = selected_cmd {
-                    if cmd == SlashCommand::Skills {
-                        self.stage_selected_slash_command_history(cmd);
+                    if cmd.as_builtin() == Some(SlashCommand::Skills) {
+                        self.stage_selected_slash_command_history(&cmd);
                         self.textarea.set_text_clearing_elements("");
                         self.is_bash_mode = false;
                         return (InputResult::Command(cmd), true);
@@ -1768,11 +1774,7 @@ impl ChatComposer {
                 // while the slash-command popup is active.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 popup.on_composer_text_change(first_line.to_string());
-                let selected_cmd = popup.selected_item().map(|sel| {
-                    let CommandItem::Builtin(cmd) = sel;
-                    cmd
-                });
-                if let Some(cmd) = selected_cmd {
+                if let Some(cmd) = popup.selected_item() {
                     let starts_with_cmd = first_line
                         .trim_start()
                         .starts_with(&format!("/{}", cmd.command()));
@@ -1792,9 +1794,8 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                if let Some(sel) = popup.selected_item() {
-                    let CommandItem::Builtin(cmd) = sel;
-                    self.stage_selected_slash_command_history(cmd);
+                if let Some(cmd) = popup.selected_item() {
+                    self.stage_selected_slash_command_history(&cmd);
                     self.textarea.set_text_clearing_elements("");
                     self.is_bash_mode = false;
                     return (InputResult::Command(cmd), true);
@@ -2592,10 +2593,13 @@ impl ChatComposer {
         {
             let treat_as_plain_text = input_starts_with_space || name.contains('/');
             if !treat_as_plain_text {
-                let is_builtin =
-                    slash_commands::find_builtin_command(name, self.builtin_command_flags())
-                        .is_some();
-                if !is_builtin {
+                if slash_commands::find_command(
+                    name,
+                    self.builtin_command_flags(),
+                    &self.service_tier_commands,
+                )
+                .is_none()
+                {
                     let message = format!(
                         r#"Unrecognized command '/{name}'. Type "/" for a list of supported commands."#
                     );
@@ -2810,10 +2814,13 @@ impl ChatComposer {
         let first_line = self.textarea.text().lines().next().unwrap_or("");
         if let Some((name, rest, _rest_offset)) = parse_slash_name(first_line)
             && rest.is_empty()
-            && let Some(cmd) =
-                slash_commands::find_builtin_command(name, self.builtin_command_flags())
+            && let Some(cmd) = slash_commands::find_command(
+                name,
+                self.builtin_command_flags(),
+                &self.service_tier_commands,
+            )
         {
-            if self.reject_slash_command_if_unavailable(cmd) {
+            if self.reject_slash_command_if_unavailable(&cmd) {
                 self.stage_slash_command_history();
                 self.record_pending_slash_command_history();
                 return Some(InputResult::None);
@@ -2843,12 +2850,16 @@ impl ChatComposer {
             return None;
         }
 
-        let cmd = slash_commands::find_builtin_command(name, self.builtin_command_flags())?;
+        let cmd = slash_commands::find_command(
+            name,
+            self.builtin_command_flags(),
+            &self.service_tier_commands,
+        )?;
 
         if !cmd.supports_inline_args() {
             return None;
         }
-        if self.reject_slash_command_if_unavailable(cmd) {
+        if self.reject_slash_command_if_unavailable(&cmd) {
             self.stage_slash_command_history();
             self.record_pending_slash_command_history();
             return Some(InputResult::None);
@@ -2893,7 +2904,7 @@ impl ChatComposer {
         Some((trimmed_rest.to_string(), args_elements))
     }
 
-    fn reject_slash_command_if_unavailable(&self, cmd: SlashCommand) -> bool {
+    fn reject_slash_command_if_unavailable(&self, cmd: &SlashCommandAction) -> bool {
         if !self.is_task_running || cmd.available_during_task() {
             return false;
         }
@@ -2938,7 +2949,7 @@ impl ChatComposer {
     ///
     /// Popup filtering text can be partial, so recording the selected command avoids recalling
     /// `/di` after the user actually accepted `/diff`.
-    fn stage_selected_slash_command_history(&mut self, cmd: SlashCommand) {
+    fn stage_selected_slash_command_history(&mut self, cmd: &SlashCommandAction) {
         self.stage_slash_command_history_text(format!("/{}", cmd.command()));
     }
 
@@ -3697,7 +3708,12 @@ impl ChatComposer {
     }
 
     fn is_known_slash_name(&self, name: &str) -> bool {
-        slash_commands::find_builtin_command(name, self.builtin_command_flags()).is_some()
+        slash_commands::find_command(
+            name,
+            self.builtin_command_flags(),
+            &self.service_tier_commands,
+        )
+        .is_some()
     }
 
     /// If the cursor is currently within a slash command on the first line,
@@ -3729,7 +3745,7 @@ impl ChatComposer {
     }
 
     /// Heuristic for whether the typed slash command looks like a valid
-    /// prefix for any known built-in command.
+    /// prefix for any known command.
     /// Empty names only count when there is no extra content after the '/'.
     fn looks_like_slash_prefix(&self, name: &str, rest_after_name: &str) -> bool {
         if !self.slash_commands_enabled() {
@@ -3739,7 +3755,11 @@ impl ChatComposer {
             return rest_after_name.is_empty();
         }
 
-        slash_commands::has_builtin_prefix(name, self.builtin_command_flags())
+        slash_commands::has_command_prefix(
+            name,
+            self.builtin_command_flags(),
+            &self.service_tier_commands,
+        )
     }
 
     /// Synchronize `self.command_popup` with the current text in the
@@ -3790,18 +3810,21 @@ impl ChatComposer {
                     let personality_command_enabled = self.personality_command_enabled;
                     let realtime_conversation_enabled = self.realtime_conversation_enabled;
                     let audio_device_selection_enabled = self.audio_device_selection_enabled;
-                    let mut command_popup = CommandPopup::new(CommandPopupFlags {
-                        collaboration_modes_enabled,
-                        connectors_enabled,
-                        plugins_command_enabled,
-                        fast_command_enabled,
-                        goal_command_enabled,
-                        personality_command_enabled,
-                        realtime_conversation_enabled,
-                        audio_device_selection_enabled,
-                        windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
-                        side_conversation_active: self.side_conversation_active,
-                    });
+                    let mut command_popup = CommandPopup::new(
+                        CommandPopupFlags {
+                            collaboration_modes_enabled,
+                            connectors_enabled,
+                            plugins_command_enabled,
+                            fast_command_enabled,
+                            goal_command_enabled,
+                            personality_command_enabled,
+                            realtime_conversation_enabled,
+                            audio_device_selection_enabled,
+                            windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
+                            side_conversation_active: self.side_conversation_active,
+                        },
+                        &self.service_tier_commands,
+                    );
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
                 }
@@ -6945,7 +6968,10 @@ mod tests {
 
         let (result, _) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Command(SlashCommand::Diff)));
+        assert!(matches!(
+            result,
+            InputResult::Command(SlashCommandAction::Builtin(SlashCommand::Diff))
+        ));
     }
 
     /// Behavior: if a burst is buffering text and the user presses a non-char key, flush the
@@ -7412,7 +7438,6 @@ mod tests {
 
     #[test]
     fn slash_popup_model_first_for_mo_logic() {
-        use super::super::command_popup::CommandItem;
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -7426,9 +7451,7 @@ mod tests {
 
         match &composer.active_popup {
             ActivePopup::Command(popup) => match popup.selected_item() {
-                Some(CommandItem::Builtin(cmd)) => {
-                    assert_eq!(cmd.command(), "model")
-                }
+                Some(command) => assert_eq!(command.command(), "model"),
                 None => panic!("no selected command for '/mo'"),
             },
             _ => panic!("slash popup not active after typing '/mo'"),
@@ -7465,7 +7488,6 @@ mod tests {
 
     #[test]
     fn slash_popup_resume_for_res_logic() {
-        use super::super::command_popup::CommandItem;
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -7479,9 +7501,7 @@ mod tests {
 
         match &composer.active_popup {
             ActivePopup::Command(popup) => match popup.selected_item() {
-                Some(CommandItem::Builtin(cmd)) => {
-                    assert_eq!(cmd.command(), "resume")
-                }
+                Some(command) => assert_eq!(command.command(), "resume"),
                 None => panic!("no selected command for '/res'"),
             },
             _ => panic!("slash popup not active after typing '/res'"),
@@ -9843,7 +9863,10 @@ mod tests {
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(result, InputResult::Command(SlashCommand::Diff));
+        assert_eq!(
+            result,
+            InputResult::Command(SlashCommandAction::Builtin(SlashCommand::Diff))
+        );
         composer.record_pending_slash_command_history();
 
         let (result, _needs_redraw) =
@@ -9868,7 +9891,10 @@ mod tests {
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(result, InputResult::Command(SlashCommand::Diff));
+        assert_eq!(
+            result,
+            InputResult::Command(SlashCommandAction::Builtin(SlashCommand::Diff))
+        );
         composer.record_pending_slash_command_history();
 
         let (result, _needs_redraw) =
@@ -9897,7 +9923,7 @@ mod tests {
 
         match result {
             InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                assert_eq!(cmd, SlashCommand::Plan);
+                assert_eq!(cmd.command(), "plan");
                 assert_eq!(args, "investigate this");
                 assert!(text_elements.is_empty());
             }

@@ -73,7 +73,7 @@ pub(crate) enum TerminalTitleItem {
     TotalOutputTokens,
     /// Full session UUID.
     SessionId,
-    /// Whether Fast mode is currently active.
+    /// Current service-tier selection.
     FastMode,
     /// Current model name.
     #[strum(to_string = "model", serialize = "model-name")]
@@ -117,7 +117,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::SessionId => {
                 "Current session identifier (omitted until session starts)"
             }
-            TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
+            TerminalTitleItem::FastMode => "Current service tier (or default when unset)",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
             TerminalTitleItem::TaskProgress => {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::bottom_pane::slash_commands::ServiceTierCommand;
+use crate::bottom_pane::slash_commands::SlashCommandAction;
 use pretty_assertions::assert_eq;
 
 fn complete_turn_with_message(chat: &mut ChatWidget, turn_id: &str, message: Option<&str>) {
@@ -25,6 +27,15 @@ fn queue_composer_text_with_tab(chat: &mut ChatWidget, text: &str) {
     chat.bottom_pane
         .set_composer_text(text.to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+}
+
+fn fast_service_tier_command() -> SlashCommandAction {
+    SlashCommandAction::ServiceTier(ServiceTierCommand {
+        service_tier: ServiceTier::priority(),
+        command: "fast".to_string(),
+        name: "Fast".to_string(),
+        description: "Fast tier".to_string(),
+    })
 }
 
 fn recall_latest_after_clearing(chat: &mut ChatWidget) -> String {
@@ -1694,14 +1705,14 @@ async fn fast_slash_command_updates_and_persists_local_service_tier() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
     chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
 
-    chat.dispatch_command(SlashCommand::Fast);
+    chat.dispatch_command(fast_service_tier_command());
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
-                service_tier: Some(Some(ServiceTier::Fast)),
+            AppEvent::CodexOp(AppCommand::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::priority())),
                 ..
             })
         )),
@@ -1711,7 +1722,7 @@ async fn fast_slash_command_updates_and_persists_local_service_tier() {
         events.iter().any(|event| matches!(
             event,
             AppEvent::PersistServiceTierSelection {
-                service_tier: Some(ServiceTier::Fast),
+                service_tier: Some(ServiceTier::priority()),
             }
         )),
         "expected fast-mode persistence app event; events: {events:?}"
@@ -1727,7 +1738,7 @@ async fn user_turn_carries_service_tier_after_fast_toggle() {
     set_chatgpt_auth(&mut chat);
     chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
 
-    chat.dispatch_command(SlashCommand::Fast);
+    chat.dispatch_command(fast_service_tier_command());
 
     let _events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
 
@@ -1737,7 +1748,7 @@ async fn user_turn_carries_service_tier_after_fast_toggle() {
 
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
-            service_tier: Some(Some(ServiceTier::Fast)),
+            service_tier: Some(Some(ServiceTier::priority())),
             ..
         } => {}
         other => panic!("expected Op::UserTurn with fast service tier, got {other:?}"),
@@ -1761,8 +1772,8 @@ async fn queued_fast_slash_applies_before_next_queued_message() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
-                service_tier: Some(Some(ServiceTier::Fast)),
+            AppEvent::CodexOp(AppCommand::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::priority())),
                 ..
             })
         )),
@@ -1772,7 +1783,7 @@ async fn queued_fast_slash_applies_before_next_queued_message() {
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             items,
-            service_tier: Some(Some(ServiceTier::Fast)),
+            service_tier: Some(Some(ServiceTier::priority())),
             ..
         } => assert_eq!(
             items,
@@ -1792,10 +1803,10 @@ async fn user_turn_sends_standard_override_after_fast_is_turned_off() {
     set_chatgpt_auth(&mut chat);
     chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
 
-    chat.dispatch_command(SlashCommand::Fast);
+    chat.dispatch_command(fast_service_tier_command());
     let _events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
 
-    chat.dispatch_command_with_args(SlashCommand::Fast, "off".to_string(), Vec::new());
+    chat.dispatch_command_with_args(fast_service_tier_command(), "off".to_string(), Vec::new());
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(
         events.iter().any(|event| matches!(
