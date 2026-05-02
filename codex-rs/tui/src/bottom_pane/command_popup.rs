@@ -12,6 +12,9 @@ use super::selection_popup_common::render_rows_with_col_width_mode;
 use super::slash_commands;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandAction;
+use super::slash_commands::command_as_builtin;
+use super::slash_commands::command_description;
+use super::slash_commands::command_name;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::slash_command::SlashCommand;
@@ -73,8 +76,8 @@ impl CommandPopup {
         // Keep command availability in sync with the composer.
         let commands = slash_commands::commands_for_input(flags.into(), service_tier_commands)
             .into_iter()
-            .filter(|command| !command.command().starts_with("debug"))
-            .filter(|command| command.as_builtin() != Some(SlashCommand::Apps))
+            .filter(|command| !command_name(command).starts_with("debug"))
+            .filter(|command| command_as_builtin(command) != Some(SlashCommand::Apps))
             .collect();
         Self {
             command_filter: String::new(),
@@ -135,8 +138,7 @@ impl CommandPopup {
         let mut out: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         if filter.is_empty() {
             for command in self.commands.iter() {
-                if command
-                    .as_builtin()
+                if command_as_builtin(command)
                     .is_some_and(|builtin| ALIAS_COMMANDS.contains(&builtin))
                 {
                     continue;
@@ -174,7 +176,7 @@ impl CommandPopup {
             };
 
         for command in self.commands.iter() {
-            push_match(command.clone(), command.command(), None, 0);
+            push_match(command.clone(), command_name(command), None, 0);
         }
 
         out.extend(exact);
@@ -193,8 +195,8 @@ impl CommandPopup {
         matches
             .into_iter()
             .map(|(item, indices)| {
-                let name = format!("/{}", item.command());
-                let description = item.description().to_string();
+                let name = format!("/{}", command_name(&item));
+                let description = command_description(&item).to_string();
                 GenericDisplayRow {
                     name,
                     name_prefix_spans: Vec::new(),
@@ -266,7 +268,7 @@ mod tests {
         // Access the filtered list via the selected command and ensure that
         // one of the matches is the new "init" command.
         let matches = popup.filtered_items();
-        let has_init = matches.iter().any(|item| item.command() == "init");
+        let has_init = matches.iter().any(|item| command_name(item) == "init");
         assert!(
             has_init,
             "expected '/init' to appear among filtered commands"
@@ -282,7 +284,7 @@ mod tests {
         // command by default.
         let selected = popup.selected_item();
         match selected {
-            Some(command) => assert_eq!(command.command(), "init"),
+            Some(command) => assert_eq!(command_name(&command), "init"),
             None => panic!("expected a selected command for exact match"),
         }
     }
@@ -293,7 +295,7 @@ mod tests {
         popup.on_composer_text_change("/mo".to_string());
         let matches = popup.filtered_items();
         match matches.first() {
-            Some(command) => assert_eq!(command.command(), "model"),
+            Some(command) => assert_eq!(command_name(command), "model"),
             None => panic!("expected at least one match for '/mo'"),
         }
     }
@@ -303,12 +305,20 @@ mod tests {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), &[]);
         popup.on_composer_text_change("/m".to_string());
 
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
-        assert_eq!(cmds, vec!["model", "memories", "mention", "mcp"]);
+        assert_eq!(
+            cmds,
+            vec![
+                "model".to_string(),
+                "memories".to_string(),
+                "mention".to_string(),
+                "mcp".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -316,13 +326,13 @@ mod tests {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), &[]);
         popup.on_composer_text_change("/ac".to_string());
 
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
         assert!(
-            !cmds.contains(&"compact"),
+            !cmds.iter().any(|command| command == "compact"),
             "expected prefix search for '/ac' to exclude 'compact', got {cmds:?}"
         );
     }
@@ -344,17 +354,17 @@ mod tests {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), &[]);
         popup.on_composer_text_change("/".to_string());
 
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
         assert!(
-            !cmds.contains(&"collab"),
+            !cmds.iter().any(|command| command == "collab"),
             "expected '/collab' to be hidden when collaboration modes are disabled, got {cmds:?}"
         );
         assert!(
-            !cmds.contains(&"plan"),
+            !cmds.iter().any(|command| command == "plan"),
             "expected '/plan' to be hidden when collaboration modes are disabled, got {cmds:?}"
         );
     }
@@ -379,7 +389,7 @@ mod tests {
         popup.on_composer_text_change("/collab".to_string());
 
         match popup.selected_item() {
-            Some(command) => assert_eq!(command.command(), "collab"),
+            Some(command) => assert_eq!(command_name(&command), "collab"),
             other => panic!("expected collab to be selected for exact match, got {other:?}"),
         }
     }
@@ -404,7 +414,7 @@ mod tests {
         popup.on_composer_text_change("/plan".to_string());
 
         match popup.selected_item() {
-            Some(command) => assert_eq!(command.command(), "plan"),
+            Some(command) => assert_eq!(command_name(&command), "plan"),
             other => panic!("expected plan to be selected for exact match, got {other:?}"),
         }
     }
@@ -428,13 +438,13 @@ mod tests {
         );
         popup.on_composer_text_change("/pers".to_string());
 
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
         assert!(
-            !cmds.contains(&"personality"),
+            !cmds.iter().any(|command| command == "personality"),
             "expected '/personality' to be hidden when disabled, got {cmds:?}"
         );
     }
@@ -459,7 +469,7 @@ mod tests {
         popup.on_composer_text_change("/personality".to_string());
 
         match popup.selected_item() {
-            Some(command) => assert_eq!(command.command(), "personality"),
+            Some(command) => assert_eq!(command_name(&command), "personality"),
             other => panic!("expected personality to be selected for exact match, got {other:?}"),
         }
     }
@@ -483,14 +493,14 @@ mod tests {
         );
         popup.on_composer_text_change("/aud".to_string());
 
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
 
         assert!(
-            !cmds.contains(&"settings"),
+            !cmds.iter().any(|command| command == "settings"),
             "expected '/settings' to be hidden when audio device selection is disabled, got {cmds:?}"
         );
     }
@@ -498,10 +508,10 @@ mod tests {
     #[test]
     fn debug_commands_are_hidden_from_popup() {
         let popup = CommandPopup::new(CommandPopupFlags::default(), &[]);
-        let cmds: Vec<&str> = popup
+        let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
-            .map(|item| item.command())
+            .map(|item| command_name(&item).to_string())
             .collect();
 
         assert!(

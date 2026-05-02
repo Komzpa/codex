@@ -57,7 +57,6 @@ use crate::bottom_pane::StatusSurfacePreviewData;
 use crate::bottom_pane::StatusSurfacePreviewItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
-use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::diff_model::FileChange;
 use crate::legacy_core::DEFAULT_AGENTS_MD_FILENAME;
 use crate::legacy_core::config::Config;
@@ -155,6 +154,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::config_types::is_priority_service_tier;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::models::MessagePhase;
@@ -343,6 +343,10 @@ use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod realtime;
 use self::realtime::RealtimeConversationUiState;
 mod reasoning_shortcuts;
+pub(crate) mod service_tiers;
+use self::service_tiers::available_service_tier_commands;
+use self::service_tiers::model_preset;
+use self::service_tiers::model_supports_fast_mode;
 mod side;
 mod status_surfaces;
 use self::status_surfaces::CachedProjectRootName;
@@ -9263,8 +9267,8 @@ impl ChatWidget {
         model: &str,
         service_tier: Option<ServiceTier>,
     ) -> bool {
-        self.model_supports_fast_mode(model)
-            && service_tier.as_ref().is_some_and(ServiceTier::is_priority)
+        model_supports_fast_mode(self, model)
+            && service_tier.as_ref().is_some_and(is_priority_service_tier)
             && self.has_chatgpt_account
     }
 
@@ -9359,7 +9363,7 @@ impl ChatWidget {
 
     fn sync_service_tier_commands(&mut self) {
         self.bottom_pane
-            .set_service_tier_commands(self.available_service_tier_commands());
+            .set_service_tier_commands(available_service_tier_commands(self));
     }
 
     fn sync_personality_command_enabled(&mut self) {
@@ -9377,55 +9381,9 @@ impl ChatWidget {
             .set_goal_command_enabled(self.config.features.enabled(Feature::Goals));
     }
 
-    fn model_preset(&self, model: &str) -> Option<ModelPreset> {
-        self.model_catalog
-            .try_list_models()
-            .ok()
-            .and_then(|models| models.into_iter().find(|preset| preset.model == model))
-    }
-
-    fn available_service_tier_commands(&self) -> Vec<ServiceTierCommand> {
-        self.model_preset(self.current_model())
-            .map(|model| {
-                crate::bottom_pane::slash_commands::service_tier_commands_for_model(&model)
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn service_tier_display_name(
-        &self,
-        model: &str,
-        service_tier: &ServiceTier,
-    ) -> String {
-        self.model_preset(model)
-            .and_then(|preset| {
-                preset
-                    .service_tier(service_tier)
-                    .map(|tier| tier.name.clone())
-            })
-            .unwrap_or_else(|| service_tier.to_string())
-    }
-
-    pub(crate) fn current_service_tier_name(&self) -> Option<String> {
-        self.current_service_tier()
-            .map(|tier| self.service_tier_display_name(self.current_model(), &tier))
-    }
-
-    pub(crate) fn current_service_tier_status_label(&self) -> String {
-        self.current_service_tier_name()
-            .map(|name| format!("Tier {name}"))
-            .unwrap_or_else(|| "Tier default".to_string())
-    }
-
     fn current_model_supports_personality(&self) -> bool {
-        self.model_preset(self.current_model())
+        model_preset(self, self.current_model())
             .map(|preset| preset.supports_personality)
-            .unwrap_or(false)
-    }
-
-    fn model_supports_fast_mode(&self, model: &str) -> bool {
-        self.model_preset(model)
-            .map(|preset| preset.supports_service_tier(&ServiceTier::priority()))
             .unwrap_or(false)
     }
 
@@ -9434,7 +9392,7 @@ impl ChatWidget {
     /// We intentionally default to `true` when model metadata cannot be read so transient catalog
     /// failures do not hard-block user input in the UI.
     fn current_model_supports_images(&self) -> bool {
-        self.model_preset(self.current_model())
+        model_preset(self, self.current_model())
             .map(|preset| preset.input_modalities.contains(&InputModality::Image))
             .unwrap_or(true)
     }

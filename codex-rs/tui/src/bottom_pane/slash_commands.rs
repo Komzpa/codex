@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::priority_service_tier;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_utils_fuzzy_match::fuzzy_match;
@@ -36,14 +37,15 @@ pub(crate) struct ServiceTierCommand {
     pub(crate) description: String,
 }
 
-impl ServiceTierCommand {
-    fn from_model_service_tier(service_tier: &ModelServiceTier, command: String) -> Self {
-        Self {
-            service_tier: service_tier.id.clone(),
-            command,
-            name: service_tier.name.clone(),
-            description: service_tier.description.clone(),
-        }
+fn service_tier_command_from_model_tier(
+    service_tier: &ModelServiceTier,
+    command: String,
+) -> ServiceTierCommand {
+    ServiceTierCommand {
+        service_tier: service_tier.id.clone(),
+        command,
+        name: service_tier.name.clone(),
+        description: service_tier.description.clone(),
     }
 }
 
@@ -53,47 +55,45 @@ pub(crate) enum SlashCommandAction {
     ServiceTier(ServiceTierCommand),
 }
 
-impl SlashCommandAction {
-    pub(crate) fn command(&self) -> &str {
-        match self {
-            Self::Builtin(command) => command.command(),
-            Self::ServiceTier(command) => command.command.as_str(),
-        }
+pub(crate) fn command_name(action: &SlashCommandAction) -> &str {
+    match action {
+        SlashCommandAction::Builtin(command) => command.command(),
+        SlashCommandAction::ServiceTier(command) => command.command.as_str(),
     }
+}
 
-    pub(crate) fn description(&self) -> &str {
-        match self {
-            Self::Builtin(command) => command.description(),
-            Self::ServiceTier(command) => command.description.as_str(),
-        }
+pub(crate) fn command_description(action: &SlashCommandAction) -> &str {
+    match action {
+        SlashCommandAction::Builtin(command) => command.description(),
+        SlashCommandAction::ServiceTier(command) => command.description.as_str(),
     }
+}
 
-    pub(crate) fn supports_inline_args(&self) -> bool {
-        match self {
-            Self::Builtin(command) => command.supports_inline_args(),
-            Self::ServiceTier(_) => true,
-        }
+pub(crate) fn command_supports_inline_args(action: &SlashCommandAction) -> bool {
+    match action {
+        SlashCommandAction::Builtin(command) => command.supports_inline_args(),
+        SlashCommandAction::ServiceTier(_) => true,
     }
+}
 
-    pub(crate) fn available_in_side_conversation(&self) -> bool {
-        match self {
-            Self::Builtin(command) => command.available_in_side_conversation(),
-            Self::ServiceTier(_) => false,
-        }
+pub(crate) fn command_available_in_side_conversation(action: &SlashCommandAction) -> bool {
+    match action {
+        SlashCommandAction::Builtin(command) => command.available_in_side_conversation(),
+        SlashCommandAction::ServiceTier(_) => false,
     }
+}
 
-    pub(crate) fn available_during_task(&self) -> bool {
-        match self {
-            Self::Builtin(command) => command.available_during_task(),
-            Self::ServiceTier(_) => false,
-        }
+pub(crate) fn command_available_during_task(action: &SlashCommandAction) -> bool {
+    match action {
+        SlashCommandAction::Builtin(command) => command.available_during_task(),
+        SlashCommandAction::ServiceTier(_) => false,
     }
+}
 
-    pub(crate) fn as_builtin(&self) -> Option<SlashCommand> {
-        match self {
-            Self::Builtin(command) => Some(*command),
-            Self::ServiceTier(_) => None,
-        }
+pub(crate) fn command_as_builtin(action: &SlashCommandAction) -> Option<SlashCommand> {
+    match action {
+        SlashCommandAction::Builtin(command) => Some(*command),
+        SlashCommandAction::ServiceTier(_) => None,
     }
 }
 
@@ -180,7 +180,7 @@ pub(crate) fn has_command_prefix(
 ) -> bool {
     commands_for_input(flags, service_tier_commands)
         .into_iter()
-        .any(|command| fuzzy_match(command.command(), name).is_some())
+        .any(|command| fuzzy_match(command_name(&command), name).is_some())
 }
 
 pub(crate) fn service_tier_commands_for_model(model: &ModelPreset) -> Vec<ServiceTierCommand> {
@@ -191,10 +191,7 @@ pub(crate) fn service_tier_commands_for_model(model: &ModelPreset) -> Vec<Servic
             continue;
         };
         reserved_names.insert(command.clone());
-        commands.push(ServiceTierCommand::from_model_service_tier(
-            service_tier,
-            command,
-        ));
+        commands.push(service_tier_command_from_model_tier(service_tier, command));
     }
     commands
 }
@@ -294,7 +291,7 @@ mod tests {
     #[test]
     fn service_tier_command_is_hidden_when_disabled() {
         let service_tier_commands = vec![ServiceTierCommand {
-            service_tier: ServiceTier::priority(),
+            service_tier: priority_service_tier(),
             command: "fast".to_string(),
             name: "Fast".to_string(),
             description: "Fast tier".to_string(),
@@ -343,7 +340,7 @@ mod tests {
             &[],
         )
         .into_iter()
-        .map(|command| command.command().to_string())
+        .map(|command| command_name(&command).to_string())
         .collect::<Vec<_>>();
 
         assert_eq!(
@@ -385,12 +382,12 @@ mod tests {
             supports_personality: false,
             service_tiers: vec![
                 ModelServiceTier {
-                    id: ServiceTier::priority(),
+                    id: priority_service_tier(),
                     name: "Fast".to_string(),
                     description: "Fast tier".to_string(),
                 },
                 ModelServiceTier {
-                    id: ServiceTier::new("express"),
+                    id: ServiceTier::from("express"),
                     name: "Model".to_string(),
                     description: "Express tier".to_string(),
                 },
@@ -409,13 +406,13 @@ mod tests {
             commands,
             vec![
                 ServiceTierCommand {
-                    service_tier: ServiceTier::priority(),
+                    service_tier: priority_service_tier(),
                     command: "fast".to_string(),
                     name: "Fast".to_string(),
                     description: "Fast tier".to_string(),
                 },
                 ServiceTierCommand {
-                    service_tier: ServiceTier::new("express"),
+                    service_tier: ServiceTier::from("express"),
                     command: "express".to_string(),
                     name: "Model".to_string(),
                     description: "Express tier".to_string(),

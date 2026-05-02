@@ -3,6 +3,8 @@
 //! Keeping this logic in a focused submodule makes the additive title/status
 //! behavior easier to review without paging through the rest of `chatwidget.rs`.
 
+use super::service_tiers::current_service_tier_name;
+use super::service_tiers::current_service_tier_status_label;
 use super::*;
 use crate::bottom_pane::status_line_from_segments;
 use crate::status::format_tokens_compact;
@@ -557,7 +559,7 @@ impl ChatWidget {
                 format_tokens_compact(self.status_line_total_usage().output_tokens)
             )),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
-            StatusLineItem::FastMode => Some(self.current_service_tier_status_label()),
+            StatusLineItem::FastMode => Some(current_service_tier_status_label(self)),
             StatusLineItem::ThreadTitle => self.thread_name.as_ref().and_then(|name| {
                 let trimmed = name.trim();
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -671,8 +673,7 @@ impl ChatWidget {
 
     fn model_with_reasoning_display_name(&self) -> String {
         let label = Self::status_line_reasoning_effort_label(self.effective_reasoning_effort());
-        let service_tier_label = self
-            .current_service_tier_name()
+        let service_tier_label = current_service_tier_name(self)
             .map(|name| format!(" {}", name.to_ascii_lowercase()))
             .unwrap_or_default();
         format!("{} {label}{service_tier_label}", self.model_display_name())

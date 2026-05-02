@@ -5,6 +5,7 @@
 
 use super::resize_reflow::trailing_run_start;
 use super::*;
+use crate::chatwidget::service_tiers::service_tier_display_name;
 
 const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
@@ -1265,7 +1266,8 @@ impl App {
                         let mut message = match service_tier.as_ref() {
                             Some(service_tier) => format!(
                                 "Service tier set to {}",
-                                self.chat_widget.service_tier_display_name(
+                                service_tier_display_name(
+                                    &self.chat_widget,
                                     self.chat_widget.current_model(),
                                     service_tier,
                                 )

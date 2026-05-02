@@ -185,6 +185,10 @@ use super::slash_commands;
 use super::slash_commands::BuiltinCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandAction;
+use super::slash_commands::command_as_builtin;
+use super::slash_commands::command_available_during_task;
+use super::slash_commands::command_name;
+use super::slash_commands::command_supports_inline_args;
 use crate::bottom_pane::paste_burst::FlushResult;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::key_hint::KeyBindingListExt;
@@ -1741,19 +1745,19 @@ impl ChatComposer {
                 popup.on_composer_text_change(first_line.to_string());
                 let selected_cmd = popup.selected_item();
                 if let Some(cmd) = selected_cmd {
-                    if cmd.as_builtin() == Some(SlashCommand::Skills) {
+                    if command_as_builtin(&cmd) == Some(SlashCommand::Skills) {
                         self.stage_selected_slash_command_history(&cmd);
                         self.textarea.set_text_clearing_elements("");
                         self.is_bash_mode = false;
                         return (InputResult::Command(cmd), true);
                     }
 
-                    let selected_command_text = format!("/{}", cmd.command());
+                    let selected_command_text = format!("/{}", command_name(&cmd));
                     let starts_with_cmd =
                         first_line.trim_start().starts_with(&selected_command_text);
                     if !starts_with_cmd {
                         self.textarea
-                            .set_text_clearing_elements(&format!("/{} ", cmd.command()));
+                            .set_text_clearing_elements(&format!("/{} ", command_name(&cmd)));
                         if !self.textarea.text().is_empty() {
                             self.textarea.set_cursor(self.textarea.text().len());
                         }
@@ -1777,10 +1781,10 @@ impl ChatComposer {
                 if let Some(cmd) = popup.selected_item() {
                     let starts_with_cmd = first_line
                         .trim_start()
-                        .starts_with(&format!("/{}", cmd.command()));
+                        .starts_with(&format!("/{}", command_name(&cmd)));
                     if !starts_with_cmd {
                         self.textarea
-                            .set_text_clearing_elements(&format!("/{} ", cmd.command()));
+                            .set_text_clearing_elements(&format!("/{} ", command_name(&cmd)));
                         self.is_bash_mode = false;
                     }
                     if !self.textarea.text().is_empty() {
@@ -2856,7 +2860,7 @@ impl ChatComposer {
             &self.service_tier_commands,
         )?;
 
-        if !cmd.supports_inline_args() {
+        if !command_supports_inline_args(&cmd) {
             return None;
         }
         if self.reject_slash_command_if_unavailable(&cmd) {
@@ -2905,12 +2909,12 @@ impl ChatComposer {
     }
 
     fn reject_slash_command_if_unavailable(&self, cmd: &SlashCommandAction) -> bool {
-        if !self.is_task_running || cmd.available_during_task() {
+        if !self.is_task_running || command_available_during_task(cmd) {
             return false;
         }
         let message = format!(
             "'/{}' is disabled while a task is in progress.",
-            cmd.command()
+            command_name(cmd)
         );
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             history_cell::new_error_event(message),
@@ -2950,7 +2954,7 @@ impl ChatComposer {
     /// Popup filtering text can be partial, so recording the selected command avoids recalling
     /// `/di` after the user actually accepted `/diff`.
     fn stage_selected_slash_command_history(&mut self, cmd: &SlashCommandAction) {
-        self.stage_slash_command_history_text(format!("/{}", cmd.command()));
+        self.stage_slash_command_history_text(format!("/{}", command_name(cmd)));
     }
 
     /// Store the provided command text and the current composer adornments in the pending slot.
@@ -7451,7 +7455,7 @@ mod tests {
 
         match &composer.active_popup {
             ActivePopup::Command(popup) => match popup.selected_item() {
-                Some(command) => assert_eq!(command.command(), "model"),
+                Some(command) => assert_eq!(command_name(&command), "model"),
                 None => panic!("no selected command for '/mo'"),
             },
             _ => panic!("slash popup not active after typing '/mo'"),
@@ -7501,7 +7505,7 @@ mod tests {
 
         match &composer.active_popup {
             ActivePopup::Command(popup) => match popup.selected_item() {
-                Some(command) => assert_eq!(command.command(), "resume"),
+                Some(command) => assert_eq!(command_name(&command), "resume"),
                 None => panic!("no selected command for '/res'"),
             },
             _ => panic!("slash popup not active after typing '/res'"),
@@ -7560,7 +7564,7 @@ mod tests {
         // Command result (not submit literal text) and clear its textarea.
         match result {
             InputResult::Command(cmd) => {
-                assert_eq!(cmd.command(), "init");
+                assert_eq!(command_name(&cmd), "init");
             }
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/init'")
@@ -7637,7 +7641,7 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
             InputResult::Command(cmd) => {
-                assert_eq!(cmd.command(), "diff");
+                assert_eq!(command_name(&cmd), "diff");
             }
             _ => panic!("expected Command result for '/diff'"),
         }
@@ -8007,7 +8011,7 @@ mod tests {
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
-            InputResult::Command(cmd) => assert_eq!(cmd.command(), "diff"),
+            InputResult::Command(cmd) => assert_eq!(command_name(&cmd), "diff"),
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/diff'")
             }
@@ -8200,7 +8204,7 @@ mod tests {
 
         match result {
             InputResult::Command(cmd) => {
-                assert_eq!(cmd.command(), "mention");
+                assert_eq!(command_name(&cmd), "mention");
             }
             InputResult::CommandWithArgs(_, _, _) => {
                 panic!("expected command dispatch without args for '/mention'")
@@ -8244,7 +8248,7 @@ mod tests {
 
         match result {
             InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                assert_eq!(cmd.command(), "plan");
+                assert_eq!(command_name(&cmd), "plan");
                 assert_eq!(args, placeholder);
                 assert_eq!(text_elements.len(), 1);
                 assert_eq!(
@@ -9923,7 +9927,7 @@ mod tests {
 
         match result {
             InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                assert_eq!(cmd.command(), "plan");
+                assert_eq!(command_name(&cmd), "plan");
                 assert_eq!(args, "investigate this");
                 assert!(text_elements.is_empty());
             }

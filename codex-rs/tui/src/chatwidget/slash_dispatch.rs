@@ -5,11 +5,17 @@
 //! dispatch step and records the staged entry once the command has been handled, so
 //! slash-command recall follows the same submitted-input rule as ordinary text.
 
+use super::service_tiers::available_service_tier_commands;
 use super::*;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::slash_commands;
 use crate::bottom_pane::slash_commands::SlashCommandAction;
+use crate::bottom_pane::slash_commands::command_as_builtin;
+use crate::bottom_pane::slash_commands::command_available_during_task;
+use crate::bottom_pane::slash_commands::command_available_in_side_conversation;
+use crate::bottom_pane::slash_commands::command_name;
+use crate::bottom_pane::slash_commands::command_supports_inline_args;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -40,7 +46,7 @@ impl ChatWidget {
     /// that staged entry after dispatch so slash-command recall follows the same "submitted input"
     /// rule as normal text.
     pub(super) fn handle_slash_command_dispatch(&mut self, cmd: SlashCommandAction) {
-        let is_goal = cmd.as_builtin() == Some(SlashCommand::Goal);
+        let is_goal = command_as_builtin(&cmd) == Some(SlashCommand::Goal);
         self.dispatch_command(cmd);
         if is_goal {
             self.bottom_pane.drain_pending_submission_state();
@@ -112,10 +118,10 @@ impl ChatWidget {
         if !self.ensure_side_command_allowed_outside_review(&cmd) {
             return;
         }
-        if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
+        if !command_available_during_task(&cmd) && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
-                cmd.command()
+                command_name(&cmd)
             );
             self.add_to_history(history_cell::new_error_event(message));
             self.bottom_pane.drain_pending_submission_state();
@@ -458,14 +464,14 @@ impl ChatWidget {
         if !self.ensure_side_command_allowed_outside_review(&cmd) {
             return;
         }
-        if !cmd.supports_inline_args() {
+        if !command_supports_inline_args(&cmd) {
             self.dispatch_command(cmd);
             return;
         }
-        if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
+        if !command_available_during_task(&cmd) && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
-                cmd.command()
+                command_name(&cmd)
             );
             self.add_to_history(history_cell::new_error_event(message));
             self.request_redraw();
@@ -548,7 +554,7 @@ impl ChatWidget {
             source,
         } = prepared;
         let trimmed = args.trim();
-        let is_goal_command = cmd.as_builtin() == Some(SlashCommand::Goal);
+        let is_goal_command = command_as_builtin(&cmd) == Some(SlashCommand::Goal);
         match cmd {
             SlashCommandAction::ServiceTier(command) => {
                 match trimmed.to_ascii_lowercase().as_str() {
@@ -769,7 +775,7 @@ impl ChatWidget {
         let Some(cmd) = slash_commands::find_command(
             name,
             self.builtin_command_flags(),
-            &self.available_service_tier_commands(),
+            &available_service_tier_commands(self),
         ) else {
             self.add_info_message(
                 format!(
@@ -785,7 +791,7 @@ impl ChatWidget {
             return self.queued_command_drain_result(cmd);
         }
 
-        if !cmd.supports_inline_args() {
+        if !command_supports_inline_args(&cmd) {
             self.submit_user_message(UserMessage {
                 text,
                 local_images,
@@ -930,19 +936,19 @@ impl ChatWidget {
         &mut self,
         cmd: &SlashCommandAction,
     ) -> bool {
-        if !self.active_side_conversation || cmd.available_in_side_conversation() {
+        if !self.active_side_conversation || command_available_in_side_conversation(cmd) {
             return true;
         }
         self.add_error_message(format!(
             "'/{}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}",
-            cmd.command()
+            command_name(cmd)
         ));
         self.bottom_pane.drain_pending_submission_state();
         false
     }
 
     fn ensure_side_command_allowed_outside_review(&mut self, cmd: &SlashCommandAction) -> bool {
-        if cmd.as_builtin() != Some(SlashCommand::Side) || !self.is_review_mode {
+        if command_as_builtin(cmd) != Some(SlashCommand::Side) || !self.is_review_mode {
             return true;
         }
 
