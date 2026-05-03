@@ -200,7 +200,7 @@ async fn record_stage1_output_usage_and_detect_memory_citation(
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<Vec<ResponseInputItem>>> + Send + 'f>>;
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
