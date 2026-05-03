@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use codex_protocol::config_types::SERVICE_TIER_PRIORITY;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelServiceTier;
@@ -237,6 +236,7 @@ fn normalize_service_tier_command_token(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::config_types::SERVICE_TIER_PRIORITY;
     use codex_protocol::openai_models::ModelServiceTier;
     use pretty_assertions::assert_eq;
 

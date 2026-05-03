@@ -9313,7 +9313,7 @@ impl ChatWidget {
         if service_tier.is_none() {
             self.config.notices.fast_default_opt_out = Some(true);
         }
-        self.set_service_tier(service_tier);
+        self.set_service_tier(service_tier.clone());
         self.app_event_tx
             .send(AppEvent::CodexOp(AppCommand::override_turn_context(
                 /*cwd*/ None,
@@ -9324,7 +9324,7 @@ impl ChatWidget {
                 /*model*/ None,
                 /*effort*/ None,
                 /*summary*/ None,
-                Some(service_tier),
+                Some(service_tier.clone()),
                 /*collaboration_mode*/ None,
                 /*personality*/ None,
             )));

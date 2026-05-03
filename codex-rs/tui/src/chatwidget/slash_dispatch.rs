@@ -787,7 +787,7 @@ impl ChatWidget {
         };
 
         if rest.is_empty() {
-            self.dispatch_command(cmd);
+            self.dispatch_command(cmd.clone());
             return self.queued_command_drain_result(cmd);
         }
 
