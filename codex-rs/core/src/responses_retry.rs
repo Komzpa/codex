@@ -28,6 +28,22 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    if let CodexErr::ServerDraining(_, requested_delay) = &err {
+        let delay = requested_delay.unwrap_or_else(|| backoff(1));
+        warn!(
+            ?delay,
+            "server is draining; retrying without consuming the transport retry budget"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            "Reconnecting... server is draining; retrying until ready".to_string(),
+            err,
+        )
+        .await;
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
+
     if *retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,

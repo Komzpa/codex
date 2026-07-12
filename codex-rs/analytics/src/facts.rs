@@ -200,7 +200,7 @@ impl From<&CodexErr> for CodexErrKind {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
             CodexErr::SessionBudgetExceeded => CodexErrKind::SessionBudgetExceeded,
-            CodexErr::Stream(..) => CodexErrKind::Stream,
+            CodexErr::Stream(..) | CodexErr::ServerDraining(..) => CodexErrKind::Stream,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,
             CodexErr::ThreadNotFound(_) => CodexErrKind::ThreadNotFound,
             CodexErr::AgentLimitReached { .. } => CodexErrKind::AgentLimitReached,

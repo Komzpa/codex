@@ -46,8 +46,8 @@ fn map_api_error_maps_server_draining_503_to_delayed_retry() {
         body: Some(body),
     }));
 
-    let CodexErr::Stream(message, delay) = err else {
-        panic!("expected delayed stream retry, got {err:?}");
+    let CodexErr::ServerDraining(message, delay) = err else {
+        panic!("expected server-draining retry, got {err:?}");
     };
     assert_eq!(message, "Server is draining");
     assert_eq!(delay, Some(std::time::Duration::from_secs(2)));

@@ -80,6 +80,11 @@ pub enum CodexErr {
     /// Optionally includes the requested delay before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String, Option<Duration>),
+    /// The configured Responses endpoint is intentionally draining for a
+    /// planned replacement. This must not consume the finite transport retry
+    /// budget: the replacement owns the outage and supplies the retry delay.
+    #[error("server is draining: {0}")]
+    ServerDraining(String, Option<Duration>),
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -198,6 +203,7 @@ impl CodexErr {
             | CodexErr::ServerOverloaded
             | CodexErr::CyberPolicy { .. } => false,
             CodexErr::Stream(..)
+            | CodexErr::ServerDraining(..)
             | CodexErr::Timeout
             | CodexErr::RequestTimeout
             | CodexErr::UnexpectedStatus(_)
