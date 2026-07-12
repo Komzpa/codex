@@ -7,6 +7,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use tracing::warn;
@@ -28,6 +29,22 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    if matches!(err.details(), CodexErrorDetails::ServerDraining(_)) {
+        let delay = err.retry_delay().unwrap_or_else(|| backoff(1));
+        warn!(
+            ?delay,
+            "server is draining; retrying without consuming the transport retry budget"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            "Reconnecting... server is draining; retrying until ready".to_string(),
+            err,
+        )
+        .await;
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
+
     if *retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,

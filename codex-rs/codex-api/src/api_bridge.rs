@@ -74,7 +74,11 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         extract_header(headers.as_ref(), http::header::RETRY_AFTER.as_str())
                             .and_then(|value| value.parse::<u64>().ok())
                             .map(std::time::Duration::from_secs);
-                    return CodexErr::Stream(message, delay);
+                    let error = CodexErr::new(CodexErrorDetails::ServerDraining(message));
+                    return match delay {
+                        Some(delay) => error.with_retry_delay(delay),
+                        None => error,
+                    };
                 }
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
