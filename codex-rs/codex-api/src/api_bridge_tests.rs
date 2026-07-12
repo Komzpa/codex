@@ -27,6 +27,32 @@ fn map_api_error_maps_server_overloaded_from_503_body() {
 }
 
 #[test]
+fn map_api_error_maps_server_draining_503_to_delayed_retry() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "service_unavailable",
+            "message": "Server is draining",
+            "code": "server_draining"
+        }
+    })
+    .to_string();
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        url: Some("http://example.com/backend-api/codex/responses".to_string()),
+        headers: Some(headers),
+        body: Some(body),
+    }));
+
+    let CodexErr::Stream(message, delay) = err else {
+        panic!("expected delayed stream retry, got {err:?}");
+    };
+    assert_eq!(message, "Server is draining");
+    assert_eq!(delay, Some(std::time::Duration::from_secs(2)));
+}
+
+#[test]
 fn map_api_error_maps_cloudflare_blocked_response_to_user_message() {
     let mut headers = HeaderMap::new();
     headers.insert(CF_RAY_HEADER, http::HeaderValue::from_static("ray-id"));
