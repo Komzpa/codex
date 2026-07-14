@@ -2176,7 +2176,7 @@ async fn remote_mid_turn_tool_transaction_overflow_keeps_history_and_window() ->
         "failed installation must not advance the context window"
     );
     assert!(
-        first_error.contains("exact latest complete tool transaction does not fit"),
+        first_error.contains("latest complete tool transaction does not fit"),
         "expected explicit fail-closed reason, got {first_error}"
     );
     assert!(

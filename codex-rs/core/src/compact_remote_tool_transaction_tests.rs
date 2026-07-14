@@ -4,6 +4,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
+use codex_utils_output_truncation::truncate_text;
 use pretty_assertions::assert_eq;
 
 fn message(role: &str, text: &str) -> ResponseItem {
@@ -114,13 +115,21 @@ fn empty_instructions() -> BaseInstructions {
 }
 
 #[test]
-fn reattaches_real_sized_terminal_function_transaction_exactly_before_compaction() {
+fn reattaches_observed_large_terminal_transaction_with_hard_item_cap() {
     let old_call = function_call("17", "old_wait");
     let old_output = function_output("17", "old output".to_string());
     let call = function_call("17", "wait");
-    // Mirrors the 50,494-character output in the observed failed compaction. At roughly 12K
-    // heuristic tokens it must rely on the full-candidate context gate, never a new raw cap.
-    let output = function_output("17", "x".repeat(50_494));
+    // Mirrors the 50,494-character output in the observed failed compaction. Preserve the
+    // transaction while bounding its output below the model-context per-item limit.
+    let output_text = "x".repeat(50_494);
+    let output = function_output("17", output_text.clone());
+    let bounded_output = function_output(
+        "17",
+        truncate_text(
+            &output_text,
+            TruncationPolicy::Tokens(MAX_REATTACHED_OUTPUT_TOKENS),
+        ),
+    );
     let trace_input_history = vec![
         message("user", "original request"),
         old_call,
@@ -142,7 +151,7 @@ fn reattaches_real_sized_terminal_function_transaction_exactly_before_compaction
         injected_context[0].clone(),
         injected_context[1].clone(),
         call,
-        output,
+        bounded_output.clone(),
         compacted_item,
     ];
 
@@ -152,13 +161,41 @@ fn reattaches_real_sized_terminal_function_transaction_exactly_before_compaction
         Some(100_000),
         &empty_instructions(),
     )
-    .expect("exact pair should fit");
+    .expect("bounded complete transaction should fit");
 
     assert_eq!(result, expected);
-    assert_eq!(
-        serde_json::to_vec(&result[2..4]).expect("installed pair should serialize"),
-        serde_json::to_vec(&trace_input_history[3..5]).expect("trace pair should serialize")
+    assert_ne!(bounded_output, output);
+}
+
+#[test]
+fn removes_unbounded_source_when_bounded_transaction_is_already_present() {
+    let call = function_call("17", "wait");
+    let output_text = "x".repeat(50_494);
+    let output = function_output("17", output_text.clone());
+    let bounded_output = function_output(
+        "17",
+        truncate_text(
+            &output_text,
+            TruncationPolicy::Tokens(MAX_REATTACHED_OUTPUT_TOKENS),
+        ),
     );
+    let compacted_item = compaction();
+
+    let result = reattach_latest_complete_tool_transaction(
+        vec![
+            call.clone(),
+            output.clone(),
+            call.clone(),
+            bounded_output.clone(),
+            compacted_item.clone(),
+        ],
+        &[call.clone(), output],
+        Some(100_000),
+        &empty_instructions(),
+    )
+    .expect("duplicate source form should be removed");
+
+    assert_eq!(result, vec![call, bounded_output, compacted_item]);
 }
 
 #[test]
@@ -187,6 +224,59 @@ fn reattaches_each_supported_terminal_transaction_with_deep_equality() {
         .expect("supported exact transaction should fit");
 
         assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn reattaches_complete_terminal_parallel_transaction_in_original_order() {
+    let first_call = function_call("parallel-1", "read_first");
+    let second_call = function_call("parallel-2", "read_second");
+    let first_output = function_output("parallel-1", "first state".to_string());
+    let second_output = function_output("parallel-2", "second state".to_string());
+    let transaction = vec![first_call, second_call, first_output, second_output];
+    let context = message("developer", "fresh context");
+    let compacted_item = compaction();
+    let mut expected = vec![context.clone()];
+    expected.extend(transaction.clone());
+    expected.push(compacted_item.clone());
+
+    let result = reattach_latest_complete_tool_transaction(
+        vec![context, compacted_item],
+        &transaction,
+        Some(100_000),
+        &empty_instructions(),
+    )
+    .expect("parallel transaction should fit");
+
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn rejects_terminal_parallel_block_with_duplicate_or_missing_match() {
+    let compacted_history = vec![message("developer", "fresh"), compaction()];
+    let unmatched = vec![
+        function_call("parallel-1", "read_first"),
+        function_call("parallel-2", "read_second"),
+        function_output("parallel-1", "first state".to_string()),
+        function_output("parallel-3", "third state".to_string()),
+    ];
+    let duplicate = vec![
+        function_call("parallel-1", "read_first"),
+        function_call("parallel-1", "read_duplicate"),
+        function_output("parallel-1", "first state".to_string()),
+        function_output("parallel-1", "duplicate state".to_string()),
+    ];
+
+    for trace_input_history in [unmatched, duplicate] {
+        let result = reattach_latest_complete_tool_transaction(
+            compacted_history.clone(),
+            &trace_input_history,
+            Some(100_000),
+            &empty_instructions(),
+        )
+        .expect("invalid terminal block should be ignored");
+
+        assert_eq!(result, compacted_history);
     }
 }
 
@@ -300,4 +390,28 @@ fn fails_closed_when_exact_transaction_would_exceed_context_window() {
     assert!(message.starts_with(CONTEXT_WINDOW_ERROR));
     assert!(message.contains("estimated "));
     assert!(message.ends_with("tokens, limit 0)"));
+}
+
+#[test]
+fn fails_closed_when_an_untruncatable_transaction_item_exceeds_hard_cap() {
+    let mut call = function_call("17", "wait");
+    let ResponseItem::FunctionCall { arguments, .. } = &mut call else {
+        panic!("function_call helper must return a function call");
+    };
+    *arguments = "x".repeat(50_000);
+    let output = function_output("17", "complete".to_string());
+
+    let error = reattach_latest_complete_tool_transaction(
+        vec![compaction()],
+        &[call, output],
+        Some(100_000),
+        &empty_instructions(),
+    )
+    .expect_err("an oversized call item must not be installed");
+
+    let CodexErr::InvalidRequest(message) = error else {
+        panic!("expected explicit invalid-request reason, got {error}");
+    };
+    assert!(message.starts_with(ITEM_LIMIT_ERROR));
+    assert!(message.ends_with("tokens)"));
 }
