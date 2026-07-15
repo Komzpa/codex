@@ -478,7 +478,7 @@ async fn multi_agent_v2_spawn_defaults_to_three_recent_turns_and_keeps_latest_co
         .get_thread(child_thread_id)
         .await
         .expect("spawned agent thread should exist");
-    let history = child_thread.codex.session.clone_history().await;
+    let history = child_thread.session.clone_history().await;
     let contains_text = |needle: &str| {
         history.raw_items().iter().any(|item| {
             let ResponseItem::Message { content, .. } = item else {
@@ -499,7 +499,6 @@ async fn multi_agent_v2_spawn_defaults_to_three_recent_turns_and_keeps_latest_co
     assert!(contains_text("latest user correction"));
     assert!(
         child_thread
-            .codex
             .session
             .reference_context_item()
             .await
