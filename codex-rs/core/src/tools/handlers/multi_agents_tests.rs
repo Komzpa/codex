@@ -426,13 +426,23 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_overrides() {
+async fn multi_agent_v2_spawn_defaults_to_three_recent_turns_and_keeps_latest_correction() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
         .start_thread((*turn.config).clone())
         .await
         .expect("root thread should start");
+    for message in [
+        "obsolete objective",
+        "current objective",
+        "implementation detail",
+        "latest user correction",
+    ] {
+        root.thread
+            .inject_user_message_without_turn(message.to_string())
+            .await;
+    }
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let mut config = (*turn.config).clone();
@@ -442,27 +452,59 @@ async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_over
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
 
-    let err = SpawnAgentHandlerV2::default()
+    let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "fork_context_v2",
-                "model": "gpt-5-child-override",
-                "reasoning_effort": "low"
+                "task_name": "bounded_default"
             })),
         ))
         .await
-        .err()
-        .expect("default full fork should reject child model overrides");
+        .expect("default bounded fork should spawn");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(result["task_name"], "/root/bounded_default");
+    let child_thread_id = manager
+        .captured_ops()
+        .into_iter()
+        .map(|(thread_id, _)| thread_id)
+        .find(|thread_id| *thread_id != root.thread_id)
+        .expect("spawned agent should receive an op");
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("spawned agent thread should exist");
+    let history = child_thread.codex.session.clone_history().await;
+    let contains_text = |needle: &str| {
+        history.raw_items().iter().any(|item| {
+            let ResponseItem::Message { content, .. } = item else {
+                return false;
+            };
+            content.iter().any(|content_item| match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    text.contains(needle)
+                }
+                ContentItem::InputImage { .. } => false,
+            })
+        })
+    };
 
-    assert_eq!(
-        err,
-            FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
-        )
+    assert!(!contains_text("obsolete objective"));
+    assert!(contains_text("current objective"));
+    assert!(contains_text("implementation detail"));
+    assert!(contains_text("latest user correction"));
+    assert!(
+        child_thread
+            .codex
+            .session
+            .reference_context_item()
+            .await
+            .is_none(),
+        "bounded default should rebuild context after dropping old turns"
     );
 }
 

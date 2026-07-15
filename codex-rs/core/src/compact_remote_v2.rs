@@ -12,6 +12,7 @@ use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::reattach_latest_complete_tool_transaction;
+use crate::compact_remote::remove_image_payloads_before_latest_real_user_message;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -282,7 +283,7 @@ async fn run_remote_compact_task_inner_impl(
     let (compacted_history, retained_images) =
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_history, world_state_baseline) = process_compacted_history(
+    let (new_history, world_state_baseline, _) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         compacted_history,
@@ -463,10 +464,7 @@ fn build_v2_compacted_history(
         .collect::<Vec<_>>();
     let mut retained =
         truncate_retained_messages_for_remote_compaction(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
-    let retained_image_count = retained
-        .iter()
-        .map(retained_input_image_count)
-        .sum::<usize>();
+    let retained_image_count = remove_image_payloads_before_latest_real_user_message(&mut retained);
     retained.push(compaction_output);
     (retained, retained_image_count)
 }
@@ -477,17 +475,6 @@ fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
     };
 
     matches!(role.as_str(), "user" | "developer" | "system")
-}
-
-fn retained_input_image_count(item: &ResponseItem) -> usize {
-    let ResponseItem::Message { content, .. } = item else {
-        return 0;
-    };
-
-    content
-        .iter()
-        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
-        .count()
 }
 
 fn truncate_retained_messages_for_remote_compaction(
@@ -682,35 +669,71 @@ mod tests {
     }
 
     #[test]
-    fn build_v2_compacted_history_counts_retained_input_images() {
-        let input = vec![ResponseItem::Message {
+    fn build_v2_compacted_history_strips_old_images_without_dropping_user_text() {
+        let old_user_message = ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![
                 ContentItem::InputText {
-                    text: "user".to_string(),
+                    text: "original objective".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
+                    image_url: "data:image/png;base64,old".to_string(),
                     detail: None,
                 },
+                ContentItem::OutputText {
+                    text: "non-image content".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let latest_user_message = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "latest correction".to_string(),
+                },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
+                    image_url: "data:image/png;base64,latest".to_string(),
                     detail: None,
                 },
             ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }];
+        };
+        let input = vec![old_user_message, latest_user_message.clone()];
         let output = ResponseItem::Compaction {
             id: None,
             encrypted_content: "new".to_string(),
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (_, retained_image_count) = build_v2_compacted_history(&input, output);
+        let (history, retained_image_count) = build_v2_compacted_history(&input, output.clone());
 
-        assert_eq!(retained_image_count, 2);
+        assert_eq!(
+            history,
+            vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![
+                        ContentItem::InputText {
+                            text: "original objective".to_string(),
+                        },
+                        ContentItem::OutputText {
+                            text: "non-image content".to_string(),
+                        },
+                    ],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                latest_user_message,
+                output,
+            ]
+        );
+        assert_eq!(retained_image_count, 1);
     }
 
     #[test]

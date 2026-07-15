@@ -5,19 +5,24 @@ use super::Config;
 use super::DoctorCheck;
 use super::DoctorIssue;
 use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_rollout::RolloutRecorder;
 use codex_state::ThreadStateAuditRow;
 use codex_utils_path::normalize_for_path_comparison;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
 const MAX_PARITY_SCAN_FILES: usize = 10_000;
+const MAX_ROLLOUT_METADATA_SCAN_BYTES: usize = 256 * 1024;
 const SAMPLE_LIMIT: usize = 5;
 const SUMMARY_LIMIT: usize = 8;
 const CHECK_ID: &str = "state.rollout_db_parity";
@@ -39,6 +44,7 @@ struct RolloutScan {
     reached_scan_cap: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum RolloutThreadId {
     Id(String),
     MalformedName,
@@ -481,7 +487,7 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
                 scan.reached_scan_cap = true;
                 return;
             }
-            let thread_id = match thread_id_from_rollout(&path).await {
+            let thread_id = match thread_id_from_rollout(&path) {
                 RolloutThreadId::Id(thread_id) => thread_id,
                 RolloutThreadId::MalformedName => {
                     scan.record_malformed_name(path.clone());
@@ -502,17 +508,59 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
     }
 }
 
-async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
-    let items = match RolloutRecorder::load_rollout_items(path).await {
-        Ok((items, _, _)) => items,
+fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
+    let line = match first_rollout_record(path) {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            return RolloutThreadId::Unusable("no parseable rollout items".to_string());
+        }
         Err(err) => return RolloutThreadId::Unusable(err.to_string()),
     };
-    if items.is_empty() {
-        return RolloutThreadId::Unusable("no parseable rollout items".to_string());
-    }
-    codex_rollout::builder_from_items(items.as_slice(), path)
+    let record = match serde_json::from_slice::<RolloutLine>(&line) {
+        Ok(record) => record,
+        Err(err) => {
+            return RolloutThreadId::Unusable(format!(
+                "failed to parse first rollout record: {err}"
+            ));
+        }
+    };
+    codex_rollout::builder_from_items(std::slice::from_ref(&record.item), path)
         .map(|builder| RolloutThreadId::Id(builder.id.to_string()))
         .unwrap_or(RolloutThreadId::MalformedName)
+}
+
+fn first_rollout_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut scanned = 0usize;
+    loop {
+        let remaining = MAX_ROLLOUT_METADATA_SCAN_BYTES
+            .saturating_add(1)
+            .saturating_sub(scanned);
+        if remaining == 0 {
+            return Err(std::io::Error::other(format!(
+                "first rollout record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
+            )));
+        }
+
+        let mut line = Vec::new();
+        let read = reader
+            .by_ref()
+            .take(remaining as u64)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        scanned = scanned.saturating_add(read);
+        if scanned > MAX_ROLLOUT_METADATA_SCAN_BYTES {
+            return Err(std::io::Error::other(format!(
+                "first rollout record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
+            )));
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        return Ok(Some(line));
+    }
 }
 
 fn is_rollout_file(path: &Path) -> bool {
@@ -678,6 +726,7 @@ where
 mod tests {
     use super::*;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
     use pretty_assertions::assert_eq;
@@ -784,6 +833,82 @@ mod tests {
                 .details
                 .iter()
                 .any(|detail| detail.contains(missing_path.to_string_lossy().as_ref()))
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_does_not_materialize_huge_trailing_rollout_line() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let metadata_line_bytes = std::fs::metadata(&path).expect("rollout metadata").len();
+        let sparse_trailing_bytes = 1024 * 1024 * 1024_u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open rollout for sparse extension")
+            .set_len(metadata_line_bytes + sparse_trailing_bytes)
+            .expect("append sparse trailing line");
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("rollout metadata").len(),
+            metadata_line_bytes + sparse_trailing_bytes
+        );
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
+    #[test]
+    fn thread_id_scan_preserves_empty_and_corrupt_diagnostics() {
+        let dir = TempDir::new().expect("tempdir");
+        let empty = dir
+            .path()
+            .join("rollout-2025-01-02T10-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let corrupt = dir
+            .path()
+            .join("rollout-2025-01-02T11-00-00-00000000-0000-0000-0000-000000000002.jsonl");
+        std::fs::write(&empty, "").expect("write empty rollout");
+        std::fs::write(&corrupt, "{ definitely not json }\n").expect("write corrupt rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&empty),
+            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+        );
+        let RolloutThreadId::Unusable(reason) = thread_id_from_rollout(&corrupt) else {
+            panic!("corrupt rollout should be unusable");
+        };
+        assert!(reason.starts_with("failed to parse first rollout record:"));
+    }
+
+    #[test]
+    fn thread_id_scan_uses_safe_filename_fallback_and_reports_malformed_names() {
+        let dir = TempDir::new().expect("tempdir");
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let valid = dir
+            .path()
+            .join(format!("rollout-2025-01-02T10-00-00-{thread_id}.jsonl"));
+        let malformed = dir.path().join("rollout-malformed.jsonl");
+        let line = RolloutLine {
+            timestamp: "2025-01-02T10-00-00".to_string(),
+            ordinal: None,
+            item: RolloutItem::ResponseItem(ResponseItem::Other),
+        };
+        let contents = format!(
+            "{}\n",
+            serde_json::to_string(&line).expect("serialize rollout line")
+        );
+        std::fs::write(&valid, &contents).expect("write filename fallback rollout");
+        std::fs::write(&malformed, contents).expect("write malformed-name rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&valid),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+        assert_eq!(
+            thread_id_from_rollout(&malformed),
+            RolloutThreadId::MalformedName
         );
     }
 
