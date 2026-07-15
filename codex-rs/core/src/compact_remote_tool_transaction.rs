@@ -3,8 +3,12 @@ use crate::context_manager::truncate_function_output_payload;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 
 const CONTEXT_WINDOW_ERROR: &str = "remote compaction did not install because the latest complete tool transaction does not fit the model context window";
 const BASELINE_CONTEXT_WINDOW_ERROR: &str = "remote compaction did not install because the compacted replacement history does not fit the model context window";
@@ -102,28 +106,15 @@ fn bounded_terminal_tool_transaction(
 ) -> CodexResult<Vec<ResponseItem>> {
     let mut transaction = transaction.to_vec();
     for item in &mut transaction {
-        match item {
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => {
-                *output = truncate_function_output_payload(
-                    output,
-                    TruncationPolicy::Tokens(MAX_REATTACHED_OUTPUT_TOKENS),
-                );
-            }
-            _ => {}
+        if matches!(
+            item,
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+        ) {
+            bound_function_output_item(item)?;
         }
-    }
 
-    let empty_instructions = BaseInstructions {
-        text: String::new(),
-    };
-    for item in &transaction {
-        let mut item_context = ContextManager::new();
-        item_context.replace(vec![item.clone()]);
-        if let Some(estimated_tokens) =
-            item_context.estimate_token_count_with_base_instructions(&empty_instructions)
-            && estimated_tokens > MAX_REATTACHED_ITEM_TOKENS
-        {
+        let estimated_tokens = estimate_item_tokens(item);
+        if estimated_tokens > MAX_REATTACHED_ITEM_TOKENS {
             return Err(CodexErr::InvalidRequest(format!(
                 "{ITEM_LIMIT_ERROR} (estimated {estimated_tokens} tokens)"
             )));
@@ -131,6 +122,73 @@ fn bounded_terminal_tool_transaction(
     }
 
     Ok(transaction)
+}
+
+/// Reduces a trimmable tool output until the serialized response item fits the hard cap.
+///
+/// `TruncationPolicy::Tokens` limits only the output body. The model sees the enclosing
+/// response-item JSON too, so reserve exactly the observed envelope cost instead of relying on a
+/// fixed slack that can be exceeded by a long call id or custom-tool name.
+fn bound_function_output_item(item: &mut ResponseItem) -> CodexResult<()> {
+    let original_output = match item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.clone(),
+        _ => return Ok(()),
+    };
+    let mut output_tokens =
+        function_output_text_token_count(&original_output).min(MAX_REATTACHED_OUTPUT_TOKENS);
+
+    loop {
+        match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                *output = truncate_function_output_payload(
+                    &original_output,
+                    TruncationPolicy::Tokens(output_tokens),
+                );
+            }
+            _ => unreachable!("response item kind was checked before bounding output"),
+        }
+        let estimated_tokens = estimate_item_tokens(item);
+        if estimated_tokens <= MAX_REATTACHED_ITEM_TOKENS {
+            return Ok(());
+        }
+        if output_tokens == 0 {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{ITEM_LIMIT_ERROR} (estimated {estimated_tokens} tokens)"
+            )));
+        }
+
+        let excess_tokens =
+            usize::try_from(estimated_tokens.saturating_sub(MAX_REATTACHED_ITEM_TOKENS))
+                .unwrap_or(usize::MAX)
+                .max(1);
+        output_tokens = output_tokens.saturating_sub(excess_tokens);
+    }
+}
+
+fn function_output_text_token_count(output: &FunctionCallOutputPayload) -> usize {
+    match &output.body {
+        FunctionCallOutputBody::Text(text) => approx_token_count(text),
+        FunctionCallOutputBody::ContentItems(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(approx_token_count(text)),
+                FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+            })
+            .fold(0usize, usize::saturating_add),
+    }
+}
+
+fn estimate_item_tokens(item: &ResponseItem) -> i64 {
+    let mut item_context = ContextManager::new();
+    item_context.replace(vec![item.clone()]);
+    item_context
+        .estimate_token_count_with_base_instructions(&BaseInstructions {
+            text: String::new(),
+        })
+        .unwrap_or(i64::MAX)
 }
 
 fn latest_terminal_tool_transaction(history: &[ResponseItem]) -> Option<&[ResponseItem]> {
