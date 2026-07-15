@@ -42,6 +42,7 @@ struct RolloutScan {
     reached_scan_cap: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum RolloutThreadId {
     Id(String),
     MalformedName,
@@ -1278,6 +1279,140 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_does_not_materialize_huge_trailing_rollout_line() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let metadata_line_bytes = std::fs::metadata(&path).expect("rollout metadata").len();
+        let sparse_trailing_bytes = 1024 * 1024 * 1024_u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open rollout for sparse extension")
+            .set_len(metadata_line_bytes + sparse_trailing_bytes)
+            .expect("append sparse trailing line");
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("rollout metadata").len(),
+            metadata_line_bytes + sparse_trailing_bytes
+        );
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_accepts_session_meta_ending_at_exact_byte_limit() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let mut contents = std::fs::read(&path).expect("read rollout");
+        assert_eq!(contents.pop(), Some(b'\n'));
+        contents.resize(MAX_ROLLOUT_METADATA_SCAN_BYTES, b' ');
+        std::fs::write(&path, &contents).expect("write exact-limit rollout");
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("rollout metadata").len(),
+            MAX_ROLLOUT_METADATA_SCAN_BYTES as u64
+        );
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_rejects_record_crossing_byte_limit() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let mut contents = std::fs::read(&path).expect("read rollout");
+        assert_eq!(contents.pop(), Some(b'\n'));
+        contents.resize(MAX_ROLLOUT_METADATA_SCAN_BYTES + 1, b' ');
+        std::fs::write(&path, &contents).expect("write over-limit rollout");
+
+        let RolloutThreadId::Unusable(reason) = thread_id_from_rollout(&path) else {
+            panic!("over-limit rollout should be unusable");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "rollout metadata record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_recovers_session_meta_after_blank_and_corrupt_records() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let metadata = std::fs::read(&path).expect("read rollout metadata");
+        let mut contents = b"\n{ definitely not json }\n".to_vec();
+        contents.extend(metadata);
+        assert!(contents.len() < MAX_ROLLOUT_METADATA_SCAN_BYTES);
+        std::fs::write(&path, contents).expect("write recoverable rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
+    #[test]
+    fn thread_id_scan_preserves_empty_and_corrupt_diagnostics() {
+        let dir = TempDir::new().expect("tempdir");
+        let empty = dir
+            .path()
+            .join("rollout-2025-01-02T10-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let corrupt = dir
+            .path()
+            .join("rollout-2025-01-02T11-00-00-00000000-0000-0000-0000-000000000002.jsonl");
+        std::fs::write(&empty, "").expect("write empty rollout");
+        std::fs::write(&corrupt, "{ definitely not json }\n").expect("write corrupt rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&empty),
+            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+        );
+        assert_eq!(
+            thread_id_from_rollout(&corrupt),
+            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+        );
+    }
+
+    #[test]
+    fn thread_id_scan_uses_safe_filename_fallback_and_reports_malformed_names() {
+        let dir = TempDir::new().expect("tempdir");
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let valid = dir
+            .path()
+            .join(format!("rollout-2025-01-02T10-00-00-{thread_id}.jsonl"));
+        let malformed = dir.path().join("rollout-malformed.jsonl");
+        let line = RolloutLine {
+            timestamp: "2025-01-02T10-00-00".to_string(),
+            ordinal: None,
+            item: RolloutItem::ResponseItem(ResponseItem::Other),
+        };
+        let contents = format!(
+            "{}\n",
+            serde_json::to_string(&line).expect("serialize rollout line")
+        );
+        std::fs::write(&valid, &contents).expect("write filename fallback rollout");
+        std::fs::write(&malformed, contents).expect("write malformed-name rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&valid),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+        assert_eq!(
+            thread_id_from_rollout(&malformed),
+            RolloutThreadId::MalformedName
+        );
     }
 
     struct Fixture {

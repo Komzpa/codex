@@ -26,7 +26,7 @@ async fn process_compacted_history_with_test_session(
         world_state,
         step_context,
     };
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         compacted_history,
         &initial_context_injection,
@@ -174,6 +174,131 @@ fn collect_user_messages_filters_legacy_warnings() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("real user message")], collected);
+}
+
+#[test]
+fn remote_compaction_removes_only_images_before_latest_real_user_message() {
+    let old_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "original objective".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,old".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            ContentItem::OutputText {
+                text: "non-image content".to_string(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let latest_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "latest correction".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,latest".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let assistant_message = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "assistant context".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = vec![
+        old_user_message,
+        assistant_message.clone(),
+        latest_user_message.clone(),
+    ];
+
+    let retained_image_count =
+        crate::compact_remote::remove_image_payloads_before_latest_real_user_message(&mut history);
+
+    assert_eq!(
+        history,
+        vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "original objective".to_string(),
+                    },
+                    ContentItem::OutputText {
+                        text: "non-image content".to_string(),
+                    },
+                ],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            assistant_message,
+            latest_user_message,
+        ]
+    );
+    assert_eq!(retained_image_count, 1);
+}
+
+#[test]
+fn remote_compaction_drops_only_older_messages_emptied_by_image_removal() {
+    let preexisting_empty_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: Vec::new(),
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let old_image_only_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "data:image/png;base64,old".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let latest_image_only_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "data:image/png;base64,latest".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = vec![
+        preexisting_empty_user_message.clone(),
+        old_image_only_user_message,
+        latest_image_only_user_message.clone(),
+    ];
+
+    let retained_image_count =
+        crate::compact_remote::remove_image_payloads_before_latest_real_user_message(&mut history);
+
+    assert_eq!(
+        history,
+        vec![
+            preexisting_empty_user_message,
+            latest_image_only_user_message,
+        ]
+    );
+    assert_eq!(retained_image_count, 1);
 }
 
 #[test]

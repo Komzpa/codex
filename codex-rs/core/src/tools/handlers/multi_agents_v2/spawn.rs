@@ -5,6 +5,7 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::tools::handlers::multi_agents_spec::DEFAULT_MULTI_AGENT_V2_FORK_TURNS;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -195,8 +196,12 @@ impl SpawnAgentArgs {
             .fork_turns
             .as_deref()
             .map(str::trim)
-            .filter(|fork_turns| !fork_turns.is_empty())
-            .unwrap_or("all");
+            .filter(|fork_turns| !fork_turns.is_empty());
+        let Some(fork_turns) = fork_turns else {
+            return Ok(Some(SpawnAgentForkMode::LastNTurns(
+                DEFAULT_MULTI_AGENT_V2_FORK_TURNS,
+            )));
+        };
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -249,3 +254,7 @@ impl ToolOutput for SpawnAgentResult {
         tool_output_code_mode_result(self, "spawn_agent")
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;
