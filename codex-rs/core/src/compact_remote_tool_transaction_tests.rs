@@ -168,6 +168,39 @@ fn reattaches_observed_large_terminal_transaction_with_hard_item_cap() {
 }
 
 #[test]
+fn shrinks_terminal_output_for_its_serialized_response_item_envelope() {
+    // A long, but still valid, call id makes the old 9,500-token body budget serialize as a
+    // 10,015-token response item. The reattached output must give up body tokens, not drop its
+    // matching call/output transaction.
+    let call_id = format!("call-{}", "x".repeat(1_969));
+    let call = function_call(&call_id, "exec");
+    let output_text = "x".repeat(50_494);
+    let output = function_output(&call_id, output_text.clone());
+    let old_bounded_output = function_output(
+        &call_id,
+        truncate_text(
+            &output_text,
+            TruncationPolicy::Tokens(MAX_REATTACHED_OUTPUT_TOKENS),
+        ),
+    );
+    assert_eq!(estimate_item_tokens(&old_bounded_output), 10_015);
+
+    let result = reattach_latest_complete_tool_transaction(
+        vec![compaction()],
+        &[call.clone(), output],
+        Some(100_000),
+        &empty_instructions(),
+    )
+    .expect("trimmable output should fit its complete response-item envelope");
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0], call);
+    assert_ne!(result[1], old_bounded_output);
+    assert_eq!(estimate_item_tokens(&result[1]), MAX_REATTACHED_ITEM_TOKENS);
+    assert!(matches!(result[1], ResponseItem::FunctionCallOutput { .. }));
+}
+
+#[test]
 fn removes_unbounded_source_when_bounded_transaction_is_already_present() {
     let call = function_call("17", "wait");
     let output_text = "x".repeat(50_494);
