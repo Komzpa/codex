@@ -251,6 +251,54 @@ fn remote_compaction_removes_only_images_before_latest_real_user_message() {
 }
 
 #[test]
+fn remote_compaction_drops_only_older_messages_emptied_by_image_removal() {
+    let preexisting_empty_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: Vec::new(),
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let old_image_only_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "data:image/png;base64,old".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let latest_image_only_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "data:image/png;base64,latest".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = vec![
+        preexisting_empty_user_message.clone(),
+        old_image_only_user_message,
+        latest_image_only_user_message.clone(),
+    ];
+
+    let retained_image_count =
+        crate::compact_remote::remove_image_payloads_before_latest_real_user_message(&mut history);
+
+    assert_eq!(
+        history,
+        vec![
+            preexisting_empty_user_message,
+            latest_image_only_user_message,
+        ]
+    );
+    assert_eq!(retained_image_count, 1);
+}
+
+#[test]
 fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // Use a small truncation limit so the test remains fast while still validating
     // that oversized user content is truncated.

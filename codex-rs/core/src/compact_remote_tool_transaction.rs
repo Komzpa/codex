@@ -7,6 +7,7 @@ use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::TruncationPolicy;
 
 const CONTEXT_WINDOW_ERROR: &str = "remote compaction did not install because the latest complete tool transaction does not fit the model context window";
+const BASELINE_CONTEXT_WINDOW_ERROR: &str = "remote compaction did not install because the compacted replacement history does not fit the model context window";
 const ITEM_LIMIT_ERROR: &str = "remote compaction did not install because the latest complete tool transaction contains an item above the 10000-token hard limit";
 const MAX_REATTACHED_ITEM_TOKENS: i64 = 10_000;
 // Leave room inside the per-item limit for the response-item JSON envelope.
@@ -25,6 +26,16 @@ pub(crate) fn reattach_latest_complete_tool_transaction(
     context_window: Option<i64>,
     base_instructions: &BaseInstructions,
 ) -> CodexResult<Vec<ResponseItem>> {
+    if let Some(context_window) = context_window
+        && let Some(estimated_tokens) =
+            estimated_history_tokens(&compacted_history, base_instructions)
+        && estimated_tokens > context_window
+    {
+        return Err(CodexErr::InvalidRequest(format!(
+            "{BASELINE_CONTEXT_WINDOW_ERROR} (estimated {estimated_tokens} tokens, limit {context_window})"
+        )));
+    }
+
     let Some(source_transaction) = latest_terminal_tool_transaction(trace_input_history) else {
         return Ok(compacted_history);
     };
@@ -64,20 +75,26 @@ pub(crate) fn reattach_latest_complete_tool_transaction(
         (Some(_), Some(_)) | (None, Some(_)) => {}
     }
 
-    if let Some(context_window) = context_window {
-        let mut candidate = ContextManager::new();
-        candidate.replace(compacted_history.clone());
-        if let Some(estimated_tokens) =
-            candidate.estimate_token_count_with_base_instructions(base_instructions)
-            && estimated_tokens > context_window
-        {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{CONTEXT_WINDOW_ERROR} (estimated {estimated_tokens} tokens, limit {context_window})"
-            )));
-        }
+    if let Some(context_window) = context_window
+        && let Some(estimated_tokens) =
+            estimated_history_tokens(&compacted_history, base_instructions)
+        && estimated_tokens > context_window
+    {
+        return Err(CodexErr::InvalidRequest(format!(
+            "{CONTEXT_WINDOW_ERROR} (estimated {estimated_tokens} tokens, limit {context_window})"
+        )));
     }
 
     Ok(compacted_history)
+}
+
+fn estimated_history_tokens(
+    history: &[ResponseItem],
+    base_instructions: &BaseInstructions,
+) -> Option<i64> {
+    let mut context = ContextManager::new();
+    context.replace(history.to_vec());
+    context.estimate_token_count_with_base_instructions(base_instructions)
 }
 
 fn bounded_terminal_tool_transaction(

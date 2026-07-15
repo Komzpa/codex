@@ -370,16 +370,44 @@ fn does_not_move_a_nonterminal_or_unmatched_transaction_across_compaction() {
 }
 
 #[test]
-fn fails_closed_when_exact_transaction_would_exceed_context_window() {
+fn fails_closed_when_compacted_baseline_exceeds_context_window() {
+    let compacted_history = vec![message("developer", "fresh"), compaction()];
+    let estimated_tokens = estimated_history_tokens(&compacted_history, &empty_instructions())
+        .expect("baseline token estimate");
+    let context_window = estimated_tokens.saturating_sub(1);
+
+    let error = reattach_latest_complete_tool_transaction(
+        compacted_history,
+        &[],
+        Some(context_window),
+        &empty_instructions(),
+    )
+    .expect_err("an oversized compacted baseline must not be installed");
+
+    let CodexErr::InvalidRequest(message) = error else {
+        panic!("expected explicit invalid-request reason, got {error}");
+    };
+    assert_eq!(
+        message,
+        format!(
+            "{BASELINE_CONTEXT_WINDOW_ERROR} (estimated {estimated_tokens} tokens, limit {context_window})"
+        )
+    );
+}
+
+#[test]
+fn fails_closed_when_reattached_transaction_crosses_context_window() {
     let call = function_call("17", "wait");
     let output = function_output("17", "x".repeat(4096));
     let trace_input_history = vec![call, output];
     let compacted_history = vec![message("developer", "fresh"), compaction()];
+    let context_window = estimated_history_tokens(&compacted_history, &empty_instructions())
+        .expect("baseline token estimate");
 
     let error = reattach_latest_complete_tool_transaction(
         compacted_history,
         &trace_input_history,
-        Some(0),
+        Some(context_window),
         &empty_instructions(),
     )
     .expect_err("an exact pair that cannot fit must not be installed lossily");
@@ -389,7 +417,7 @@ fn fails_closed_when_exact_transaction_would_exceed_context_window() {
     };
     assert!(message.starts_with(CONTEXT_WINDOW_ERROR));
     assert!(message.contains("estimated "));
-    assert!(message.ends_with("tokens, limit 0)"));
+    assert!(message.ends_with(format!("tokens, limit {context_window})").as_str()));
 }
 
 #[test]

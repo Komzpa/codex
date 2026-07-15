@@ -389,20 +389,31 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
 }
 
 pub(crate) fn remove_image_payloads_before_latest_real_user_message(
-    items: &mut [ResponseItem],
+    items: &mut Vec<ResponseItem>,
 ) -> usize {
-    if let Some(latest_real_user_index) = items.iter().rposition(|item| {
+    if let Some(mut latest_real_user_index) = items.iter().rposition(|item| {
         matches!(
             crate::event_mapping::parse_turn_item(item),
             Some(TurnItem::UserMessage(_))
         )
     }) {
-        for item in &mut items[..latest_real_user_index] {
-            let ResponseItem::Message { role, content, .. } = item else {
-                continue;
+        let mut index = 0;
+        while index < latest_real_user_index {
+            let newly_empty_image_message = match &mut items[index] {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    let had_image = content
+                        .iter()
+                        .any(|item| matches!(item, ContentItem::InputImage { .. }));
+                    content.retain(|item| !matches!(item, ContentItem::InputImage { .. }));
+                    had_image && content.is_empty()
+                }
+                _ => false,
             };
-            if role == "user" {
-                content.retain(|item| !matches!(item, ContentItem::InputImage { .. }));
+            if newly_empty_image_message {
+                items.remove(index);
+                latest_real_user_index -= 1;
+            } else {
+                index += 1;
             }
         }
     }

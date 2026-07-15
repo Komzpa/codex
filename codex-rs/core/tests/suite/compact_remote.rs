@@ -2074,7 +2074,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_mid_turn_tool_transaction_overflow_keeps_history_and_window() -> Result<()> {
+async fn remote_mid_turn_compacted_baseline_overflow_keeps_history_and_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
@@ -2176,7 +2176,7 @@ async fn remote_mid_turn_tool_transaction_overflow_keeps_history_and_window() ->
         "failed installation must not advance the context window"
     );
     assert!(
-        first_error.contains("latest complete tool transaction does not fit"),
+        first_error.contains("compacted replacement history does not fit"),
         "expected explicit fail-closed reason, got {first_error}"
     );
     assert!(
