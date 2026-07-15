@@ -28,6 +28,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -40,6 +41,10 @@ use codex_rollout_trace::CompactionCheckpointTracePayload;
 mod request;
 use request::RemoteCompactAttempt;
 use request::run_remote_compact_attempt;
+
+#[path = "compact_remote_tool_transaction.rs"]
+mod tool_transaction;
+pub(crate) use tool_transaction::reattach_latest_complete_tool_transaction;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
@@ -257,14 +262,28 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) = process_compacted_history(
+    let (new_history, world_state_baseline, retained_image_count) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         new_history,
         &initial_context_injection,
     )
     .await;
+    analytics_details.retained_image_count = Some(retained_image_count);
+    let new_history = if matches!(compaction_metadata.phase(), CompactionPhase::MidTurn) {
+        let base_instructions = sess.get_base_instructions().await;
+        reattach_latest_complete_tool_transaction(
+            new_history,
+            &trace_input_history,
+            compaction_turn_context.model_context_window(),
+            &base_instructions,
+        )?
+    } else {
+        new_history
+    };
+    // Advance only after the replacement history passes the lossless-install check. On failure,
+    // the old history and its current window remain live.
+    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -307,7 +326,7 @@ pub(crate) async fn process_compacted_history(
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+) -> (Vec<ResponseItem>, Option<Arc<WorldState>>, usize) {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
@@ -315,9 +334,12 @@ pub(crate) async fn process_compacted_history(
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
     compacted_history.retain(should_keep_compacted_history_item);
+    let retained_image_count =
+        remove_image_payloads_before_latest_real_user_message(&mut compacted_history);
     (
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
+        retained_image_count,
     )
 }
 
@@ -364,6 +386,47 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Other => false,
     }
+}
+
+pub(crate) fn remove_image_payloads_before_latest_real_user_message(
+    items: &mut Vec<ResponseItem>,
+) -> usize {
+    if let Some(mut latest_real_user_index) = items.iter().rposition(|item| {
+        matches!(
+            crate::event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(_))
+        )
+    }) {
+        let mut index = 0;
+        while index < latest_real_user_index {
+            let newly_empty_image_message = match &mut items[index] {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    let had_image = content
+                        .iter()
+                        .any(|item| matches!(item, ContentItem::InputImage { .. }));
+                    content.retain(|item| !matches!(item, ContentItem::InputImage { .. }));
+                    had_image && content.is_empty()
+                }
+                _ => false,
+            };
+            if newly_empty_image_message {
+                items.remove(index);
+                latest_real_user_index -= 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+        .count()
 }
 
 pub(crate) fn trim_function_call_history_to_fit_context_window(

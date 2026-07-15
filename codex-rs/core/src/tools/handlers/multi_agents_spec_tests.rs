@@ -93,6 +93,23 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         Some(true)
     );
     assert!(properties.contains_key("fork_turns"));
+    assert_eq!(
+        properties
+            .get("fork_turns")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Optional number of turns to fork. Defaults to the most recent 3 turns. Use `none`, `all`, or a positive integer string such as `3`."
+        )
+    );
+    assert!(description.contains("Omitting `fork_turns` passes the most recent 3 turns."));
+    assert!(
+        description.contains(
+            "Note that passing `fork_turns=\"none\"` will not pass any surrounding context"
+        )
+    );
+    assert!(description.contains(
+        "whereas `fork_turns=\"all\"` will provide the subagent with all surrounding context"
+    ));
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(

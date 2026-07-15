@@ -68,6 +68,36 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
         .saturating_add(approx_token_count(&request.instructions_text()))
 }
 
+fn assert_exact_tool_transaction_before_last_compaction(
+    request: &responses::ResponsesRequest,
+    compact_request: &responses::ResponsesRequest,
+    call_id: &str,
+) {
+    let input = request.input();
+    let compaction_index = input
+        .iter()
+        .rposition(|item| item["type"] == "compaction")
+        .expect("continuation should include the opaque compaction item");
+    assert!(compaction_index >= 2);
+    let compact_input = compact_request.input();
+    let expected = compact_input
+        .windows(2)
+        .rev()
+        .find(|items| {
+            items[0]["type"] == "function_call"
+                && items[0]["call_id"] == call_id
+                && items[1]["type"] == "function_call_output"
+                && items[1]["call_id"] == call_id
+        })
+        .expect("compact input should contain the exact completed transaction");
+    assert_eq!(
+        &input[compaction_index - 2..compaction_index],
+        expected,
+        "continuation should preserve the transaction's complete JSON payload"
+    );
+    assert_eq!(input[compaction_index]["type"], "compaction");
+}
+
 fn assert_tools_payload_does_not_defer(body: &Value) {
     if let Some(tools) = body.get("tools") {
         assert!(
@@ -2043,6 +2073,132 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_mid_turn_compacted_baseline_overflow_keeps_history_and_window() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_context_window = Some(20_000);
+                config.model_auto_compact_token_limit = Some(200);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let rollout_path = harness
+        .test()
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    let responses_mock = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            responses::ev_function_call("fail-closed-call", DUMMY_FUNCTION_NAME, "{}"),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+        ]),
+    )
+    .await;
+    let compact_mock = responses::mount_compact_response_sequence(
+        harness.server(),
+        vec![
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "output": [{
+                        "type": "compaction",
+                        "encrypted_content": "x".repeat(200_000),
+                    }],
+                })),
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({ "output": "invalid compact payload shape" })),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "preserve terminal tool state".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let first_error = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Error(error) => Some(error.message.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_turn_complete(&codex).await;
+
+    codex.submit(Op::Compact).await?;
+    let second_error = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Error(error) => Some(error.message.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_turn_complete(&codex).await;
+
+    let compact_requests = compact_mock.requests();
+    assert_eq!(compact_requests.len(), 2);
+    assert_eq!(
+        compact_requests[1].input(),
+        compact_requests[0].input(),
+        "failed installation must leave the exact pre-compaction history live"
+    );
+    assert!(compact_requests[0].has_function_call("fail-closed-call"));
+    assert!(
+        compact_requests[0]
+            .function_call_output_text("fail-closed-call")
+            .is_some()
+    );
+    let compact_metadata = compact_requests
+        .iter()
+        .map(|request| {
+            serde_json::from_str::<Value>(
+                &request
+                    .header("x-codex-turn-metadata")
+                    .expect("compact request should include turn metadata"),
+            )
+            .expect("compact turn metadata should be valid json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_metadata[1]["window_id"], compact_metadata[0]["window_id"],
+        "failed installation must not advance the context window"
+    );
+    assert!(
+        first_error.contains("compacted replacement history does not fit"),
+        "expected explicit fail-closed reason, got {first_error}"
+    );
+    assert!(
+        second_error.contains("Error running remote compact task"),
+        "expected the observation request to fail before installing history, got {second_error}"
+    );
+
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    assert_eq!(responses_mock.requests().len(), 1);
+    let installed_compaction = fs::read_to_string(rollout_path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .any(|line| matches!(line.item, RolloutItem::Compacted(_)));
+    assert!(
+        !installed_compaction,
+        "failed exact-pair preservation must not record replacement history"
+    );
+
+    Ok(())
+}
+
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result<()> {
@@ -3842,6 +3998,11 @@ async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()> {
         requests[2].header(TURN_STATE_HEADER).as_deref(),
         Some("sampling-state")
     );
+    assert_exact_tool_transaction_before_last_compaction(
+        &requests[2],
+        &compact_request,
+        "call-before-compact",
+    );
 
     Ok(())
 }
@@ -3932,6 +4093,11 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
     assert_eq!(
         requests[2].header(TURN_STATE_HEADER).as_deref(),
         Some("sampling-state")
+    );
+    assert_exact_tool_transaction_before_last_compaction(
+        &requests[2],
+        &requests[1],
+        "call-before-compact",
     );
     assert_eq!(
         requests[3].header(TURN_STATE_HEADER).as_deref(),
@@ -4100,7 +4266,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     insta::assert_snapshot!(
         "remote_mid_turn_compaction_shapes",
         format_labeled_requests_snapshot(
-            "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.",
+            "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request reattaches the exact completed transaction immediately before the returned compaction item.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Compaction History Layout", &requests[1]),
