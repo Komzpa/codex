@@ -509,58 +509,64 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
 }
 
 fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
-    let line = match first_rollout_record(path) {
-        Ok(Some(line)) => line,
-        Ok(None) => {
+    let items = match rollout_items_from_bounded_prefix(path) {
+        Ok(items) if items.is_empty() => {
             return RolloutThreadId::Unusable("no parseable rollout items".to_string());
         }
+        Ok(items) => items,
         Err(err) => return RolloutThreadId::Unusable(err.to_string()),
     };
-    let record = match serde_json::from_slice::<RolloutLine>(&line) {
-        Ok(record) => record,
-        Err(err) => {
-            return RolloutThreadId::Unusable(format!(
-                "failed to parse first rollout record: {err}"
-            ));
-        }
-    };
-    codex_rollout::builder_from_items(std::slice::from_ref(&record.item), path)
+    codex_rollout::builder_from_items(&items, path)
         .map(|builder| RolloutThreadId::Id(builder.id.to_string()))
         .unwrap_or(RolloutThreadId::MalformedName)
 }
 
-fn first_rollout_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    let mut reader = BufReader::new(File::open(path)?);
+fn rollout_items_from_bounded_prefix(
+    path: &Path,
+) -> std::io::Result<Vec<codex_protocol::protocol::RolloutItem>> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    // Put the limit below BufReader so its internal prefetch cannot read beyond the cap.
+    let mut reader = BufReader::new(file.take(MAX_ROLLOUT_METADATA_SCAN_BYTES as u64));
     let mut scanned = 0usize;
+    let mut first_parseable = None;
     loop {
-        let remaining = MAX_ROLLOUT_METADATA_SCAN_BYTES
-            .saturating_add(1)
-            .saturating_sub(scanned);
-        if remaining == 0 {
-            return Err(std::io::Error::other(format!(
-                "first rollout record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
-            )));
-        }
-
         let mut line = Vec::new();
-        let read = reader
-            .by_ref()
-            .take(remaining as u64)
-            .read_until(b'\n', &mut line)?;
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
-            return Ok(None);
+            break;
         }
         scanned = scanned.saturating_add(read);
-        if scanned > MAX_ROLLOUT_METADATA_SCAN_BYTES {
+        let record_is_complete = line.ends_with(b"\n") || scanned as u64 >= file_len;
+        if !record_is_complete {
+            if let Some(item) = first_parseable {
+                return Ok(vec![item]);
+            }
             return Err(std::io::Error::other(format!(
-                "first rollout record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
+                "rollout metadata record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
             )));
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        return Ok(Some(line));
+        let Ok(record) = serde_json::from_slice::<RolloutLine>(&line) else {
+            continue;
+        };
+        if matches!(
+            &record.item,
+            codex_protocol::protocol::RolloutItem::SessionMeta(_)
+        ) {
+            return Ok(vec![record.item]);
+        }
+        first_parseable.get_or_insert(record.item);
     }
+
+    if first_parseable.is_none() && (scanned as u64) < file_len {
+        return Err(std::io::Error::other(format!(
+            "rollout metadata scan reached {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte limit"
+        )));
+    }
+    Ok(first_parseable.into_iter().collect())
 }
 
 fn is_rollout_file(path: &Path) -> bool {
@@ -860,6 +866,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn thread_id_scan_accepts_session_meta_ending_at_exact_byte_limit() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let mut contents = std::fs::read(&path).expect("read rollout");
+        assert_eq!(contents.pop(), Some(b'\n'));
+        contents.resize(MAX_ROLLOUT_METADATA_SCAN_BYTES, b' ');
+        std::fs::write(&path, &contents).expect("write exact-limit rollout");
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("rollout metadata").len(),
+            MAX_ROLLOUT_METADATA_SCAN_BYTES as u64
+        );
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_rejects_record_crossing_byte_limit() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let mut contents = std::fs::read(&path).expect("read rollout");
+        assert_eq!(contents.pop(), Some(b'\n'));
+        contents.resize(MAX_ROLLOUT_METADATA_SCAN_BYTES + 1, b' ');
+        std::fs::write(&path, &contents).expect("write over-limit rollout");
+
+        let RolloutThreadId::Unusable(reason) = thread_id_from_rollout(&path) else {
+            panic!("over-limit rollout should be unusable");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "rollout metadata record exceeds {MAX_ROLLOUT_METADATA_SCAN_BYTES} byte scan limit"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_id_scan_recovers_session_meta_after_blank_and_corrupt_records() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let metadata = std::fs::read(&path).expect("read rollout metadata");
+        let mut contents = b"\n{ definitely not json }\n".to_vec();
+        contents.extend(metadata);
+        assert!(contents.len() < MAX_ROLLOUT_METADATA_SCAN_BYTES);
+        std::fs::write(&path, contents).expect("write recoverable rollout");
+
+        assert_eq!(
+            thread_id_from_rollout(&path),
+            RolloutThreadId::Id(thread_id.to_string())
+        );
+    }
+
     #[test]
     fn thread_id_scan_preserves_empty_and_corrupt_diagnostics() {
         let dir = TempDir::new().expect("tempdir");
@@ -876,10 +940,10 @@ mod tests {
             thread_id_from_rollout(&empty),
             RolloutThreadId::Unusable("no parseable rollout items".to_string())
         );
-        let RolloutThreadId::Unusable(reason) = thread_id_from_rollout(&corrupt) else {
-            panic!("corrupt rollout should be unusable");
-        };
-        assert!(reason.starts_with("failed to parse first rollout record:"));
+        assert_eq!(
+            thread_id_from_rollout(&corrupt),
+            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+        );
     }
 
     #[test]

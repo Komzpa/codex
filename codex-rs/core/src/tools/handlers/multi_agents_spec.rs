@@ -746,7 +746,7 @@ Only call this tool for a concrete, bounded subtask that can run independently a
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 
-Omitting `fork_turns` passes the most recent {DEFAULT_MULTI_AGENT_V2_FORK_TURNS} turns. Passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
+Omitting `fork_turns` passes the most recent {DEFAULT_MULTI_AGENT_V2_FORK_TURNS} turns. Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {
