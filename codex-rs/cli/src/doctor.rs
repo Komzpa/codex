@@ -95,6 +95,7 @@ const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=20
 const WEBSOCKET_IMMEDIATE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const SLOW_CHECK_PROGRESS_THRESHOLD: Duration = Duration::from_secs(2);
 const SLOW_CHECK_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+const SQLITE_INTEGRITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_ENV_VARS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -2202,19 +2203,30 @@ async fn sqlite_integrity_detail(
         return;
     }
 
-    match codex_state::sqlite_integrity_check(path).await {
-        Ok(rows) if rows.iter().all(|row| row == "ok") => {
+    match tokio::time::timeout(
+        SQLITE_INTEGRITY_CHECK_TIMEOUT,
+        codex_state::sqlite_integrity_check(path),
+    )
+    .await
+    {
+        Ok(Ok(rows)) if rows.iter().all(|row| row == "ok") => {
             details.push(format!("{label} integrity: ok"));
         }
-        Ok(rows) => {
+        Ok(Ok(rows)) => {
             let message = format!("{label} integrity: {}", rows.join("; "));
             integrity_failures.push(message.clone());
             details.push(message);
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let message = format!("{label} integrity: {err}");
             integrity_failures.push(message.clone());
             details.push(message);
+        }
+        Err(_) => {
+            details.push(format!(
+                "{label} integrity: timed out after {} ms (incomplete, database not marked corrupt)",
+                SQLITE_INTEGRITY_CHECK_TIMEOUT.as_millis()
+            ));
         }
     }
 }

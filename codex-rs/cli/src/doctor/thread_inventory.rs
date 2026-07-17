@@ -21,7 +21,7 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
-const MAX_PARITY_SCAN_FILES: usize = 10_000;
+const MAX_PARITY_SCAN_FILES: usize = 50_000;
 const MAX_ROLLOUT_METADATA_SCAN_BYTES: usize = 256 * 1024;
 const SAMPLE_LIMIT: usize = 5;
 const SUMMARY_LIMIT: usize = 8;
@@ -509,6 +509,14 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
 }
 
 fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
+    // The canonical rollout filename already carries the thread UUID. Parse it
+    // first so doctor remains O(directory entries) instead of opening every
+    // protected multi-gigabyte transcript. Only legacy/non-canonical names need
+    // the bounded metadata fallback below.
+    if let Some(thread_id) = thread_id_from_rollout_filename(path) {
+        return RolloutThreadId::Id(thread_id);
+    }
+
     let items = match rollout_items_from_bounded_prefix(path) {
         Ok(items) if items.is_empty() => {
             return RolloutThreadId::Unusable("no parseable rollout items".to_string());
@@ -519,6 +527,19 @@ fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
     codex_rollout::builder_from_items(&items, path)
         .map(|builder| RolloutThreadId::Id(builder.id.to_string()))
         .unwrap_or(RolloutThreadId::MalformedName)
+}
+
+fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
+    // Expected: rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl. UUIDs contain hyphens,
+    // so inspect every hyphen-delimited suffix from right to left.
+    let name = path.file_name()?.to_str()?;
+    let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    core.match_indices('-').rev().find_map(|(index, _)| {
+        let candidate = &core[index + 1..];
+        codex_protocol::ThreadId::from_string(candidate)
+            .ok()
+            .map(|thread_id| thread_id.to_string())
+    })
 }
 
 fn rollout_items_from_bounded_prefix(
@@ -890,8 +911,10 @@ mod tests {
     async fn thread_id_scan_rejects_record_crossing_byte_limit() {
         let fixture = Fixture::new().await;
         let thread_id = "00000000-0000-0000-0000-000000000001";
-        let path = fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
-        let mut contents = std::fs::read(&path).expect("read rollout");
+        let canonical_path =
+            fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", thread_id);
+        let path = canonical_path.with_file_name("rollout-legacy-metadata.jsonl");
+        let mut contents = std::fs::read(&canonical_path).expect("read rollout");
         assert_eq!(contents.pop(), Some(b'\n'));
         contents.resize(MAX_ROLLOUT_METADATA_SCAN_BYTES + 1, b' ');
         std::fs::write(&path, &contents).expect("write over-limit rollout");
@@ -925,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_id_scan_preserves_empty_and_corrupt_diagnostics() {
+    fn thread_id_scan_uses_canonical_filename_before_empty_or_corrupt_contents() {
         let dir = TempDir::new().expect("tempdir");
         let empty = dir
             .path()
@@ -938,11 +961,11 @@ mod tests {
 
         assert_eq!(
             thread_id_from_rollout(&empty),
-            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+            RolloutThreadId::Id("00000000-0000-0000-0000-000000000001".to_string())
         );
         assert_eq!(
             thread_id_from_rollout(&corrupt),
-            RolloutThreadId::Unusable("no parseable rollout items".to_string())
+            RolloutThreadId::Id("00000000-0000-0000-0000-000000000002".to_string())
         );
     }
 
