@@ -175,6 +175,7 @@ fn function_output_text_token_count(output: &FunctionCallOutputPayload) -> usize
             .filter_map(|item| match item {
                 FunctionCallOutputContentItem::InputText { text } => Some(approx_token_count(text)),
                 FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::InputAudio { .. }
                 | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
             })
             .fold(0usize, usize::saturating_add),

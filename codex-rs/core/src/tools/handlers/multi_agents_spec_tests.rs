@@ -99,7 +99,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .get("fork_turns")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Optional number of turns to fork. Defaults to the most recent 3 turns. Use `none`, `all`, or a positive integer string such as `3`."
+            "Optional number of turns to fork. Defaults to the most recent 3 turns. Use `none`, `all`, or a positive integer string such as `3`. Full-history forks inherit the parent model and reasoning effort."
         )
     );
     assert!(description.contains("Omitting `fork_turns` passes the most recent 3 turns."));

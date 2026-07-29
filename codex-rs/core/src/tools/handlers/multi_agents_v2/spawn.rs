@@ -66,7 +66,11 @@ async fn handle_spawn_agent(
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
     if is_full_history_fork {
-        reject_full_fork_agent_type_override(role_name)?;
+        if role_name.is_some() || args.model.is_some() || args.reasoning_effort.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            ));
+        }
     }
     apply_requested_spawn_agent_model_overrides(
         &session,

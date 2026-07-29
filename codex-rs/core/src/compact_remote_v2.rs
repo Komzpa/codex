@@ -288,17 +288,14 @@ async fn run_remote_compact_task_inner_impl(
     let (compacted_history, retained_images) =
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_history, world_state_baseline, _) = process_compacted_history(
-        sess.as_ref(),
-        compacted_history,
-        &initial_context_injection,
-    )
-    .await;
+    let (new_history, world_state_baseline, _) =
+        process_compacted_history(sess.as_ref(), compacted_history, &initial_context_injection)
+            .await;
     let new_history = if matches!(compaction_metadata.phase(), CompactionPhase::MidTurn) {
         let base_instructions = sess.get_base_instructions().await;
         reattach_latest_complete_tool_transaction(
             new_history,
-            &trace_input_history,
+            trace_input_history.as_deref().unwrap_or_default(),
             compaction_turn_context.model_context_window(),
             &base_instructions,
         )?

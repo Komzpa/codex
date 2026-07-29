@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
@@ -417,11 +418,11 @@ fn fails_closed_when_compacted_baseline_exceeds_context_window() {
     )
     .expect_err("an oversized compacted baseline must not be installed");
 
-    let CodexErr::InvalidRequest(message) = error else {
+    let CodexErrorDetails::InvalidRequest(message) = error.details() else {
         panic!("expected explicit invalid-request reason, got {error}");
     };
     assert_eq!(
-        message,
+        message.as_str(),
         format!(
             "{BASELINE_CONTEXT_WINDOW_ERROR} (estimated {estimated_tokens} tokens, limit {context_window})"
         )
@@ -445,7 +446,7 @@ fn fails_closed_when_reattached_transaction_crosses_context_window() {
     )
     .expect_err("an exact pair that cannot fit must not be installed lossily");
 
-    let CodexErr::InvalidRequest(message) = error else {
+    let CodexErrorDetails::InvalidRequest(message) = error.details() else {
         panic!("expected explicit invalid-request reason, got {error}");
     };
     assert!(message.starts_with(CONTEXT_WINDOW_ERROR));
@@ -470,7 +471,7 @@ fn fails_closed_when_an_untruncatable_transaction_item_exceeds_hard_cap() {
     )
     .expect_err("an oversized call item must not be installed");
 
-    let CodexErr::InvalidRequest(message) = error else {
+    let CodexErrorDetails::InvalidRequest(message) = error.details() else {
         panic!("expected explicit invalid-request reason, got {error}");
     };
     assert!(message.starts_with(ITEM_LIMIT_ERROR));

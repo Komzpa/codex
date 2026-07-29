@@ -267,18 +267,14 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_history, world_state_baseline, retained_image_count) = process_compacted_history(
-        sess.as_ref(),
-        new_history,
-        &initial_context_injection,
-    )
-    .await;
+    let (new_history, world_state_baseline, retained_image_count) =
+        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
     analytics_details.retained_image_count = Some(retained_image_count);
     let new_history = if matches!(compaction_metadata.phase(), CompactionPhase::MidTurn) {
         let base_instructions = sess.get_base_instructions().await;
         reattach_latest_complete_tool_transaction(
             new_history,
-            &trace_input_history,
+            trace_input_history.as_deref().unwrap_or_default(),
             compaction_turn_context.model_context_window(),
             &base_instructions,
         )?
