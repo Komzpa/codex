@@ -188,6 +188,29 @@ impl SqliteConfig {
         migrator: &Migrator,
         telemetry_override: Option<&dyn DbTelemetry>,
     ) -> anyhow::Result<SqlitePool> {
+        let path = LOGS_DB.path(self.home());
+        let started = Instant::now();
+        let ready_pool_result = self.try_open_existing_ready_pool(&path, migrator).await;
+        telemetry::record_init_result(
+            telemetry_override,
+            LOGS_DB.kind,
+            LOGS_DB.open_phase,
+            started.elapsed(),
+            &ready_pool_result,
+        );
+        match ready_pool_result {
+            Ok(Some(pool)) => return Ok(pool),
+            Ok(None) => {}
+            Err(source) => {
+                return Err(RuntimeDbInitError::new(
+                    LOGS_DB.label,
+                    "open ready",
+                    path.as_path(),
+                    source,
+                )
+                .into());
+            }
+        }
         self.open_runtime_db(LOGS_DB, migrator, telemetry_override)
             .await
     }
@@ -274,6 +297,76 @@ impl SqliteConfig {
         Ok(pool)
     }
 
+    /// Open an existing, fully migrated WAL database without startup writes.
+    ///
+    /// `Migrator::run` takes SQLite's migration write lock even when every
+    /// migration is already applied. Likewise, setting `journal_mode` and
+    /// `auto_vacuum` on every connection can contend with active writers.
+    /// Logs are opened by every Codex process, so validate the ready schema
+    /// using reads and reserve the mutating path for new or stale databases.
+    async fn try_open_existing_ready_pool(
+        &self,
+        path: &Path,
+        migrator: &Migrator,
+    ) -> anyhow::Result<Option<SqlitePool>> {
+        if !tokio::fs::try_exists(path).await? {
+            return Ok(None);
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .log_statements(LevelFilter::Off);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await?;
+        if migrator.table_name.as_ref() != "_sqlx_migrations" {
+            pool.close().await;
+            return Ok(None);
+        }
+        let migrations_table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_optional(&pool)
+        .await?
+        .is_some();
+        if !journal_mode.eq_ignore_ascii_case("wal") || !migrations_table_exists {
+            pool.close().await;
+            return Ok(None);
+        }
+
+        let applied = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
+            "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let all_applied_succeeded = applied.iter().all(|(_, success, _)| *success);
+        let every_embedded_migration_matches = migrator.iter().all(|migration| {
+            applied.iter().any(|(version, success, checksum)| {
+                *version == migration.version
+                    && *success
+                    && checksum.as_slice() == migration.checksum.as_ref()
+            })
+        });
+        let no_unknown_migrations = migrator.ignore_missing
+            || applied
+                .iter()
+                .all(|(version, _, _)| migrator.version_exists(*version));
+        if !all_applied_succeeded || !every_embedded_migration_matches || !no_unknown_migrations {
+            pool.close().await;
+            return Ok(None);
+        }
+
+        Ok(Some(pool))
+    }
+
     /// Open a writable Codex SQLite database, creating it if necessary.
     pub async fn open_read_write_pool(&self, path: &Path) -> Result<SqlitePool, Error> {
         let options = SqliteConnectOptions::new()
@@ -301,5 +394,64 @@ impl SqliteConfig {
             .max_connections(1)
             .connect_with(options)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteConfig;
+    use crate::migrations::runtime_logs_migrator;
+    use codex_utils_absolute_path::test_support::PathExt;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn ready_logs_db_opens_without_waiting_for_migration_write_lock() {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-ready-logs-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create test Codex home");
+        let sqlite = SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let logs_path = sqlite.logs_db_path();
+        let initial_pool = sqlite
+            .open_logs_db(&runtime_logs_migrator(), /*telemetry_override*/ None)
+            .await
+            .expect("create migrated logs DB");
+        initial_pool.close().await;
+
+        let writer_pool = sqlite
+            .open_read_write_pool(&logs_path)
+            .await
+            .expect("open competing writer");
+        let mut writer = writer_pool.acquire().await.expect("acquire writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("reserve logs DB writer slot");
+
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlite.open_logs_db(&runtime_logs_migrator(), /*telemetry_override*/ None),
+        )
+        .await
+        .expect("ready logs DB open must not wait for the migration write lock")
+        .expect("open ready logs DB");
+        let table_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE name = 'logs'")
+                .fetch_one(&reopened)
+                .await
+                .expect("query reopened logs DB");
+        assert_eq!(table_count, 1);
+        reopened.close().await;
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut *writer)
+            .await
+            .expect("release logs DB writer slot");
+        drop(writer);
+        writer_pool.close().await;
+        tokio::fs::remove_dir_all(codex_home)
+            .await
+            .expect("remove test Codex home");
     }
 }
