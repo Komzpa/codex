@@ -43,7 +43,10 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
     tracing::trace!(target: "codex_api::sse", "dropped-sse-parent");
     tracing::trace!(target: "codex_api::sse::responses", "dropped-sse-payload");
     tracing::debug!(target: "codex_api::sse::responses", "retained-sse-diagnostic");
-    tracing::trace!(target: "codex_state", "retained-trace");
+    // The default filter is DEBUG here, not TRACE, so codex_state trace events
+    // are dropped and debug events are kept.
+    tracing::trace!(target: "codex_state", "dropped-trace");
+    tracing::debug!(target: "codex_state", "retained-debug");
     tracing::trace!(
         target: "codex_api::responses_websocket_timing",
         payload = "complete timing payload",
@@ -83,7 +86,7 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
                 "codex_api::sse::responses",
                 Some("retained-sse-diagnostic")
             ),
-            ("TRACE", "codex_state", Some("retained-trace")),
+            ("DEBUG", "codex_state", Some("retained-debug")),
         ]
     );
 }
