@@ -21,6 +21,7 @@ const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
+pub(crate) const DEFAULT_MULTI_AGENT_V2_FORK_TURNS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions {
@@ -645,16 +646,13 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         ),
         (
             "fork_turns".to_string(),
-            JsonSchema::string(Some(
-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(format!(
+                "Optional number of turns to fork. Defaults to the most recent {DEFAULT_MULTI_AGENT_V2_FORK_TURNS} turns. Use `none`, `all`, or a positive integer string such as `3`. Full-history forks inherit the parent model and reasoning effort."
+            ))),
         ),
         (
             "model".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
-            )),
+            JsonSchema::string(Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string())),
         ),
         (
             "reasoning_effort".to_string(),
@@ -765,7 +763,7 @@ Only call this tool for a concrete, bounded subtask that can run independently a
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 
-Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
+Omitting `fork_turns` passes the most recent {DEFAULT_MULTI_AGENT_V2_FORK_TURNS} turns. Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context and requires model and reasoning-effort overrides to be omitted."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {

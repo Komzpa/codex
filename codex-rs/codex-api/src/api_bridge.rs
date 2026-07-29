@@ -59,6 +59,31 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
+                    && value
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("server_draining")
+                {
+                    let message = value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Server is draining")
+                        .to_string();
+                    let delay =
+                        extract_header(headers.as_ref(), http::header::RETRY_AFTER.as_str())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(std::time::Duration::from_secs);
+                    let error = CodexErr::new(CodexErrorDetails::ServerDraining(message));
+                    return match delay {
+                        Some(delay) => error.with_retry_delay(delay),
+                        None => error,
+                    };
+                }
+
+                if status == http::StatusCode::SERVICE_UNAVAILABLE
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
                     && matches!(
                         value
                             .get("error")

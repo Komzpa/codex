@@ -19,6 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const MAX_PARITY_SCAN_FILES: usize = 10_000;
+const MAX_ROLLOUT_HEADER_BYTES: u64 = 256 * 1024;
 const MAX_ROLLOUT_HEADER_LINES: usize = 64;
 const SAMPLE_LIMIT: usize = 5;
 const SUMMARY_LIMIT: usize = 8;
@@ -42,6 +43,7 @@ struct RolloutScan {
     reached_scan_cap: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum RolloutThreadId {
     Id(String),
     MalformedName,
@@ -525,10 +527,13 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
 }
 
 async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
-    let mut lines = match codex_rollout::open_rollout_line_reader(path).await {
-        Ok(lines) => lines,
-        Err(err) => return RolloutThreadId::Unusable(err.to_string()),
-    };
+    let mut lines =
+        match codex_rollout::open_rollout_line_reader_with_limit(path, MAX_ROLLOUT_HEADER_BYTES)
+            .await
+        {
+            Ok(lines) => lines,
+            Err(err) => return RolloutThreadId::Unusable(err.to_string()),
+        };
     let mut has_legacy_item = false;
 
     for _ in 0..MAX_ROLLOUT_HEADER_LINES {

@@ -5,6 +5,7 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::tools::handlers::multi_agents_spec::DEFAULT_MULTI_AGENT_V2_FORK_TURNS;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -69,6 +70,17 @@ async fn handle_spawn_agent(
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+    // Local behavior: a full-history fork inherits the parent's agent type,
+    // model and reasoning effort, so reject explicit overrides instead of
+    // silently ignoring them. This keeps upstream's `|| role_name.is_some()`
+    // branch below equivalent to the local `!is_full_history_fork`.
+    if is_full_history_fork
+        && (role_name.is_some() || args.model.is_some() || args.reasoning_effort.is_some())
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+        ));
+    }
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
@@ -213,8 +225,12 @@ impl SpawnAgentArgs {
             .fork_turns
             .as_deref()
             .map(str::trim)
-            .filter(|fork_turns| !fork_turns.is_empty())
-            .unwrap_or("all");
+            .filter(|fork_turns| !fork_turns.is_empty());
+        let Some(fork_turns) = fork_turns else {
+            return Ok(Some(SpawnAgentForkMode::LastNTurns(
+                DEFAULT_MULTI_AGENT_V2_FORK_TURNS,
+            )));
+        };
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -267,3 +283,7 @@ impl ToolOutput for SpawnAgentResult {
         tool_output_code_mode_result(self, "spawn_agent")
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;
