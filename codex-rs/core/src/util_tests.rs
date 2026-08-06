@@ -432,3 +432,49 @@ fn normalize_thread_name_trims_and_rejects_empty() {
         Some("my thread".to_string())
     );
 }
+
+#[test]
+fn stream_reconnect_delay_caps_runaway_exponential_backoff() {
+    // Without a ceiling, attempt 20 sleeps ~29h and attempt 100 saturates
+    // u64 milliseconds, which reads to the user as a permanently parked turn.
+    for attempt in [15_u64, 20, 100] {
+        assert_eq!(
+            stream_reconnect_delay(attempt, /*requested_delay*/ None),
+            MAX_STREAM_RECONNECT_DELAY,
+            "attempt {attempt} must be clamped",
+        );
+    }
+}
+
+#[test]
+fn stream_reconnect_delay_keeps_early_backoff_snappy() {
+    let delay = stream_reconnect_delay(/*attempt*/ 1, /*requested_delay*/ None);
+    assert!(
+        delay < std::time::Duration::from_secs(1),
+        "first reconnect should stay sub-second, got {delay:?}",
+    );
+}
+
+#[test]
+fn stream_reconnect_delay_caps_server_requested_delay() {
+    // `Retry-After` and rate-limit "try again in Ns" messages are unvalidated
+    // server input; an absurd value must not park the client.
+    assert_eq!(
+        stream_reconnect_delay(
+            /*attempt*/ 1,
+            Some(std::time::Duration::from_secs(86_400))
+        ),
+        MAX_STREAM_RECONNECT_DELAY,
+    );
+}
+
+#[test]
+fn stream_reconnect_delay_preserves_short_server_requested_delay() {
+    assert_eq!(
+        stream_reconnect_delay(
+            /*attempt*/ 8,
+            Some(std::time::Duration::from_millis(750))
+        ),
+        std::time::Duration::from_millis(750),
+    );
+}

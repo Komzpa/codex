@@ -6,6 +6,19 @@ use tracing::error;
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
 
+/// Upper bound for a single sleep between stream reconnect attempts.
+///
+/// [`backoff`] doubles without bound, and the retry budget is provider
+/// configurable up to `MAX_STREAM_MAX_RETRIES` (100). At the documented
+/// maximum the 20th attempt alone would sleep ~29 hours and the 100th would
+/// saturate `u64` milliseconds, so a mid-turn disconnect leaves the client
+/// parked in `tokio::time::sleep` with a frozen `Reconnecting... n/m`
+/// indicator and no network activity — indistinguishable from a hang.
+/// Server-supplied delays (`Retry-After`, rate-limit "try again in Ns") are
+/// likewise unvalidated. Bound every reconnect sleep so the retry budget stays
+/// a wait the user can sit through.
+pub const MAX_STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
 /// Emit structured feedback metadata as key/value pairs.
 ///
 /// This logs a tracing event with `target: "feedback_tags"`. If
@@ -88,6 +101,16 @@ pub fn backoff(attempt: u64) -> Duration {
     let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
     let jitter = rand::rng().random_range(0.9..1.1);
     Duration::from_millis((base as f64 * jitter) as u64)
+}
+
+/// Delay before the next stream reconnect attempt.
+///
+/// Prefers a delay the server asked for, falls back to [`backoff`], and always
+/// clamps the result to [`MAX_STREAM_RECONNECT_DELAY`].
+pub fn stream_reconnect_delay(attempt: u64, requested_delay: Option<Duration>) -> Duration {
+    requested_delay
+        .unwrap_or_else(|| backoff(attempt))
+        .min(MAX_STREAM_RECONNECT_DELAY)
 }
 
 pub(crate) fn error_or_panic(message: impl std::string::ToString) {
