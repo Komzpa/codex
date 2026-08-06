@@ -70,17 +70,6 @@ async fn handle_spawn_agent(
         config.service_tier = Some(service_tier.clone());
     }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
-    // Local behavior: a full-history fork inherits the parent's agent type,
-    // model and reasoning effort, so reject explicit overrides instead of
-    // silently ignoring them. This keeps upstream's `|| role_name.is_some()`
-    // branch below equivalent to the local `!is_full_history_fork`.
-    if is_full_history_fork
-        && (role_name.is_some() || args.model.is_some() || args.reasoning_effort.is_some())
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
-        ));
-    }
     apply_requested_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
