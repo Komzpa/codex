@@ -179,7 +179,7 @@ impl SqliteConfig {
         // New state DBs should use incremental auto-vacuum, but retrofitting an
         // existing DB requires a full VACUUM. Do not attempt that during process
         // startup: it is maintenance work that can contend with foreground writers.
-        self.open_runtime_db(STATE_DB, migrator, telemetry_override)
+        self.open_ready_or_runtime_db(STATE_DB, migrator, telemetry_override)
             .await
     }
 
@@ -211,7 +211,7 @@ impl SqliteConfig {
                 .into());
             }
         }
-        self.open_runtime_db(LOGS_DB, migrator, telemetry_override)
+        self.open_ready_or_runtime_db(LOGS_DB, migrator, telemetry_override)
             .await
     }
 
@@ -297,13 +297,47 @@ impl SqliteConfig {
         Ok(pool)
     }
 
+    async fn open_ready_or_runtime_db(
+        &self,
+        spec: RuntimeDbSpec,
+        migrator: &Migrator,
+        telemetry_override: Option<&dyn DbTelemetry>,
+    ) -> anyhow::Result<SqlitePool> {
+        let path = spec.path(self.home());
+        let started = Instant::now();
+        let ready_pool_result = self.try_open_existing_ready_pool(&path, migrator).await;
+        telemetry::record_init_result(
+            telemetry_override,
+            spec.kind,
+            spec.open_phase,
+            started.elapsed(),
+            &ready_pool_result,
+        );
+        match ready_pool_result {
+            Ok(Some(pool)) => return Ok(pool),
+            Ok(None) => {}
+            Err(source) => {
+                return Err(RuntimeDbInitError::new(
+                    spec.label,
+                    "open ready",
+                    path.as_path(),
+                    source,
+                )
+                .into());
+            }
+        }
+        self.open_runtime_db(spec, migrator, telemetry_override)
+            .await
+    }
+
     /// Open an existing, fully migrated WAL database without startup writes.
     ///
     /// `Migrator::run` takes SQLite's migration write lock even when every
     /// migration is already applied. Likewise, setting `journal_mode` and
     /// `auto_vacuum` on every connection can contend with active writers.
-    /// Logs are opened by every Codex process, so validate the ready schema
-    /// using reads and reserve the mutating path for new or stale databases.
+    /// State and logs are opened by every Codex process, so validate their
+    /// ready schema using reads and reserve the mutating path for new or stale
+    /// databases. The returned pool remains writable for normal runtime use.
     async fn try_open_existing_ready_pool(
         &self,
         path: &Path,
@@ -401,6 +435,7 @@ impl SqliteConfig {
 mod tests {
     use super::SqliteConfig;
     use crate::migrations::runtime_logs_migrator;
+    use crate::migrations::runtime_state_migrator;
     use codex_utils_absolute_path::test_support::PathExt;
     use std::time::Duration;
 
@@ -448,6 +483,58 @@ mod tests {
             .execute(&mut *writer)
             .await
             .expect("release logs DB writer slot");
+        drop(writer);
+        writer_pool.close().await;
+        tokio::fs::remove_dir_all(codex_home)
+            .await
+            .expect("remove test Codex home");
+    }
+
+    #[tokio::test]
+    async fn ready_state_db_opens_without_waiting_for_migration_write_lock() {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-ready-state-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create test Codex home");
+        let sqlite = SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let state_path = sqlite.state_db_path();
+        let initial_pool = sqlite
+            .open_state_db(&runtime_state_migrator(), /*telemetry_override*/ None)
+            .await
+            .expect("create migrated state DB");
+        initial_pool.close().await;
+
+        let writer_pool = sqlite
+            .open_read_write_pool(&state_path)
+            .await
+            .expect("open competing writer");
+        let mut writer = writer_pool.acquire().await.expect("acquire writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("reserve state DB writer slot");
+
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlite.open_state_db(&runtime_state_migrator(), /*telemetry_override*/ None),
+        )
+        .await
+        .expect("ready state DB open must not wait for the migration write lock")
+        .expect("open ready state DB");
+        let table_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = '_sqlx_migrations'",
+        )
+        .fetch_one(&reopened)
+        .await
+        .expect("query reopened state DB");
+        assert_eq!(table_count, 1);
+        reopened.close().await;
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut *writer)
+            .await
+            .expect("release state DB writer slot");
         drop(writer);
         writer_pool.close().await;
         tokio::fs::remove_dir_all(codex_home)
