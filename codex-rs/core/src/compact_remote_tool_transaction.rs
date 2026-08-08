@@ -188,6 +188,7 @@ fn estimate_item_tokens(item: &ResponseItem) -> i64 {
     item_context
         .estimate_token_count_with_base_instructions(&BaseInstructions {
             text: String::new(),
+            provenance: None,
         })
         .unwrap_or(i64::MAX)
 }

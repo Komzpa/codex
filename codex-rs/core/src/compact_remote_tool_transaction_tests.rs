@@ -113,6 +113,7 @@ fn compaction() -> ResponseItem {
 fn empty_instructions() -> BaseInstructions {
     BaseInstructions {
         text: String::new(),
+        provenance: None,
     }
 }
 
