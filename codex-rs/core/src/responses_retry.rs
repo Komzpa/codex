@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
+use crate::util::stream_reconnect_delay;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
@@ -46,6 +46,22 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    if matches!(err.details(), CodexErrorDetails::ServerDraining(_)) {
+        let delay = stream_reconnect_delay(/*attempt*/ 1, err.retry_delay());
+        warn!(
+            ?delay,
+            "server is draining; retrying without consuming the transport retry budget"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            "Reconnecting... server is draining; retrying until ready".to_string(),
+            err,
+        )
+        .await;
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
+
     if matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
         && !turn_context.session_source.is_internal()
