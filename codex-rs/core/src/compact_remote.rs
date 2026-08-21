@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -28,6 +29,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -47,6 +49,9 @@ pub(crate) use tool_transaction::reattach_latest_complete_tool_transaction;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
+const COMPACT_STATE_TOOL_NAMES: &[&str] = &["update_plan"];
+const ACTIVE_SKILL_CONTEXT_PREFIX: &str = "<skill>";
+const SKILLS_CATALOG_CONTEXT_PREFIX: &str = "<skills_instructions>";
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -331,7 +336,7 @@ pub(crate) async fn process_compacted_history(
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
-    compacted_history.retain(should_keep_compacted_history_item);
+    retain_compacted_history_items(&mut compacted_history);
     (
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
@@ -358,6 +363,12 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } if role == "developer" => false,
         ResponseItem::Message { role, .. } if role == "user" => {
+            if is_skills_catalog_context_message(item) {
+                return false;
+            }
+            if is_active_skill_context_message(item) {
+                return true;
+            }
             matches!(
                 crate::event_mapping::parse_turn_item(item),
                 Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
@@ -381,6 +392,77 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Other => false,
     }
+}
+
+fn retain_compacted_history_items(compacted_history: &mut Vec<ResponseItem>) {
+    let state_tool_indices = compacted_state_tool_pair_indices(compacted_history);
+    let mut index = 0;
+    compacted_history.retain(|item| {
+        let keep = state_tool_indices.contains(&index) || should_keep_compacted_history_item(item);
+        index += 1;
+        keep
+    });
+}
+
+fn is_active_skill_context_message(item: &ResponseItem) -> bool {
+    is_user_message_with_text_prefix(item, ACTIVE_SKILL_CONTEXT_PREFIX)
+}
+
+fn is_skills_catalog_context_message(item: &ResponseItem) -> bool {
+    is_user_message_with_text_prefix(item, SKILLS_CATALOG_CONTEXT_PREFIX)
+}
+
+fn is_user_message_with_text_prefix(item: &ResponseItem, prefix: &str) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    role == "user"
+        && content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputText { text } if text.trim_start().starts_with(prefix)
+            )
+        })
+}
+
+fn compacted_state_tool_pair_indices(items: &[ResponseItem]) -> HashSet<usize> {
+    let mut keep_indices = HashSet::new();
+    for tool_name in COMPACT_STATE_TOOL_NAMES {
+        if let Some((call_index, output_index)) =
+            latest_complete_state_tool_pair_indices(items, tool_name)
+        {
+            keep_indices.insert(call_index);
+            keep_indices.insert(output_index);
+        }
+    }
+    keep_indices
+}
+
+fn latest_complete_state_tool_pair_indices(
+    items: &[ResponseItem],
+    tool_name: &str,
+) -> Option<(usize, usize)> {
+    for (call_index, item) in items.iter().enumerate().rev() {
+        let ResponseItem::FunctionCall { name, call_id, .. } = item else {
+            continue;
+        };
+        if name != tool_name {
+            continue;
+        }
+        let Some(output_index) = items.iter().enumerate().skip(call_index + 1).find_map(
+            |(output_index, item)| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: output_call_id,
+                    ..
+                } if output_call_id == call_id => Some(output_index),
+                _ => None,
+            },
+        ) else {
+            continue;
+        };
+        return Some((call_index, output_index));
+    }
+    None
 }
 
 pub(crate) fn trim_function_call_history_to_fit_context_window(
@@ -476,3 +558,7 @@ fn truncated_output_payload(output: &FunctionCallOutputPayload) -> FunctionCallO
         success: output.success,
     }
 }
+
+#[cfg(test)]
+#[path = "compact_remote_tests.rs"]
+mod tests;
