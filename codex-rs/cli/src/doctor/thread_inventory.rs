@@ -1169,7 +1169,7 @@ mod tests {
                     "role": "assistant",
                     "content": [{
                         "type": "output_text",
-                        "text": "x".repeat(/*n*/ 1024 * 1024),
+                        "text": "x".repeat(/*n*/ 1024),
                     }],
                 }],
             },
