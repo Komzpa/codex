@@ -163,6 +163,10 @@ pub struct DoctorCommand {
     #[arg(long, hide = true, default_value_t = false)]
     feedback: bool,
 
+    /// Run complete database integrity scans without the default per-database time limit.
+    #[arg(long, default_value_t = false)]
+    full_integrity_check: bool,
+
     /// Only show grouped check rows and the final count summary.
     #[arg(long, default_value_t = false)]
     summary: bool,
@@ -2052,9 +2056,9 @@ async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
     let mut status = CheckStatus::Ok;
     for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        // Feedback collection gives each database its own budget; direct runs scan fully.
-        let deadline = command
-            .feedback
+        // Large history databases must not prevent an ordinary diagnostic report.
+        // Feedback attachments remain bounded even when a full scan is requested.
+        let deadline = (!command.full_integrity_check || command.feedback)
             .then(|| Instant::now() + Duration::from_secs(1));
         status = status.max(
             sqlite_integrity_detail(
