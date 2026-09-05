@@ -384,6 +384,10 @@ const fn default_effective_context_window_percent() -> i64 {
     95
 }
 
+const fn default_truncation_policy() -> TruncationPolicyConfig {
+    TruncationPolicyConfig::tokens(/*limit*/ 10_000)
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -437,6 +441,7 @@ pub struct ModelInfo {
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     #[serde(default)]
     pub web_search_tool_type: WebSearchToolType,
+    #[serde(default = "default_truncation_policy")]
     pub truncation_policy: TruncationPolicyConfig,
     #[serde(default)]
     pub supports_image_detail_original: bool,
@@ -1905,6 +1910,57 @@ mod tests {
 
         let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
         assert!(!model.include_apps_usage_instructions);
+    }
+
+    #[test]
+    fn model_info_defaults_missing_truncation_policy_to_tokens() {
+        let mut value =
+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize test model");
+        value
+            .as_object_mut()
+            .expect("model info should be an object")
+            .remove("truncation_policy");
+
+        let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
+        let expected = ModelInfo {
+            truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 10_000),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(model, expected);
+    }
+
+    #[test]
+    fn model_info_preserves_explicit_truncation_policy() {
+        for truncation_policy in [
+            TruncationPolicyConfig::bytes(/*limit*/ 12_345),
+            TruncationPolicyConfig::tokens(/*limit*/ 67_890),
+        ] {
+            let expected = ModelInfo {
+                truncation_policy,
+                ..test_model(/*spec*/ None)
+            };
+            let value = serde_json::to_value(&expected).expect("serialize test model");
+
+            let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
+
+            assert_eq!(model, expected);
+        }
+    }
+
+    #[test]
+    fn model_info_still_rejects_other_missing_required_fields() {
+        let mut value =
+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize test model");
+        value
+            .as_object_mut()
+            .expect("model info should be an object")
+            .remove("slug");
+
+        let error = serde_json::from_value::<ModelInfo>(value)
+            .expect_err("missing slug should remain invalid");
+
+        assert_eq!(error.to_string(), "missing field `slug`");
     }
 
     #[test]

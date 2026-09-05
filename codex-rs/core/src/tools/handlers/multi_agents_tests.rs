@@ -371,7 +371,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
+async fn multi_agent_v2_spawn_fork_turns_all_rejects_child_overrides() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
@@ -386,11 +386,9 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    let mut turn = turn;
-    turn.config = Arc::new(config);
-    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    set_turn_config(&mut turn, config);
 
-    SpawnAgentHandlerV2::default()
+    let err = SpawnAgentHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -399,11 +397,21 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
                 "message": "inspect this repo",
                 "task_name": "fork_context_v2",
                 "agent_type": role_name,
+                "model": "child-model",
+                "reasoning_effort": "high",
                 "fork_turns": "all"
             })),
         ))
         .await
-        .expect("fork_turns=all should apply agent_type overrides");
+        .err()
+        .expect("fork_turns=all should reject child overrides");
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+        )
+    );
 }
 
 #[tokio::test]

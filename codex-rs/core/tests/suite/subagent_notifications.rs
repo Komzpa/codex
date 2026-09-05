@@ -2012,6 +2012,136 @@ async fn spawned_agent_uses_summary_support_for_final_model(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_default_spawn_forks_latest_three_real_turns() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const OBSOLETE_OBJECTIVE: &str = "obsolete objective must be dropped";
+    const CURRENT_OBJECTIVE: &str = "current objective must remain";
+    const IMPLEMENTATION_DETAIL: &str = "implementation detail must remain";
+    const LATEST_CORRECTION: &str = "latest correction must remain";
+    const BOUNDED_CHILD_TASK: &str = "inspect inherited bounded context";
+
+    let server = start_mock_server().await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, OBSOLETE_OBJECTIVE) && !body_contains(req, CURRENT_OBJECTIVE)
+        },
+        sse(vec![
+            ev_response_created("resp-obsolete"),
+            ev_assistant_message("msg-obsolete", "obsolete acknowledged"),
+            ev_completed("resp-obsolete"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CURRENT_OBJECTIVE) && !body_contains(req, IMPLEMENTATION_DETAIL)
+        },
+        sse(vec![
+            ev_response_created("resp-current"),
+            ev_assistant_message("msg-current", "current acknowledged"),
+            ev_completed("resp-current"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, IMPLEMENTATION_DETAIL) && !body_contains(req, LATEST_CORRECTION)
+        },
+        sse(vec![
+            ev_response_created("resp-implementation"),
+            ev_assistant_message("msg-implementation", "implementation acknowledged"),
+            ev_completed("resp-implementation"),
+        ]),
+    )
+    .await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": BOUNDED_CHILD_TASK,
+        "task_name": "bounded_worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, LATEST_CORRECTION) && !body_contains(req, BOUNDED_CHILD_TASK)
+        },
+        sse(vec![
+            ev_response_created("resp-spawn-bounded"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-spawn-bounded"),
+        ]),
+    )
+    .await;
+    let child_request_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, BOUNDED_CHILD_TASK) && !body_contains(req, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-bounded-child"),
+            ev_completed("resp-bounded-child"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-spawn-bounded-followup"),
+            ev_assistant_message("msg-spawn-bounded-followup", "bounded child spawned"),
+            ev_completed("resp-spawn-bounded-followup"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build(&server).await?;
+    for prompt in [
+        OBSOLETE_OBJECTIVE,
+        CURRENT_OBJECTIVE,
+        IMPLEMENTATION_DETAIL,
+        LATEST_CORRECTION,
+    ] {
+        test.submit_turn(prompt).await?;
+    }
+
+    let child_request = wait_for_requests(&child_request_log)
+        .await?
+        .pop()
+        .expect("child request log should capture one request");
+    assert!(
+        !child_request.body_contains_text(OBSOLETE_OBJECTIVE),
+        "child request retained obsolete context: {}",
+        child_request.body_json()
+    );
+    for expected in [CURRENT_OBJECTIVE, IMPLEMENTATION_DETAIL, LATEST_CORRECTION] {
+        assert!(
+            child_request.body_contains_text(expected),
+            "child request should retain {expected:?}"
+        );
+    }
+    assert!(child_request.body_contains_text(BOUNDED_CHILD_TASK));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

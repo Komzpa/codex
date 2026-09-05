@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -10,7 +11,6 @@ use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
-use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
@@ -33,6 +33,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -47,8 +48,16 @@ mod request;
 use request::RemoteCompactAttempt;
 use request::run_remote_compact_attempt;
 
+#[path = "compact_remote_tool_transaction.rs"]
+mod tool_transaction;
+pub(crate) use tool_transaction::reattach_latest_complete_tool_transaction;
+pub(crate) use tool_transaction::reattach_latest_complete_tool_transaction_annotated;
+
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
+const COMPACT_STATE_TOOL_NAMES: &[&str] = &["update_plan"];
+const ACTIVE_SKILL_CONTEXT_PREFIX: &str = "<skill>";
+const SKILLS_CATALOG_CONTEXT_PREFIX: &str = "<skills_instructions>";
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -267,9 +276,23 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) =
+    let (new_history, world_state_baseline, retained_image_count) =
         process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
+    analytics_details.retained_image_count = Some(retained_image_count);
+    let new_history = if matches!(compaction_metadata.phase(), CompactionPhase::MidTurn) {
+        let base_instructions = sess.get_base_instructions().await;
+        reattach_latest_complete_tool_transaction(
+            new_history,
+            trace_input_history.as_deref().unwrap_or_default(),
+            compaction_turn_context.model_context_window(),
+            &base_instructions,
+        )?
+    } else {
+        new_history
+    };
+    // Advance only after the replacement history passes the lossless-install check. On failure,
+    // the old history and its current window remain live.
+    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -316,12 +339,12 @@ pub(crate) async fn process_compacted_history(
     sess: &Session,
     compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+) -> (Vec<ResponseItem>, Option<Arc<WorldState>>, usize) {
     let compacted_history = compacted_history
         .into_iter()
         .map(ResponseItemEnvelope::new)
         .collect();
-    let (compacted_history, world_state_baseline) =
+    let (compacted_history, world_state_baseline, retained_image_count) =
         process_annotated_compacted_history(sess, compacted_history, initial_context_injection)
             .await;
     (
@@ -330,28 +353,29 @@ pub(crate) async fn process_compacted_history(
             .map(ResponseItemEnvelope::into_item)
             .collect(),
         world_state_baseline,
+        retained_image_count,
     )
 }
 
 /// Installs already-annotated remote compaction output without dropping its metadata sidecar.
 pub(crate) async fn process_annotated_compacted_history(
     sess: &Session,
-    compacted_history: Vec<ResponseItemEnvelope>,
+    mut compacted_history: Vec<ResponseItemEnvelope>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
+) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>, usize) {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, initial_context_injection).await;
 
-    let compacted_history = history_item_groups(compacted_history)
-        .filter(|group| should_keep_compacted_history_item(&group.source.item))
-        .flat_map(HistoryItemGroup::into_items)
-        .collect();
+    retain_annotated_compacted_history_items(&mut compacted_history);
+    let retained_image_count =
+        remove_annotated_image_payloads_before_latest_real_user_message(&mut compacted_history);
     (
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
+        retained_image_count,
     )
 }
 
@@ -375,6 +399,12 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } if role == "developer" => false,
         ResponseItem::Message { role, .. } if role == "user" => {
+            if is_skills_catalog_context_message(item) {
+                return false;
+            }
+            if is_active_skill_context_message(item) {
+                return true;
+            }
             matches!(
                 crate::event_mapping::parse_turn_item(item),
                 Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
@@ -398,6 +428,176 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Other => false,
     }
+}
+
+#[cfg(test)]
+fn retain_compacted_history_items(compacted_history: &mut Vec<ResponseItem>) {
+    let state_tool_indices = compacted_state_tool_pair_indices(compacted_history);
+    let mut index = 0;
+    compacted_history.retain(|item| {
+        let keep = state_tool_indices.contains(&index) || should_keep_compacted_history_item(item);
+        index += 1;
+        keep
+    });
+}
+
+fn retain_annotated_compacted_history_items(compacted_history: &mut Vec<ResponseItemEnvelope>) {
+    let items = compacted_history
+        .iter()
+        .map(|envelope| envelope.item.clone())
+        .collect::<Vec<_>>();
+    let state_tool_indices = compacted_state_tool_pair_indices(&items);
+    let mut index = 0;
+    compacted_history.retain(|envelope| {
+        let keep = state_tool_indices.contains(&index)
+            || should_keep_compacted_history_item(&envelope.item);
+        index += 1;
+        keep
+    });
+}
+
+fn is_active_skill_context_message(item: &ResponseItem) -> bool {
+    is_user_message_with_text_prefix(item, ACTIVE_SKILL_CONTEXT_PREFIX)
+}
+
+fn is_skills_catalog_context_message(item: &ResponseItem) -> bool {
+    is_user_message_with_text_prefix(item, SKILLS_CATALOG_CONTEXT_PREFIX)
+}
+
+fn is_user_message_with_text_prefix(item: &ResponseItem, prefix: &str) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    role == "user"
+        && content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputText { text } if text.trim_start().starts_with(prefix)
+            )
+        })
+}
+
+fn compacted_state_tool_pair_indices(items: &[ResponseItem]) -> HashSet<usize> {
+    let mut keep_indices = HashSet::new();
+    for tool_name in COMPACT_STATE_TOOL_NAMES {
+        if let Some((call_index, output_index)) =
+            latest_complete_state_tool_pair_indices(items, tool_name)
+        {
+            keep_indices.insert(call_index);
+            keep_indices.insert(output_index);
+        }
+    }
+    keep_indices
+}
+
+fn latest_complete_state_tool_pair_indices(
+    items: &[ResponseItem],
+    tool_name: &str,
+) -> Option<(usize, usize)> {
+    for (call_index, item) in items.iter().enumerate().rev() {
+        let ResponseItem::FunctionCall { name, call_id, .. } = item else {
+            continue;
+        };
+        if name != tool_name {
+            continue;
+        }
+        let Some(output_index) = items.iter().enumerate().skip(call_index + 1).find_map(
+            |(output_index, item)| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(output_call_id),
+                    ..
+                } if output_call_id == call_id => Some(output_index),
+                _ => None,
+            },
+        ) else {
+            continue;
+        };
+        return Some((call_index, output_index));
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn remove_image_payloads_before_latest_real_user_message(
+    items: &mut Vec<ResponseItem>,
+) -> usize {
+    if let Some(mut latest_real_user_index) = items.iter().rposition(|item| {
+        matches!(
+            crate::event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(_))
+        )
+    }) {
+        let mut index = 0;
+        while index < latest_real_user_index {
+            let newly_empty_image_message = match &mut items[index] {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    let had_image = content
+                        .iter()
+                        .any(|item| matches!(item, ContentItem::InputImage { .. }));
+                    content.retain(|item| !matches!(item, ContentItem::InputImage { .. }));
+                    had_image && content.is_empty()
+                }
+                _ => false,
+            };
+            if newly_empty_image_message {
+                items.remove(index);
+                latest_real_user_index -= 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+        .count()
+}
+
+pub(crate) fn remove_annotated_image_payloads_before_latest_real_user_message(
+    items: &mut Vec<ResponseItemEnvelope>,
+) -> usize {
+    if let Some(mut latest_real_user_index) = items.iter().rposition(|item| {
+        matches!(
+            crate::event_mapping::parse_turn_item(&item.item),
+            Some(TurnItem::UserMessage(_))
+        )
+    }) {
+        let mut index = 0;
+        while index < latest_real_user_index {
+            let newly_empty_image_message = match &mut items[index].item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    let had_image = content
+                        .iter()
+                        .any(|item| matches!(item, ContentItem::InputImage { .. }));
+                    content.retain(|item| !matches!(item, ContentItem::InputImage { .. }));
+                    had_image && content.is_empty()
+                }
+                _ => false,
+            };
+            if newly_empty_image_message {
+                items.remove(index);
+                latest_real_user_index -= 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    items
+        .iter()
+        .filter_map(|item| match &item.item {
+            ResponseItem::Message { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+        .count()
 }
 
 pub(crate) fn trim_function_call_history_to_fit_context_window(
@@ -523,3 +723,6 @@ fn truncated_output_payload(output: &FunctionCallOutputPayload) -> FunctionCallO
 #[cfg(test)]
 #[path = "compact_remote_metadata_tests.rs"]
 mod metadata_tests;
+#[cfg(test)]
+#[path = "compact_remote_tests.rs"]
+mod tests;

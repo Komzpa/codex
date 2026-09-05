@@ -43,8 +43,16 @@ pub(crate) async fn file_modified_time(path: &Path) -> io::Result<Option<time::O
 /// If the requested path disappears during a representation transition, this briefly retries
 /// resolution so callers do not need to know which representation is on disk.
 pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineReader> {
+    open_rollout_line_reader_with_limit(path, u64::MAX).await
+}
+
+/// Opens a rollout line reader while bounding decompressed bytes exposed to the caller.
+pub async fn open_rollout_line_reader_with_limit(
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<RolloutLineReader> {
     for _ in 0..MAX_NOT_FOUND_RETRIES {
-        match reader::open_once(path).await {
+        match reader::open_once(path, max_bytes).await {
             Ok(reader) => return Ok(reader),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 tokio::time::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY).await;
@@ -52,7 +60,7 @@ pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineRead
             Err(err) => return Err(err),
         }
     }
-    reader::open_once(path).await
+    reader::open_once(path, max_bytes).await
 }
 
 /// Returns the compressed `.jsonl.zst` path for a rollout path.
@@ -198,7 +206,7 @@ pub struct RolloutLineReader {
 }
 
 enum RolloutLineReaderInner {
-    Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
+    Plain(tokio::io::Lines<tokio::io::Take<tokio::io::BufReader<tokio::fs::File>>>),
     Blocking(Option<BlockingLineReader>),
 }
 
@@ -222,7 +230,7 @@ impl RolloutLineReader {
     }
 }
 
-type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
+type BlockingLineReader = std::io::Lines<std::io::BufReader<std::io::Take<Box<dyn Read + Send>>>>;
 
 mod worker {
     use std::ffi::OsStr;
@@ -1017,8 +1025,9 @@ mod reader {
     use super::RolloutLineReaderInner;
     use super::path;
     use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
 
-    pub(super) async fn open_once(path: &Path) -> io::Result<RolloutLineReader> {
+    pub(super) async fn open_once(path: &Path, max_bytes: u64) -> io::Result<RolloutLineReader> {
         let path = path::existing_rollout_path(path)
             .await
             .unwrap_or_else(|| path.to_path_buf());
@@ -1026,9 +1035,8 @@ mod reader {
             let reader = tokio::task::spawn_blocking(move || {
                 let input = File::open(path.as_path())?;
                 let decoder = zstd::stream::read::Decoder::new(input)?;
-                Ok::<_, io::Error>(
-                    io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>).lines(),
-                )
+                let input = Box::new(decoder) as Box<dyn Read + Send>;
+                Ok::<_, io::Error>(io::BufReader::new(input.take(max_bytes)).lines())
             })
             .await
             .map_err(io::Error::other)??;
@@ -1038,7 +1046,9 @@ mod reader {
         }
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
-            inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
+            inner: RolloutLineReaderInner::Plain(
+                tokio::io::BufReader::new(file).take(max_bytes).lines(),
+            ),
         })
     }
 }

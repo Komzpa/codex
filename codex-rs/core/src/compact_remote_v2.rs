@@ -13,6 +13,8 @@ use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
+use crate::compact_remote::reattach_latest_complete_tool_transaction_annotated;
+use crate::compact_remote::remove_annotated_image_payloads_before_latest_real_user_message;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
@@ -320,11 +322,22 @@ async fn run_remote_compact_task_inner_impl(
         },
     );
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
     let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let new_history = if matches!(compaction_metadata.phase(), CompactionPhase::MidTurn) {
+        let base_instructions = sess.get_base_instructions().await;
+        reattach_latest_complete_tool_transaction_annotated(
+            new_history,
+            trace_input_history.as_deref().unwrap_or_default(),
+            compaction_turn_context.model_context_window(),
+            &base_instructions,
+        )?
+    } else {
+        new_history
+    };
+    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -507,10 +520,14 @@ fn build_v2_compacted_history(
         .collect::<Vec<_>>();
     let mut retained =
         truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET, image_budget);
-    let retained_image_count = retained
-        .iter()
-        .map(|envelope| retained_input_image_count(&envelope.item))
-        .sum::<usize>();
+    let retained_image_count = if image_budget == RetainedImageBudget::Enabled {
+        retained
+            .iter()
+            .map(|envelope| retained_input_image_count(&envelope.item))
+            .sum::<usize>()
+    } else {
+        remove_annotated_image_payloads_before_latest_real_user_message(&mut retained)
+    };
     retained.push(ResponseItemEnvelope::new(compaction_output));
     (retained, retained_image_count)
 }
@@ -960,35 +977,71 @@ mod tests {
     }
 
     #[test]
-    fn build_v2_compacted_history_counts_retained_input_images() {
-        let input = vec![ResponseItem::Message {
+    fn build_v2_compacted_history_strips_old_images_without_dropping_user_text() {
+        let old_user_message = ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![
                 ContentItem::InputText {
-                    text: "user".to_string(),
+                    text: "original objective".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
+                    image_url: "data:image/png;base64,old".to_string(),
                     detail: None,
                 },
+                ContentItem::OutputText {
+                    text: "non-image content".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let latest_user_message = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "latest correction".to_string(),
+                },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
+                    image_url: "data:image/png;base64,latest".to_string(),
                     detail: None,
                 },
             ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }];
+        };
+        let input = vec![old_user_message, latest_user_message.clone()];
         let output = ResponseItem::Compaction {
             id: None,
             encrypted_content: "new".to_string(),
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (_, retained_image_count) = build_without_metadata(input, output);
+        let (history, retained_image_count) = build_without_metadata(input, output.clone());
 
-        assert_eq!(retained_image_count, 2);
+        assert_eq!(
+            raw(history),
+            vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![
+                        ContentItem::InputText {
+                            text: "original objective".to_string(),
+                        },
+                        ContentItem::OutputText {
+                            text: "non-image content".to_string(),
+                        },
+                    ],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                latest_user_message,
+                output,
+            ]
+        );
+        assert_eq!(retained_image_count, 1);
     }
 
     #[test]

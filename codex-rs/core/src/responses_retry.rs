@@ -55,6 +55,23 @@ pub(crate) async fn handle_retryable_response_stream_error(
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
 
+    if matches!(err.details(), CodexErrorDetails::ServerDraining(_)) {
+        let delay = err.retry_delay().unwrap_or_else(|| backoff(1));
+        warn!(
+            ?delay,
+            "server is draining; retrying without consuming the transport retry budget"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            "Reconnecting... server is draining; retrying until ready",
+            err,
+        )
+        .await;
+        codex_client::record_retry!(retry_state.retries, delay, operation);
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
+
     if turn_context
         .config
         .features

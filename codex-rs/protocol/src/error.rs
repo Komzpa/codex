@@ -95,6 +95,11 @@ pub enum CodexErrorDetails {
     /// A retryable upstream rate limit received inside the response stream.
     #[error("rate limit exceeded: {0}")]
     RateLimitExceeded(String),
+    /// The configured Responses endpoint is intentionally draining for a
+    /// planned replacement. This must not consume the finite transport retry
+    /// budget: the replacement owns the outage and supplies the retry delay.
+    #[error("server is draining: {0}")]
+    ServerDraining(String),
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -200,6 +205,11 @@ impl fmt::Debug for CodexErr {
         match &self.details {
             CodexErrorDetails::Stream(message) => formatter
                 .debug_tuple("Stream")
+                .field(message)
+                .field(&self.retry_delay)
+                .finish(),
+            CodexErrorDetails::ServerDraining(message) => formatter
+                .debug_tuple("ServerDraining")
                 .field(message)
                 .field(&self.retry_delay)
                 .finish(),
@@ -396,6 +406,7 @@ impl CodexErr {
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => false,
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::RateLimitExceeded(_)
+            | CodexErrorDetails::ServerDraining(..)
             | CodexErrorDetails::Timeout
             | CodexErrorDetails::RequestTimeout
             | CodexErrorDetails::UnexpectedStatus(_)
