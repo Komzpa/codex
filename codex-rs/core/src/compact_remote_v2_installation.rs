@@ -178,6 +178,7 @@ async fn build_and_install_compaction(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
+        base_instructions,
         compaction_output,
         compaction_response_id,
         token_usage,
@@ -190,6 +191,22 @@ async fn build_and_install_compaction(
             .await?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
     }
+    // Guardian budgets the complete review request after compaction, including recovery
+    // and rejection of oversized evidence. Keep that existing budget owner intact.
+    let preserve_terminal_transaction = prefix.is_none()
+        && matches!(compaction_metadata.phase(), CompactionPhase::MidTurn)
+        && !crate::guardian::is_basic_session_source(&compaction_turn_context.session_source);
+    let terminal_tool_transaction = preserve_terminal_transaction
+        .then(|| {
+            let envelopes = prompt_input
+                .iter()
+                .cloned()
+                .zip(prompt_input_metadata.iter().cloned())
+                .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
+                .collect::<Vec<_>>();
+            super::tool_transaction::latest_complete_tool_transaction(&envelopes)
+        })
+        .flatten();
     let (compacted_history, retained_images) = build_v2_compacted_history(
         prompt_input,
         prompt_input_metadata,
@@ -232,13 +249,21 @@ async fn build_and_install_compaction(
         )
         .await
     } else {
-        let (new_history, world_state_baseline) = build_compaction_replacement_history(
+        let (mut new_history, world_state_baseline) = build_compaction_replacement_history(
             sess,
             replacement_step_context,
             world_state,
             compacted_history,
         )
         .await;
+        if preserve_terminal_transaction {
+            new_history = super::tool_transaction::validate_and_reattach_terminal_tool_transaction(
+                new_history,
+                terminal_tool_transaction.as_deref(),
+                compaction_turn_context.model_context_window(),
+                &base_instructions,
+            )?;
+        }
         let (window_number, window_ids) = sess.advance_auto_compact_window().await;
         let installation = CompactedHistoryMetadata {
             input_goal_ids,

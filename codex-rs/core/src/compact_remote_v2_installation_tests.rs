@@ -81,6 +81,7 @@ async fn prepared_prefix_rejection_respects_caller_intent(
             trace_input_history: None,
             prompt_input: vec![original.clone()],
             prompt_input_metadata: vec![None],
+            base_instructions: Default::default(),
             compaction_output: ResponseItem::Compaction {
                 id: None,
                 encrypted_content: "stale-summary".to_string(),
