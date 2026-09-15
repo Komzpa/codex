@@ -34,10 +34,12 @@ impl WebLinkDisplay {
             | TerminalName::VsCode
             | TerminalName::Alacritty
             | TerminalName::WindowsTerminal
-            | TerminalName::Konsole
             | TerminalName::GnomeTerminal
             | TerminalName::Vte => Self::LabelOnly,
-            TerminalName::AppleTerminal
+            // Konsole can disable OSC 8 links in its profile, so its identity alone
+            // does not prove that a hidden destination remains usable.
+            TerminalName::Konsole
+            | TerminalName::AppleTerminal
             | TerminalName::WarpTerminal
             | TerminalName::Dumb
             | TerminalName::Unknown => Self::WithDestination,
