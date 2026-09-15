@@ -700,6 +700,37 @@ impl ChatWidget {
             });
         }
 
+        if preset
+            .supported_reasoning_efforts
+            .iter()
+            .any(|option| option.effort == ReasoningEffortConfig::Ultra)
+            && model_slug != LUNA_RESERVE_MODEL
+        {
+            let model = model_slug;
+            let warning = self.ultra_reasoning_concurrency_warning(&ReasoningEffortConfig::Ultra);
+            items.push(SelectionItem {
+                name: "Ultra (save as default)".to_string(),
+                description: Some("Use this model and Ultra for new conversations".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::UpdateModel(model.clone()));
+                    tx.send(AppEvent::UpdateReasoningEffort(Some(
+                        ReasoningEffortConfig::Ultra,
+                    )));
+                    tx.send(AppEvent::PersistModelSelection {
+                        model: model.clone(),
+                        effort: Some(ReasoningEffortConfig::Ultra),
+                    });
+                    if let Some(warning) = warning.clone() {
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_warning_event(warning),
+                        )));
+                    }
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Advanced Reasoning".bold()));
         header.push(Line::from("⚠ Consumes usage limits faster".cyan()));

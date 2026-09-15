@@ -1005,11 +1005,7 @@ impl App {
         &self,
         model: &str,
     ) -> Option<ReasoningEffortConfig> {
-        let configured_effort = self
-            .config
-            .model_reasoning_effort
-            .as_ref()
-            .filter(|effort| **effort != ReasoningEffortConfig::Ultra);
+        let configured_effort = self.config.model_reasoning_effort.as_ref();
         let preset = self
             .model_catalog
             .try_list_models()
@@ -1393,6 +1389,33 @@ mod tests {
                 (Some("gpt-5.5"), Some(expected_default_effort))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_reasoning_preserves_explicit_ultra_default() {
+        let mut app = make_test_app().await;
+        let mut preset = app.model_catalog.try_list_models().unwrap().remove(0);
+        preset.model = "saved-ultra-model".to_string();
+        preset
+            .supported_reasoning_efforts
+            .push(ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::Ultra,
+                description: "Ultra reasoning".to_string(),
+            });
+        app.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+        app.config.model = Some("saved-ultra-model".to_string());
+        app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
+        let effort =
+            app.on_apply_advanced_reasoning("saved-ultra-model", ReasoningEffortConfig::Ultra);
+        let fresh = app.fresh_session_config();
+        assert_eq!(effort, Some(ReasoningEffortConfig::Ultra));
+        assert_eq!(
+            (fresh.model, fresh.model_reasoning_effort),
+            (
+                Some("saved-ultra-model".to_string()),
+                Some(ReasoningEffortConfig::Ultra)
+            )
+        );
     }
 
     #[tokio::test]

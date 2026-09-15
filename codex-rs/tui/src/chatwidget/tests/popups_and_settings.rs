@@ -3838,6 +3838,32 @@ async fn ultra_reasoning_selection_skips_warning_below_threshold() {
 }
 
 #[tokio::test]
+async fn ultra_reasoning_can_be_saved_as_default() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    let mut preset = get_available_model(&chat, "gpt-5.4");
+    preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+        effort: ReasoningEffortConfig::Ultra,
+        description: "Ultra reasoning".to_string(),
+    }];
+    chat.open_advanced_reasoning_popup(preset);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let selections = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::PersistModelSelection { model, effort } => Some((model, effort)),
+            AppEvent::ApplyAdvancedReasoning { .. } => panic!("default selection must persist"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selections,
+        vec![("gpt-5.4".to_string(), Some(ReasoningEffortConfig::Ultra))]
+    );
+}
+
+#[tokio::test]
 async fn max_reasoning_selection_persists_model_selection() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
