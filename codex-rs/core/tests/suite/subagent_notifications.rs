@@ -389,14 +389,16 @@ async fn wait_for_requests(
 async fn wait_for_request_with_model(
     mock: &core_test_support::responses::ResponseMock,
     model: &str,
+    excluded_thread_id: Option<&str>,
 ) -> Result<ResponsesRequest> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Some(request) = mock
-            .requests()
-            .into_iter()
-            .find(|request| request.body_json()["model"] == model)
-        {
+        if let Some(request) = mock.requests().into_iter().find(|request| {
+            request.body_json()["model"] == model
+                && excluded_thread_id.is_none_or(|thread_id| {
+                    request.body_json()["client_metadata"]["thread_id"] != thread_id
+                })
+        }) {
             return Ok(request);
         }
         if Instant::now() >= deadline {
@@ -1065,7 +1067,8 @@ async fn spawned_child_receives_forked_parent_context(
     submit_turn_with_trigger(&test, TURN_1_PROMPT, "composer").await?;
     let parent_body = spawn_turn.single_request().body_json();
 
-    let child_request = wait_for_request_with_model(&child_request_log, REQUESTED_MODEL).await?;
+    let child_request =
+        wait_for_request_with_model(&child_request_log, REQUESTED_MODEL, None).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
     let child_body = child_request.body_json();
     let child_metadata: serde_json::Value = serde_json::from_str(
@@ -1139,7 +1142,7 @@ async fn spawned_child_receives_forked_parent_context(
 
     submit_turn_with_trigger(&test, "reuse the legacy child", "automation_cron_scheduled").await?;
     let followup_parent_body = parent.single_request().body_json();
-    let reused_child_body = wait_for_request_with_model(&followup, REQUESTED_MODEL)
+    let reused_child_body = wait_for_request_with_model(&followup, REQUESTED_MODEL, None)
         .await?
         .body_json();
     let followup_parent_turn_id = followup_parent_body["client_metadata"]["turn_id"]
@@ -1448,14 +1451,14 @@ enum FullHistoryV2ModelSelection {
     MultiAgentModeTransitions,
 }
 
-#[test_case(FullHistoryV2ModelSelection::ConfiguredDefault; "configured default with omitted fork_turns")]
-#[test_case(FullHistoryV2ModelSelection::ExplicitOverride; "explicit override with fork_turns all")]
+#[test_case(FullHistoryV2ModelSelection::ConfiguredDefault; "full fork inherits parent despite configured child defaults")]
+#[test_case(FullHistoryV2ModelSelection::ExplicitOverride; "full fork rejects explicit child overrides")]
 #[test_case(FullHistoryV2ModelSelection::WorldStateIdentity; "world state appends context window when agent identity changes")]
 #[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork drops inherited current-time reminders")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork drops inherited multi-agent mode instructions")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModeTransitions; "full fork restores explicit policy after proactive transition")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_context(
+async fn spawned_full_history_v2_child_inherits_settings_without_dropping_context(
     selection: FullHistoryV2ModelSelection,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1471,7 +1474,7 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         ]),
     )
     .await;
-    let (spawn_args, expected_model, expected_reasoning_effort) = match selection {
+    let (spawn_args, expected_model) = match selection {
         FullHistoryV2ModelSelection::ConfiguredDefault
         | FullHistoryV2ModelSelection::WorldStateIdentity
         | FullHistoryV2ModelSelection::CurrentTimeReminders
@@ -1480,9 +1483,9 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             json!({
                 "message": CHILD_PROMPT,
                 "task_name": "worker",
+                "fork_turns": "all",
             }),
-            V2_DEFAULT_MODEL,
-            V2_DEFAULT_REASONING_EFFORT,
+            INHERITED_MODEL,
         ),
         FullHistoryV2ModelSelection::ExplicitOverride => (
             json!({
@@ -1493,7 +1496,6 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
                 "reasoning_effort": V2_REQUESTED_REASONING_EFFORT,
             }),
             V2_REQUESTED_MODEL,
-            V2_REQUESTED_REASONING_EFFORT,
         ),
     };
     let spawn_args = serde_json::to_string(&spawn_args)?;
@@ -1744,8 +1746,32 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
     }
     test.submit_turn(TURN_1_PROMPT).await?;
     let parent_request = spawn_turn.single_request();
+    let parent_thread_id = parent_request.body_json()["client_metadata"]["thread_id"]
+        .as_str()
+        .expect("parent thread id")
+        .to_owned();
+    let parent_settings = (
+        parent_request.body_json()["model"].clone(),
+        parent_request.body_json()["reasoning"]["effort"].clone(),
+    );
+    if matches!(selection, FullHistoryV2ModelSelection::ExplicitOverride) {
+        let output = _turn1_followup
+            .single_request()
+            .function_call_output(SPAWN_CALL_ID);
+        assert!(
+            output
+                .to_string()
+                .contains("Full-history forked agents inherit")
+        );
+        assert!(child_request_log.requests().iter().all(|request| {
+            request.body_json()["client_metadata"]["thread_id"] == parent_thread_id
+        }));
+        return Ok(());
+    }
 
-    let child_request = wait_for_request_with_model(&child_request_log, expected_model).await?;
+    let child_request =
+        wait_for_request_with_model(&child_request_log, expected_model, Some(&parent_thread_id))
+            .await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
     let misaligned_child_messages = child_request
         .inputs_of_type("message")
@@ -1788,10 +1814,11 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             1
         );
     }
-    assert!(!child_developer_messages.iter().any(|message| {
-        message.contains(&format!("{INHERITED_MODEL} root role."))
-            || message.contains(&format!("{INHERITED_MODEL} subagent role."))
-    }));
+    assert!(
+        !child_developer_messages
+            .iter()
+            .any(|message| { message.contains(&format!("{INHERITED_MODEL} root role.")) })
+    );
     if matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeInstructions
@@ -1944,10 +1971,7 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             child_body["model"].clone(),
             child_body["reasoning"]["effort"].clone(),
         ),
-        (
-            json!(expected_model),
-            json!(expected_reasoning_effort.to_string()),
-        )
+        parent_settings
     );
 
     Ok(())
@@ -2120,6 +2144,136 @@ async fn spawned_agent_uses_summary_support_for_final_model(
         child_body.get("stream_options").is_some(),
         child_supports_summary
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_default_spawn_forks_latest_three_real_turns() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const OBSOLETE_OBJECTIVE: &str = "obsolete objective must be dropped";
+    const CURRENT_OBJECTIVE: &str = "current objective must remain";
+    const IMPLEMENTATION_DETAIL: &str = "implementation detail must remain";
+    const LATEST_CORRECTION: &str = "latest correction must remain";
+    const BOUNDED_CHILD_TASK: &str = "inspect inherited bounded context";
+
+    let server = start_mock_server().await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, OBSOLETE_OBJECTIVE) && !body_contains(req, CURRENT_OBJECTIVE)
+        },
+        sse(vec![
+            ev_response_created("resp-obsolete"),
+            ev_assistant_message("msg-obsolete", "obsolete acknowledged"),
+            ev_completed("resp-obsolete"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CURRENT_OBJECTIVE) && !body_contains(req, IMPLEMENTATION_DETAIL)
+        },
+        sse(vec![
+            ev_response_created("resp-current"),
+            ev_assistant_message("msg-current", "current acknowledged"),
+            ev_completed("resp-current"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, IMPLEMENTATION_DETAIL) && !body_contains(req, LATEST_CORRECTION)
+        },
+        sse(vec![
+            ev_response_created("resp-implementation"),
+            ev_assistant_message("msg-implementation", "implementation acknowledged"),
+            ev_completed("resp-implementation"),
+        ]),
+    )
+    .await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": BOUNDED_CHILD_TASK,
+        "task_name": "bounded_worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, LATEST_CORRECTION) && !body_contains(req, BOUNDED_CHILD_TASK)
+        },
+        sse(vec![
+            ev_response_created("resp-spawn-bounded"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-spawn-bounded"),
+        ]),
+    )
+    .await;
+    let child_request_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, BOUNDED_CHILD_TASK) && !body_contains(req, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-bounded-child"),
+            ev_completed("resp-bounded-child"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-spawn-bounded-followup"),
+            ev_assistant_message("msg-spawn-bounded-followup", "bounded child spawned"),
+            ev_completed("resp-spawn-bounded-followup"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build(&server).await?;
+    for prompt in [
+        OBSOLETE_OBJECTIVE,
+        CURRENT_OBJECTIVE,
+        IMPLEMENTATION_DETAIL,
+        LATEST_CORRECTION,
+    ] {
+        test.submit_turn(prompt).await?;
+    }
+
+    let child_request = wait_for_requests(&child_request_log)
+        .await?
+        .pop()
+        .expect("child request log should capture one request");
+    assert!(
+        !child_request.body_contains_text(OBSOLETE_OBJECTIVE),
+        "child request retained obsolete context: {}",
+        child_request.body_json()
+    );
+    for expected in [CURRENT_OBJECTIVE, IMPLEMENTATION_DETAIL, LATEST_CORRECTION] {
+        assert!(
+            child_request.body_contains_text(expected),
+            "child request should retain {expected:?}"
+        );
+    }
+    assert!(child_request.body_contains_text(BOUNDED_CHILD_TASK));
 
     Ok(())
 }

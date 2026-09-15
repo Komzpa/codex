@@ -12,6 +12,7 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents::collab_tool_call_status;
+use crate::tools::handlers::multi_agents_spec::DEFAULT_MULTI_AGENT_V2_FORK_TURNS;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -134,6 +135,13 @@ async fn handle_spawn_agent(
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
+    if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory))
+        && (role_name.is_some() || args.model.is_some() || args.reasoning_effort.is_some())
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+        ));
+    }
     let prepared = prepare_agent_spawn_config(
         &session,
         step_context.as_ref(),
@@ -291,8 +299,12 @@ impl SpawnAgentArgs {
             .fork_turns
             .as_deref()
             .map(str::trim)
-            .filter(|fork_turns| !fork_turns.is_empty())
-            .unwrap_or("all");
+            .filter(|fork_turns| !fork_turns.is_empty());
+        let Some(fork_turns) = fork_turns else {
+            return Ok(Some(SpawnAgentForkMode::LastNTurns(
+                DEFAULT_MULTI_AGENT_V2_FORK_TURNS,
+            )));
+        };
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -345,3 +357,7 @@ impl ToolOutput for SpawnAgentResult {
         tool_output_code_mode_result(self, "spawn_agent")
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

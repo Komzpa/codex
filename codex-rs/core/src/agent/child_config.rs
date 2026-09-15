@@ -59,14 +59,16 @@ pub(crate) async fn prepare_agent_spawn_config(
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    apply_requested_spawn_agent_model_overrides(
-        session,
-        step_context,
-        &mut config,
-        options.model,
-        options.reasoning_effort,
-    )
-    .await?;
+    if options.version != SpawnConfigVersion::V2 || !options.full_history_fork {
+        apply_requested_spawn_agent_model_overrides(
+            session,
+            step_context,
+            &mut config,
+            options.model,
+            options.reasoning_effort,
+        )
+        .await?;
+    }
     if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
