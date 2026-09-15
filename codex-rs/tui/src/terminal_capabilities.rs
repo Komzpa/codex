@@ -327,10 +327,10 @@ pub(crate) fn web_link_display(terminal: &TerminalInfo, term: Option<&str>) -> W
         | TerminalName::VsCode
         | TerminalName::Alacritty
         | TerminalName::WindowsTerminal
-        | TerminalName::Konsole
         | TerminalName::GnomeTerminal
         | TerminalName::Vte => WebLinkDisplay::LabelOnly,
-        TerminalName::AppleTerminal
+        TerminalName::Konsole
+        | TerminalName::AppleTerminal
         | TerminalName::WarpTerminal
         | TerminalName::Dumb
         | TerminalName::Unknown => WebLinkDisplay::WithDestination,
