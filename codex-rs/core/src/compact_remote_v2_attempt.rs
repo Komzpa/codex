@@ -9,8 +9,9 @@ use crate::compact_remote_history::trim_function_call_history_to_fit_context_win
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
-use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::CompactionTraceContext;
@@ -18,8 +19,8 @@ use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
-    pub(super) prompt_input: Vec<ResponseItem>,
-    pub(super) prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
+    pub(super) prompt_input: Vec<ResponseItemEnvelope>,
+    pub(super) base_instructions: BaseInstructions,
     pub(super) compaction_output: ResponseItem,
     pub(super) compaction_response_id: String,
     pub(super) token_usage: Option<TokenUsage>,
@@ -121,10 +122,16 @@ pub(super) async fn run_remote_compact_v2_attempt(
     } = compaction_output_result?;
     let mut prompt_input = prompt.input;
     prompt_input.pop();
+    debug_assert_eq!(prompt_input.len(), prompt_input_metadata.len());
+    let prompt_input = prompt_input
+        .into_iter()
+        .zip(prompt_input_metadata)
+        .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
+        .collect();
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
         prompt_input,
-        prompt_input_metadata,
+        base_instructions: prompt.base_instructions,
         compaction_output,
         compaction_response_id: response_id,
         token_usage,
