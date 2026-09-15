@@ -36,7 +36,6 @@ use codex_analytics::CompactionTrigger;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
-use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -65,6 +64,9 @@ use attempt::run_remote_compact_v2_attempt;
 
 #[path = "compact_remote_v2_images.rs"]
 mod images;
+
+#[path = "compact_remote_tool_transaction.rs"]
+mod tool_transaction;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetainedImageBudget {
@@ -290,7 +292,7 @@ async fn run_remote_compact_task_inner_impl(
     let RemoteCompactV2Attempt {
         trace_input_history,
         prompt_input,
-        prompt_input_metadata,
+        base_instructions,
         compaction_output,
         compaction_response_id,
         token_usage,
@@ -303,9 +305,16 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
         analytics_details.cache_write_input_tokens = Some(token_usage.cache_write_input_tokens);
     }
+    // Guardian budgets the complete review request after compaction, including recovery
+    // and rejection of oversized evidence. Keep that existing budget owner intact.
+    let preserve_terminal_transaction =
+        matches!(compaction_metadata.phase(), CompactionPhase::MidTurn)
+            && !crate::guardian::is_basic_session_source(&compaction_turn_context.session_source);
+    let terminal_tool_transaction = preserve_terminal_transaction
+        .then(|| tool_transaction::latest_complete_tool_transaction(&prompt_input))
+        .flatten();
     let (compacted_history, retained_images) = build_v2_compacted_history(
         prompt_input,
-        prompt_input_metadata,
         compaction_output,
         sess.enabled(Feature::RetainClientDeveloperMessages),
         if sess.enabled(Feature::CompactionImageBudget) {
@@ -315,11 +324,19 @@ async fn run_remote_compact_task_inner_impl(
         },
     );
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
-    let new_history =
+    let mut new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    if preserve_terminal_transaction {
+        new_history = tool_transaction::validate_and_reattach_terminal_tool_transaction(
+            new_history,
+            terminal_tool_transaction.as_deref(),
+            compaction_turn_context.model_context_window(),
+            &base_instructions,
+        )?;
+    }
+    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -499,18 +516,11 @@ async fn collect_compaction_output(
 }
 
 fn build_v2_compacted_history(
-    prompt_input: Vec<ResponseItem>,
-    prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
+    prompt_input: Vec<ResponseItemEnvelope>,
     compaction_output: ResponseItem,
     retain_client_developer_messages: bool,
     image_budget: RetainedImageBudget,
 ) -> (Vec<ResponseItemEnvelope>, usize) {
-    debug_assert_eq!(prompt_input.len(), prompt_input_metadata.len());
-    let prompt_input = prompt_input
-        .into_iter()
-        .zip(prompt_input_metadata)
-        .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
-        .collect::<Vec<_>>();
     let retained = v2_history_item_groups(prompt_input)
         .filter(|group| {
             is_retained_for_remote_compaction_v2(&group.source, retain_client_developer_messages)
@@ -584,15 +594,31 @@ fn is_retained_for_remote_compaction_v2(
     };
 
     match role.as_str() {
-        "user" => matches!(
-            crate::event_mapping::parse_turn_item(item),
-            Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
-        ),
+        "user" => {
+            is_selected_skill_prompt(item)
+                || matches!(
+                    crate::event_mapping::parse_turn_item(item),
+                    Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
+                )
+        }
         "developer" => {
             retain_client_developer_messages && is_client_authored_developer_message(envelope)
         }
         _ => false,
     }
+}
+
+fn is_selected_skill_prompt(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { content, .. } = item else {
+        return false;
+    };
+    content.iter().any(|item| {
+        matches!(
+            item,
+            ContentItem::InputText { text }
+                if codex_skills_extension::is_skill_prompt_fragment(text)
+        )
+    })
 }
 
 fn retained_input_image_count(item: &ResponseItem) -> usize {
@@ -776,6 +802,7 @@ fn truncate_message_text_to_token_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_history::CodexHarnessMetadata;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ContentItemKind;
     use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -800,10 +827,8 @@ mod tests {
         input: Vec<ResponseItem>,
         output: ResponseItem,
     ) -> (Vec<ResponseItemEnvelope>, usize) {
-        let metadata = vec![None; input.len()];
         build_v2_compacted_history(
-            input,
-            metadata,
+            annotated(input),
             output,
             /*retain_client_developer_messages*/ false,
             RetainedImageBudget::Disabled,
@@ -887,6 +912,11 @@ mod tests {
     #[test]
     fn build_v2_compacted_history_preserves_retained_metadata_sidecar() {
         let retained = message("user", "keep", /*phase*/ None);
+        let selected_skill = message(
+            "user",
+            "<skill>\n<name>demo</name>\n<path>/tmp/demo/SKILL.md</path>\nRetain this skill body.\n</skill>",
+            /*phase*/ None,
+        );
         let generated_notice = message(
             "developer",
             "<image_resize_notice>generated</image_resize_notice>",
@@ -907,19 +937,23 @@ mod tests {
         for enabled in [false, true] {
             let (history, _) = build_v2_compacted_history(
                 vec![
-                    harness.clone(),
-                    client.clone(),
-                    retained.clone(),
-                    generated_notice.clone(),
-                ],
-                vec![
-                    None,
-                    Some(CodexHarnessMetadata {
-                        client_authored: true,
-                        ..Default::default()
-                    }),
-                    Some(CodexHarnessMetadata::default()),
-                    None,
+                    ResponseItemEnvelope::new(harness.clone()),
+                    ResponseItemEnvelope {
+                        item: client.clone(),
+                        metadata: Some(CodexHarnessMetadata {
+                            client_authored: true,
+                            ..Default::default()
+                        }),
+                    },
+                    ResponseItemEnvelope {
+                        item: retained.clone(),
+                        metadata: Some(CodexHarnessMetadata::default()),
+                    },
+                    ResponseItemEnvelope {
+                        item: selected_skill.clone(),
+                        metadata: Some(CodexHarnessMetadata::default()),
+                    },
+                    ResponseItemEnvelope::new(generated_notice.clone()),
                 ],
                 output.clone(),
                 enabled,
@@ -928,6 +962,10 @@ mod tests {
             let mut expected = vec![
                 ResponseItemEnvelope {
                     item: retained.clone(),
+                    metadata: Some(CodexHarnessMetadata::default()),
+                },
+                ResponseItemEnvelope {
+                    item: selected_skill.clone(),
                     metadata: Some(CodexHarnessMetadata::default()),
                 },
                 ResponseItemEnvelope::new(generated_notice.clone()),

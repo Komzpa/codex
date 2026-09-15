@@ -1,4 +1,5 @@
 use super::*;
+use codex_history::CodexHarnessMetadata;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;

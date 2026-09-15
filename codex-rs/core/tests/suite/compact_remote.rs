@@ -9,6 +9,7 @@ use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::InitialHistory;
+use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_login::auth::BedrockApiKeyAuth;
@@ -1485,9 +1486,12 @@ async fn active_realtime_refreshes_changed_start_instructions_only_after_compact
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
+async fn remote_mid_turn_compact_v2_preserves_terminal_transaction_correction_and_skill()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let selected_skill = "<skill>\n<name>compact-proof</name>\n<path>/tmp/compact-proof/SKILL.md</path>\nPRESERVE_SELECTED_SKILL_BODY\n</skill>";
+    let latest_user_correction = "LATEST_USER_CORRECTION_AFTER_SELECTED_SKILL";
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -1496,7 +1500,27 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
             }),
     )
     .await?;
-    let codex = harness.test().codex.clone();
+    let initial_history = vec![RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: selected_skill.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::default()),
+    })];
+    let codex = harness
+        .test()
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            initial_history: InitialHistory::Forked(initial_history),
+            ..StartThreadOptions::new(harness.test().config.clone())
+        })
+        .await?
+        .thread;
     let responses_mock = responses::mount_response_sequence(
         harness.server(),
         vec![
@@ -1532,7 +1556,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
     // Phase 1: sampling mints state and schedules inline v2 compaction.
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "RUN_WITH_MID_TURN_COMPACT_V2".to_string(),
+            text: latest_user_correction.to_string(),
             text_elements: Vec::new(),
         }]))
         .await?;
@@ -1563,6 +1587,39 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
     assert_eq!(
         requests[2].header(TURN_STATE_HEADER).as_deref(),
         Some("sampling-state")
+    );
+    assert!(requests[2].body_contains_text(selected_skill));
+    assert!(requests[2].body_contains_text(latest_user_correction));
+    let continuation_input = requests[2].input();
+    let compaction_index = continuation_input
+        .iter()
+        .rposition(|item| item["type"] == "compaction")
+        .expect("continuation should include the opaque compaction item");
+    let compact_input = requests[1].input();
+    let expected_transaction = compact_input
+        .windows(2)
+        .rev()
+        .find(|items| {
+            items[0]["type"] == "function_call"
+                && items[0]["call_id"] == "call-before-compact"
+                && items[1]["type"] == "function_call_output"
+                && items[1]["call_id"] == "call-before-compact"
+        })
+        .expect("compact input should contain the completed transaction");
+    assert_eq!(
+        &continuation_input[compaction_index - 2..compaction_index],
+        expected_transaction,
+        "continuation should retain the exact terminal transaction before compaction"
+    );
+    assert_eq!(
+        continuation_input
+            .iter()
+            .filter(|item| {
+                item["type"] == "function_call" && item["call_id"] == "call-before-compact"
+            })
+            .count(),
+        1,
+        "continuation should not duplicate the terminal tool call"
     );
     assert_eq!(
         requests[3].header(TURN_STATE_HEADER).as_deref(),
