@@ -242,6 +242,43 @@ async fn wait_for_turn_completion(test: &TestCodex) {
     assert_eq!(completed.error, None, "turn should complete successfully");
 }
 
+#[tokio::test]
+async fn server_draining_retries_beyond_the_normal_stream_budget() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut sequence = (0..4)
+        .map(|_| {
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "0")
+                .set_body_json(json!({
+                    "error": {"code": "server_draining", "message": "planned replacement"}
+                }))
+        })
+        .collect::<Vec<_>>();
+    sequence.push(responses::sse_response(responses::sse(vec![
+        responses::ev_assistant_message("recovered-message", "connection recovered"),
+        responses::ev_completed("recovered-response"),
+    ])));
+    let response_mock = responses::mount_response_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(1);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    submit_user_input(&test, "continue through the planned replacement").await?;
+    wait_for_turn_completion(&test).await;
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 5);
+    for request in requests {
+        assert!(request.body_contains_text("continue through the planned replacement"));
+    }
+    Ok(())
+}
+
 // TODO(anp) respect Retry-After
 /// HTTP overloads currently retry with local backoff instead of the upstream header delay.
 #[tokio::test(flavor = "current_thread")]
