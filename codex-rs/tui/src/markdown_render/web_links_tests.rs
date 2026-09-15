@@ -95,7 +95,6 @@ fn supporting_terminals_render_only_the_styled_label_and_keep_its_target() {
         TerminalName::VsCode,
         TerminalName::Alacritty,
         TerminalName::WindowsTerminal,
-        TerminalName::Konsole,
         TerminalName::GnomeTerminal,
         TerminalName::Vte,
     ] {
@@ -152,6 +151,7 @@ fn unknown_terminals_and_multiplexers_keep_visible_destinations() {
     let markdown = "[label](https://example.com)";
     let expected = render(markdown, /*width*/ 80, WebLinkDisplay::WithDestination);
     for (terminal, term) in [
+        (terminal(TerminalName::Konsole), None),
         (terminal(TerminalName::Unknown), None),
         (terminal(TerminalName::AppleTerminal), None),
         (terminal(TerminalName::Dumb), None),
