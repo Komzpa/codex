@@ -89,6 +89,9 @@ use installation::run_compaction;
 #[path = "compact_remote_v2_media.rs"]
 mod media;
 
+#[path = "compact_remote_tool_transaction.rs"]
+mod tool_transaction;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetainedImageBudget {
     Disabled,
@@ -682,12 +685,28 @@ fn is_retained_for_remote_compaction_v2(
     };
 
     match role.as_str() {
-        "user" => matches!(
-            crate::event_mapping::parse_turn_item(item),
-            Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
-        ),
+        "user" => {
+            is_selected_skill_prompt(item)
+                || matches!(
+                    crate::event_mapping::parse_turn_item(item),
+                    Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
+                )
+        }
         _ => false,
     }
+}
+
+fn is_selected_skill_prompt(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { content, .. } = item else {
+        return false;
+    };
+    content.iter().any(|item| {
+        matches!(
+            item,
+            ContentItem::InputText { text }
+                if codex_skills_extension::is_skill_prompt_fragment(text)
+        )
+    })
 }
 
 fn retained_input_image_count(item: &ResponseItem) -> usize {
