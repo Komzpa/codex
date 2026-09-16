@@ -65,6 +65,38 @@ fn assert_hidden_shell_payload_is_literal(op: Result<Op, TryRecvError>, payload:
 }
 
 #[tokio::test]
+async fn queued_followup_count_tracks_queue_without_submitting_contents() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+
+    chat.queue_user_message(UserMessage::from("private queued follow-up"));
+
+    assert_eq!(
+        op_rx.try_recv(),
+        Ok(Op::SetQueuedFollowupCount { count: 1 })
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+    assert_eq!(
+        op_rx.try_recv(),
+        Ok(Op::SetQueuedFollowupCount { count: 0 })
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "private queued follow-up".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected queued user turn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn user_submission_does_not_commit_recap_loading_to_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -127,7 +159,7 @@ async fn hidden_shell_paste_queued_during_turn_submits_literal_prompt() {
         }
         handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-        assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+        assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
     }
 }
 
@@ -144,7 +176,7 @@ async fn hidden_shell_paste_restored_by_queue_edit_submits_literal_prompt() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -228,7 +260,7 @@ async fn hidden_shell_paste_queued_before_session_submits_literal_prompt() {
     chat.thread_id = Some(ThreadId::new());
     chat.maybe_send_next_queued_input();
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]

@@ -102,6 +102,8 @@ use codex_app_server_protocol::ThreadMemoryModeSetResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
+use codex_app_server_protocol::ThreadQueuedFollowupCountUpdateParams;
+use codex_app_server_protocol::ThreadQueuedFollowupCountUpdateResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -1589,6 +1591,26 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/compact/start failed in TUI")?;
+        Ok(())
+    }
+
+    pub(crate) async fn thread_queued_followup_count_update(
+        &mut self,
+        thread_id: ThreadId,
+        count: u32,
+    ) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ThreadQueuedFollowupCountUpdateResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadQueuedFollowupCountUpdate {
+                request_id,
+                params: ThreadQueuedFollowupCountUpdateParams {
+                    thread_id: thread_id.to_string(),
+                    count,
+                },
+            })
+            .await
+            .wrap_err("thread/queuedFollowupCount/update failed in TUI")?;
         Ok(())
     }
 

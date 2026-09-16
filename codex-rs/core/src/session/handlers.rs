@@ -509,6 +509,10 @@ pub(super) async fn submission_loop(
                     thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
                     false
                 }
+                Op::SetQueuedFollowupCount { count } => {
+                    sess.state.lock().await.queued_followup_count = count;
+                    false
+                }
                 Op::TurnSettings {
                     turn_id,
                     update,

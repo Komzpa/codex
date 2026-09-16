@@ -620,6 +620,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadGoalClearResponse,
     },
+    #[experimental("thread/queuedFollowupCount/update")]
+    ThreadQueuedFollowupCountUpdate => "thread/queuedFollowupCount/update" {
+        params: v2::ThreadQueuedFollowupCountUpdateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadQueuedFollowupCountUpdateResponse,
+    },
     #[experimental("thread/queue/add")]
     ThreadQueueAdd => "thread/queue/add" {
         params: v2::ThreadQueueAddParams,

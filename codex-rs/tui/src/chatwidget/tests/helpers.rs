@@ -262,6 +262,19 @@ pub(crate) fn set_active_cell(chat: &mut ChatWidget, cell: Box<dyn HistoryCell>)
     chat.transcript.active_cell = Some(cell);
 }
 
+// Queue size is metadata, not an input action. Keep every other command visible
+// to tests that assert submission, steering, shell, and local-command behavior.
+pub(crate) fn try_recv_input_action(
+    op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>,
+) -> Result<Op, TryRecvError> {
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::SetQueuedFollowupCount { .. }) => continue,
+            result => return result,
+        }
+    }
+}
+
 // ChatWidget may emit other `Op`s (e.g. history/logging updates) on the same channel; this helper
 // filters until we see a submission op.
 pub(super) fn next_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> Op {

@@ -183,7 +183,7 @@ async fn queued_prompt_clears_questions_arriving_after_enqueue_when_it_starts() 
     chat.turn_lifecycle.finish();
     chat.update_task_running_state();
     assert!(chat.maybe_send_next_queued_input());
-    assert_answer(op_rx.try_recv().unwrap(), "New prompt");
+    assert_answer(try_recv_input_action(&mut op_rx).unwrap(), "New prompt");
     assert_eq!(question_count(&chat), 0);
     chat.add_async_questions("late", &questions());
     assert_eq!(question_count(&chat), 0);
@@ -202,7 +202,10 @@ async fn queued_question_answer_preserves_other_questions_on_delivery() {
 
     chat.input_queue.suppress_queue_autosend = false;
     assert!(chat.maybe_send_next_queued_input());
-    assert_answer(op_rx.try_recv().unwrap(), "> Which way?\n\nanswer");
+    assert_answer(
+        try_recv_input_action(&mut op_rx).unwrap(),
+        "> Which way?\n\nanswer",
+    );
     assert_eq!(question_count(&chat), 1);
 }
 
@@ -314,7 +317,7 @@ async fn queued_model_slash_prompt_clears_questions_but_local_slash_command_does
         /*had_modal_or_popup*/ false,
     );
     assert_eq!(question_count(&chat), 0);
-    assert!(op_rx.try_recv().is_err());
+    assert!(try_recv_input_action(&mut op_rx).is_err());
 
     chat.add_async_questions("new", &questions());
     chat.handle_composer_input_result(
@@ -686,7 +689,7 @@ async fn question_queue_key_does_not_steer_the_running_turn() {
     repeat.kind = KeyEventKind::Repeat;
     chat.handle_key_event(repeat);
     assert_eq!(question_count(&chat), 1);
-    assert!(ops.try_recv().is_err());
+    assert!(try_recv_input_action(&mut ops).is_err());
 }
 
 #[tokio::test]
@@ -750,7 +753,7 @@ async fn question_queue_pop_becomes_an_ordinary_composer_draft_and_clears_questi
     assert_eq!(chat.bottom_pane.composer_text(), "older");
     assert!(chat.input_queue.queued_user_messages.is_empty());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    assert_answer(ops.try_recv().unwrap(), "older");
+    assert_answer(try_recv_input_action(&mut ops).unwrap(), "older");
     chat.handle_key_event(forward);
     assert_eq!(question_count(&chat), 0);
     assert!(!chat.bottom_pane.questions.as_ref().unwrap().expanded);

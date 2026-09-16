@@ -113,6 +113,7 @@ use crate::chatwidget::ChatWidgetInit;
 use crate::chatwidget::create_initial_user_message;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::chatwidget::tests::helpers::set_active_cell;
+use crate::chatwidget::tests::helpers::try_recv_input_action;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use crate::chatwidget::tests::set_chatgpt_auth;
 use crate::chatwidget::tests::set_fast_mode_test_catalog;
@@ -1423,7 +1424,7 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
     app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    while try_recv_input_action(&mut new_op_rx).is_ok() {}
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
@@ -1444,7 +1445,7 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
         vec!["queued follow-up".to_string()]
     );
     assert!(
-        new_op_rx.try_recv().is_err(),
+        try_recv_input_action(&mut new_op_rx).is_err(),
         "replay-only threads should not auto-submit restored queue"
     );
 }
@@ -1476,7 +1477,7 @@ async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_s
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
     app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    while try_recv_input_action(&mut new_op_rx).is_ok() {}
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
@@ -1495,7 +1496,7 @@ async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_s
         vec!["queued follow-up".to_string()]
     );
     assert!(
-        new_op_rx.try_recv().is_err(),
+        try_recv_input_action(&mut new_op_rx).is_err(),
         "restored queue should stay queued when replay did not prove the turn finished"
     );
 }
@@ -1527,7 +1528,7 @@ async fn replay_thread_snapshot_in_progress_turn_restores_running_queue_state() 
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
     app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    while try_recv_input_action(&mut new_op_rx).is_ok() {}
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
@@ -1546,7 +1547,7 @@ async fn replay_thread_snapshot_in_progress_turn_restores_running_queue_state() 
         vec!["queued follow-up".to_string()]
     );
     assert!(
-        new_op_rx.try_recv().is_err(),
+        try_recv_input_action(&mut new_op_rx).is_err(),
         "restored queue should stay queued while replayed turn is still running"
     );
 }
@@ -1602,7 +1603,7 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
     app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    while try_recv_input_action(&mut new_op_rx).is_ok() {}
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
@@ -1626,7 +1627,7 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
     );
 
     assert!(
-        new_op_rx.try_recv().is_err(),
+        try_recv_input_action(&mut new_op_rx).is_err(),
         "queued follow-up should stay queued until the latest turn completes"
     );
     assert_eq!(
@@ -1891,7 +1892,7 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
         make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
     app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    while try_recv_input_action(&mut new_op_rx).is_ok() {}
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
@@ -1913,7 +1914,7 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
     );
     assert!(app.chat_widget.queued_user_message_texts().is_empty());
     assert!(
-        new_op_rx.try_recv().is_err(),
+        try_recv_input_action(&mut new_op_rx).is_err(),
         "replayed interrupted turns should restore queued input for editing, not submit it"
     );
 }
