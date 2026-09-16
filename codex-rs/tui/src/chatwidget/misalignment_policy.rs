@@ -107,6 +107,7 @@ impl ChatWidget {
             retired_voice,
         });
         self.input_queue.clear();
+        self.publish_queued_followup_count();
         self.finalize_turn();
         self.refresh_pending_input_preview();
         self.bottom_pane.drain_pending_submission_state();

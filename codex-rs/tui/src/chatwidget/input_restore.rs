@@ -184,17 +184,22 @@ impl ChatWidget {
         &mut self,
     ) -> Option<(QueuedUserMessage, UserMessageHistoryRecord)> {
         if self.input_queue.rejected_steers_queue.is_empty() {
-            self.input_queue
-                .queued_user_messages
-                .pop_front()
-                .map(|user_message| {
-                    let history_record = self
-                        .input_queue
-                        .queued_user_message_history_records
-                        .pop_front()
-                        .unwrap_or(UserMessageHistoryRecord::UserMessageText);
-                    (user_message, history_record)
-                })
+            let queued_message =
+                self.input_queue
+                    .queued_user_messages
+                    .pop_front()
+                    .map(|user_message| {
+                        let history_record = self
+                            .input_queue
+                            .queued_user_message_history_records
+                            .pop_front()
+                            .unwrap_or(UserMessageHistoryRecord::UserMessageText);
+                        (user_message, history_record)
+                    });
+            if queued_message.is_some() {
+                self.publish_queued_followup_count();
+            }
+            queued_message
         } else {
             let rejected_messages = self
                 .input_queue
@@ -243,6 +248,7 @@ impl ChatWidget {
 
     pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ThreadComposerState> {
         if let Some(user_message) = self.input_queue.queued_user_messages.pop_back() {
+            self.publish_queued_followup_count();
             self.input_queue.recovered_queue &= self.input_queue.has_queued_follow_up_messages()
                 || !self.input_queue.pending_steers.is_empty();
             let history_record = self
@@ -631,6 +637,7 @@ impl ChatWidget {
             self.input_queue.clear();
             self.restore_composer_state(Default::default());
         }
+        self.publish_queued_followup_count();
         self.input_queue.recovered_queue &= self.input_queue.has_queued_follow_up_messages()
             || !self.input_queue.pending_steers.is_empty();
         let effort = self.effective_reasoning_effort();

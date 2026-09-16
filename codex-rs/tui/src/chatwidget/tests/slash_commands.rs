@@ -218,7 +218,7 @@ async fn queued_slash_review_with_args_dispatches_after_active_turn() {
 
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
-    match op_rx.try_recv() {
+    match try_recv_input_action(&mut op_rx) {
         Ok(Op::Review { target }) => assert_eq!(
             target,
             ReviewTarget::Custom {
@@ -261,11 +261,11 @@ async fn queued_bang_shell_dispatches_after_active_turn() {
             .action,
         QueuedInputAction::RunShell
     );
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
 
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
-    match op_rx.try_recv() {
+    match try_recv_input_action(&mut op_rx) {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected queued shell command op, got {other:?}"),
     }
@@ -321,7 +321,7 @@ async fn queued_bang_shell_waits_for_user_shell_completion_before_next_input() {
 
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
-    match op_rx.try_recv() {
+    match try_recv_input_action(&mut op_rx) {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected queued shell command op, got {other:?}"),
     }
@@ -371,10 +371,10 @@ async fn assert_cancelled_queued_menu_drains_next_input(
         popup.contains(expected_popup_text),
         "expected {command} menu to open; popup:\n{popup}"
     );
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
 
     chat.handle_key_event(cancel_key);
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
     assert!(
         std::iter::from_fn(|| rx.try_recv().ok())
             .any(|event| matches!(event, AppEvent::SettingsSelectionClosed))
@@ -433,7 +433,7 @@ async fn queued_settings_selection_applies_before_next_input() {
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
     while let Ok(event) = rx.try_recv() {
         match event {
             AppEvent::OpenReasoningPopup { model } => chat.open_reasoning_popup(model),
@@ -474,7 +474,7 @@ async fn queued_bare_rename_drains_next_input_after_name_update() {
 
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Name thread"));
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
 
     chat.handle_paste("Queued rename".to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -582,7 +582,7 @@ async fn queued_inline_rename_does_not_drain_again_before_turn_started() {
         /*replay_kind*/ None,
     );
 
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
     assert_eq!(
         chat.queued_user_message_texts(),
         vec!["second after rename"]
@@ -632,7 +632,7 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
     chat.set_local_worktree_operations(/*enabled*/ false);
     let drain = chat.submit_queued_slash_prompt(UserMessage::from("/worktree extra").into());
     assert_matches!(drain, QueueDrain::Continue);
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
     assert!(drain_insert_history(&mut rx).iter().any(|lines| {
         lines_to_single_string(lines).contains("Unrecognized command '/worktree'")
     }));
@@ -1711,7 +1711,7 @@ async fn slash_copy_picker_defers_queued_input_until_selection_or_cancellation_s
             complete_turn_with_message(&mut chat, "active", Some("New response"));
             assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
             assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Previous response"));
-            assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+            assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
             while let Ok(event) = rx.try_recv() {
                 assert!(!matches!(
                     event,
@@ -2534,7 +2534,7 @@ async fn queued_menu_slash_keeps_agent_turn_complete_notification() {
         Some(Notification::AgentTurnComplete { ref response }) if response == "Done"
     );
     assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Select Model"));
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]

@@ -209,6 +209,26 @@ impl TurnRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn thread_queued_followup_count_update(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadQueuedFollowupCountUpdateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        self.ensure_direct_input_allowed(request_id, thread.as_ref())
+            .await?;
+        self.submit_core_op(
+            request_id,
+            &thread,
+            Op::SetQueuedFollowupCount {
+                count: params.count,
+            },
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to update queued follow-up count: {err}")))?;
+        Ok(Some(ThreadQueuedFollowupCountUpdateResponse {}.into()))
+    }
+
     pub(crate) async fn turn_settings_update(
         &self,
         request_id: &ConnectionRequestId,

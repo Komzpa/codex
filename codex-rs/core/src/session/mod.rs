@@ -246,6 +246,7 @@ mod mcp_refresh;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod plugin_selection;
+mod queued_followups;
 mod realtime_history;
 mod retained_context;
 mod review;

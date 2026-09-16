@@ -68,6 +68,74 @@ async fn idle_user_input_reaches_the_first_model_request_in_plan_mode() -> anyho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_followup_awareness_is_count_only_and_does_not_start_a_turn() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                ev_response_created("queued-followups"),
+                ev_completed("queued-followups"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("queue-cleared"),
+                ev_completed("queue-cleared"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    test.codex
+        .submit(Op::SetQueuedFollowupCount { count: 1 })
+        .await?;
+    test.codex
+        .submit(Op::SetQueuedFollowupCount { count: 2 })
+        .await?;
+    assert!(
+        response.requests().is_empty(),
+        "count updates must not start a turn"
+    );
+
+    submit_user_input(test.codex.as_ref(), "current request").await;
+    wait_for_turn_complete(test.codex.as_ref()).await;
+    test.codex
+        .submit(Op::SetQueuedFollowupCount { count: 0 })
+        .await?;
+    submit_user_input(test.codex.as_ref(), "next normal request").await;
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let requests = response.requests();
+    assert_eq!(requests.len(), 2);
+    let developer_messages = requests[0].message_input_texts("developer");
+    assert_eq!(
+        developer_messages
+            .iter()
+            .filter(|text| text.contains("queued follow-up messages"))
+            .count(),
+        1
+    );
+    assert!(
+        developer_messages
+            .iter()
+            .any(|text| text.contains("user has 2 queued"))
+    );
+    let updated_notices = requests[1]
+        .message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text.contains("<queued_followup_awareness>"))
+        .collect::<Vec<_>>();
+    assert_eq!(updated_notices.len(), 2);
+    assert_eq!(
+        updated_notices[0],
+        developer_messages.last().unwrap().as_str()
+    );
+    assert!(updated_notices[1].contains("user has 0 queued"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let response = responses::mount_sse_once(

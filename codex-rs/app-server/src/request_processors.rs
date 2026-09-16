@@ -245,6 +245,8 @@ use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadProjectUpdatedNotification;
+use codex_app_server_protocol::ThreadQueuedFollowupCountUpdateParams;
+use codex_app_server_protocol::ThreadQueuedFollowupCountUpdateResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;

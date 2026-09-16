@@ -99,6 +99,9 @@ impl Serialize for RealtimeSpeechText {
 pub(crate) enum AppCommand {
     Interrupt,
     CleanBackgroundTerminals,
+    SetQueuedFollowupCount {
+        count: u32,
+    },
     RealtimeConversationStart {
         thread_id: ThreadId,
         offer_sdp: RealtimeOfferSdp,

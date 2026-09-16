@@ -96,6 +96,9 @@ pub(crate) struct SessionState {
     /// Retained after completion so later turns do not repeat speculative captures.
     pub(crate) shell_snapshot_prewarm: Option<AbortOnDropHandle<()>>,
     pub(crate) current_time_reminder: CurrentTimeReminderState,
+    /// Latest count of TUI-local follow-ups, delivered out of band by the host.
+    pub(crate) queued_followup_count: u32,
+    pub(crate) queued_followup_last_reported: Option<(String, u32)>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
@@ -136,6 +139,8 @@ impl SessionState {
             startup_prewarm: None,
             shell_snapshot_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),
+            queued_followup_count: 0,
+            queued_followup_last_reported: None,
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),

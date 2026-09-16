@@ -1526,7 +1526,7 @@ async fn plan_slash_command_with_hidden_shell_paste_queued_during_turn_submits_l
     );
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-    assert_literal_plan_prompt(&chat, op_rx.try_recv(), payload);
+    assert_literal_plan_prompt(&chat, try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]

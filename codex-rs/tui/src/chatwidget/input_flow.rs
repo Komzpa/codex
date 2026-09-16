@@ -179,6 +179,7 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .push_back(UserMessageHistoryRecord::UserMessageText);
             self.refresh_pending_input_preview();
+            self.publish_queued_followup_count();
             if model_prompt && !should_run_now {
                 self.bottom_pane.clear_pending_questions();
             }
@@ -332,6 +333,19 @@ impl ChatWidget {
             preview.pending_steers,
             preview.rejected_steers,
         );
+    }
+
+    pub(super) fn publish_queued_followup_count(&mut self) {
+        if self.is_session_configured() && !self.blocks_direct_input {
+            self.submit_op(AppCommand::SetQueuedFollowupCount {
+                count: self
+                    .input_queue
+                    .queued_user_messages
+                    .len()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            });
+        }
     }
 
     pub(crate) fn submit_user_message_with_mode(

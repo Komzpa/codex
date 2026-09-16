@@ -509,6 +509,9 @@ pub(crate) async fn run_turn(
             sess.record_reasoning_effort_override(step_context.as_ref())
                 .await;
 
+            super::queued_followups::maybe_record(sess.as_ref(), turn_context.as_ref(), &window_id)
+                .await;
+
             // Construct the input that we will send to the model.
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()

@@ -653,6 +653,9 @@ pub enum Op {
         thread_settings: ThreadSettingsOverrides,
     },
 
+    /// Update the TUI-local queued-follow-up count without submitting user input.
+    SetQueuedFollowupCount { count: u32 },
+
     /// Update only the named running turn, without changing future settings.
     /// The reply reports the actual publication or why it did not occur.
     TurnSettings {
@@ -945,6 +948,7 @@ impl Op {
             Self::RecoverTurn { .. } => "recover_turn",
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
+            Self::SetQueuedFollowupCount { .. } => "set_queued_followup_count",
             Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
