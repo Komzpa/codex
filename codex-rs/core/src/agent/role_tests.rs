@@ -590,6 +590,52 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
+#[tokio::test]
+async fn apply_role_clears_inherited_effort_only_for_a_different_model() {
+    for (role_contents, expected_model, expected_effort) in [
+        ("model = \"role-model\"", "role-model", None),
+        (
+            "model = \"parent-model\"",
+            "parent-model",
+            Some(ReasoningEffort::High),
+        ),
+        (
+            "model = \"role-model\"\nmodel_reasoning_effort = \"low\"",
+            "role-model",
+            Some(ReasoningEffort::Low),
+        ),
+    ] {
+        let (home, mut config) = test_config_with_cli_overrides(vec![
+            (
+                "model".to_string(),
+                TomlValue::String("parent-model".to_string()),
+            ),
+            (
+                "model_reasoning_effort".to_string(),
+                TomlValue::String("high".to_string()),
+            ),
+        ])
+        .await;
+        let role_path = write_role_config(&home, "model-role.toml", role_contents).await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                config_file: Some(role_path),
+                ..Default::default()
+            },
+        );
+
+        apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect("custom role should apply");
+
+        assert_eq!(
+            (config.model.as_deref(), config.model_reasoning_effort),
+            (Some(expected_model), expected_effort),
+        );
+    }
+}
+
 #[cfg_attr(windows, ignore)]
 #[tokio::test]
 async fn apply_role_skills_config_disables_skill_for_spawned_agent() {
