@@ -675,6 +675,10 @@ pub(super) async fn submission_loop(
                     let _ = reply.send(sess.replace_dynamic_tools(tools).await);
                     false
                 }
+                Op::SetQueuedFollowupCount { count } => {
+                    sess.state.lock().await.queued_followup_count = count;
+                    false
+                }
                 Op::TurnSettings {
                     turn_id,
                     update,

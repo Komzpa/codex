@@ -736,6 +736,12 @@ impl App {
             return Ok(true);
         }
         match op {
+            AppCommand::SetQueuedFollowupCount { count } => {
+                app_server
+                    .thread_queued_followup_count_update(thread_id, *count)
+                    .await?;
+                Ok(true)
+            }
             AppCommand::Interrupt => {
                 let mut turn_id = self
                     .active_turn_id_for_thread(thread_id)

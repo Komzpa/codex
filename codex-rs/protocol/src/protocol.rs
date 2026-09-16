@@ -802,6 +802,9 @@ pub enum Op {
         reply: oneshot::Sender<CodexResult<()>>,
     },
 
+    /// Update the TUI-local queued-follow-up count without submitting user input.
+    SetQueuedFollowupCount { count: u32 },
+
     /// Update only the named running turn, without changing future settings.
     /// The reply reports the actual publication or why it did not occur.
     #[debug("TurnSettings {{ turn_id: {turn_id:?}, requested_approvals_reviewer: {:?} }}", update.approvals_reviewer)]
@@ -1122,6 +1125,7 @@ impl Op {
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::ReplaceDynamicTools { .. } => "replace_dynamic_tools",
+            Self::SetQueuedFollowupCount { .. } => "set_queued_followup_count",
             Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",

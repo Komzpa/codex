@@ -1445,6 +1445,11 @@ impl MessageProcessor {
                     .thread_goal_clear(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadQueuedFollowupCountUpdate { params, .. } => {
+                self.turn_processor
+                    .thread_queued_followup_count_update(&request_id, params)
+                    .await
+            }
             ClientRequest::ThreadQueueAdd { params, .. } => self
                 .thread_queue_processor
                 .add(params)
