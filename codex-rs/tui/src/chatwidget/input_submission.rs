@@ -201,6 +201,7 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .insert(queue_index, history_record);
             self.refresh_pending_input_preview();
+            self.publish_queued_followup_count();
             if model_prompt {
                 self.bottom_pane.clear_pending_questions();
             }
@@ -223,6 +224,7 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .push_front(history_record);
             self.refresh_pending_input_preview();
+            self.publish_queued_followup_count();
             if model_prompt {
                 self.bottom_pane.clear_pending_questions();
             }

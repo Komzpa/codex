@@ -284,6 +284,7 @@ mod model_catalog_settings;
 pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_handoff;
+mod queued_followups;
 mod realtime_history;
 mod retained_context;
 mod review;

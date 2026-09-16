@@ -112,6 +112,9 @@ pub(crate) enum CloudSubmissionIntent {
 pub(crate) enum AppCommand {
     Interrupt,
     CleanBackgroundTerminals,
+    SetQueuedFollowupCount {
+        count: u32,
+    },
     RealtimeConversationStart {
         thread_id: ThreadId,
         attempt_id: u64,

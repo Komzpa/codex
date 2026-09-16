@@ -109,6 +109,7 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .push_front(pending.history_record);
             self.refresh_pending_input_preview();
+            self.publish_queued_followup_count();
             self.request_redraw();
         }
     }
