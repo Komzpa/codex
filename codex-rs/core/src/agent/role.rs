@@ -181,6 +181,10 @@ mod role_overrides {
     ) -> anyhow::Result<Config> {
         let mut next_config = config.clone();
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        let model_changes = overrides
+            .model
+            .as_ref()
+            .is_some_and(|model| config.model.as_deref() != Some(model));
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
         }
@@ -189,6 +193,8 @@ mod role_overrides {
         }
         if let Some(effort) = overrides.model_reasoning_effort.clone() {
             next_config.model_reasoning_effort = Some(effort);
+        } else if model_changes {
+            next_config.model_reasoning_effort = None;
         }
         if let Some(summary) = overrides.model_reasoning_summary {
             next_config.model_reasoning_summary = Some(summary);
