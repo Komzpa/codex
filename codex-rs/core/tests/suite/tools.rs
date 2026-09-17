@@ -33,7 +33,7 @@ use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_custom_tool_call_with_namespace;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_response_once;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -201,11 +201,19 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
             "code": "invalid_request",
         },
     });
-    let compact_mock =
-        mount_response_once(&server, ResponseTemplate::new(400).set_body_json(&error)).await;
+    // Remote compaction falls back to local compaction on an invalid request, so both attempts fail.
+    let compact_mock = mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(400).set_body_json(&error),
+            ResponseTemplate::new(400).set_body_json(&error),
+        ],
+    )
+    .await;
     let mut builder = test_codex().with_config(|config| {
         config.tool_registry.error_on_tool_collisions = true;
         config.model_auto_compact_token_limit = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
     });
     let test = builder.build_with_auto_env(&server).await?;
 
@@ -227,11 +235,8 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
     })
     .await;
 
-    assert_eq!(
-        errors,
-        vec![format!("Error running remote compact task: {error}")]
-    );
-    assert_eq!(compact_mock.requests().len(), 1);
+    assert_eq!(errors, vec![error.to_string()]);
+    assert_eq!(compact_mock.requests().len(), 2);
 
     Ok(())
 }

@@ -865,6 +865,11 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
                 .set_body_json(json!({ "error": { "code": "server_is_overloaded" } })),
             ResponseTemplate::new(503)
                 .set_body_json(json!({ "error": { "code": "server_is_overloaded" } })),
+            // Exhausted remote compaction falls back to local summarization.
+            responses::sse_response(responses::sse(vec![
+                responses::ev_assistant_message("local-compact", "local summary"),
+                responses::ev_completed("local-compact-response"),
+            ])),
         ],
     )
     .await;
@@ -907,23 +912,13 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
     let mut stream_error_events = 0;
     loop {
         match wait_for_event(&test.codex, |_| true).await {
-            EventMsg::Error(error) => {
-                error_events += 1;
-                assert_eq!(
-                    error.codex_error_info,
-                    Some(CodexErrorInfo::ServerOverloaded)
-                );
-                assert!(
-                    error
-                        .message
-                        .contains("Selected model is at capacity. Please try a different model.")
-                );
-            }
+            EventMsg::Error(_) => error_events += 1,
             EventMsg::StreamError(_) => stream_error_events += 1,
             EventMsg::TurnComplete(event) => {
                 assert_eq!(
                     event.error.and_then(|error| error.codex_error_info),
-                    Some(CodexErrorInfo::ServerOverloaded)
+                    None,
+                    "local fallback compaction should complete the turn"
                 );
                 break;
             }
@@ -931,21 +926,28 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
         }
     }
 
-    assert_eq!(error_events, 1);
+    assert_eq!(
+        error_events, 0,
+        "exhausted remote compaction falls back locally without a user-facing error"
+    );
     assert_eq!(stream_error_events, 0);
     let requests = response_mock.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "expected a seed request and three remote compaction v2 attempts"
+        5,
+        "expected a seed request, three remote compaction v2 attempts, and one local compaction"
     );
-    for request in &requests[1..] {
+    for request in &requests[1..=3] {
         assert_eq!(request.path(), "/v1/responses");
         assert!(
             !request.inputs_of_type("compaction_trigger").is_empty(),
             "expected a remote compaction v2 request"
         );
     }
+    assert!(
+        requests[4].inputs_of_type("compaction_trigger").is_empty(),
+        "expected the fallback to use local compaction"
+    );
     assert_eq!(
         telemetry.events.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)

@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::config::Config;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
@@ -68,6 +69,7 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
 /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
 /// initial context into the replacement history just above the last real user message.
+#[derive(Clone)]
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage {
         world_state: Arc<WorldState>,
@@ -111,6 +113,19 @@ pub(crate) async fn build_compaction_initial_context(
     }
 }
 
+/// Builds the summarization request that local compaction sends to the model.
+pub(crate) fn summarization_input(config: &Config) -> Vec<UserInput> {
+    vec![UserInput::Text {
+        text: config
+            .compact_prompt
+            .as_deref()
+            .unwrap_or(SUMMARIZATION_PROMPT)
+            .to_string(),
+        // Compaction prompt is synthesized; no UI element ranges to preserve.
+        text_elements: Vec::new(),
+    }]
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -118,17 +133,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
-    let prompt = turn_context
-        .config
-        .compact_prompt
-        .as_deref()
-        .unwrap_or(SUMMARIZATION_PROMPT)
-        .to_string();
-    let input = vec![UserInput::Text {
-        text: prompt,
-        // Compaction prompt is synthesized; no UI element ranges to preserve.
-        text_elements: Vec::new(),
-    }];
+    let input = summarization_input(&turn_context.config);
 
     run_compact_task_inner(
         sess,
@@ -149,8 +154,17 @@ pub(crate) async fn run_compact_task(
     input: Vec<UserInput>,
 ) -> CodexResult<()> {
     sess.emit_turn_started(&turn_context).await;
+    run_compact_task_in_started_turn(sess, turn_context, input).await
+}
+
+/// Runs manual compaction inside a turn whose `TurnStarted` event was already emitted.
+pub(crate) async fn run_compact_task_in_started_turn(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<UserInput>,
+) -> CodexResult<()> {
     run_compact_task_inner(
-        sess.clone(),
+        sess,
         turn_context,
         input,
         InitialContextInjection::DoNotInject,

@@ -9,6 +9,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
@@ -63,6 +64,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
+use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::InvocationType;
@@ -180,7 +182,10 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(
+    if let Err(AutoCompactError {
+        error: err,
+        implementation,
+    }) = run_pre_sampling_compact(
         &sess,
         &turn_context,
         &mut client_session,
@@ -208,9 +213,15 @@ pub(crate) async fn run_turn(
             .await;
         // Publish the failure only after prompt hooks finish, so clients cannot react to
         // an error by steering follow-up input into a turn still preserving its prompt.
-        let message_prefix = match turn_context.provider.capabilities().remote_compaction {
-            RemoteCompactionSupport::V2 => Some("Error running remote compact task".to_string()),
-            RemoteCompactionSupport::Unsupported => None,
+        // Name the implementation that failed: remote compaction may have fallen back to local.
+        let remote_prefix = || Some("Error running remote compact task".to_string());
+        let message_prefix = match implementation {
+            Some(CompactionImplementation::ResponsesCompactionV2) => remote_prefix(),
+            Some(CompactionImplementation::Responses) => None,
+            None => match turn_context.provider.capabilities().remote_compaction {
+                RemoteCompactionSupport::V2 => remote_prefix(),
+                RemoteCompactionSupport::Unsupported => None,
+            },
         };
         sess.send_event(
             turn_context.as_ref(),
@@ -611,7 +622,7 @@ pub(crate) async fn run_turn(
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if should_roll_over {
-                    if let Err(err) = run_auto_compact(
+                    if let Err(AutoCompactError { error: err, .. }) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
                         /*fallback_step_context*/ None,
@@ -1275,7 +1286,7 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
+) -> Result<(), AutoCompactError> {
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
         .await?;
     let token_status =
@@ -1343,7 +1354,7 @@ async fn maybe_run_previous_model_inline_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
+) -> Result<(), AutoCompactError> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
     };
@@ -1437,6 +1448,29 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
+/// Auto-compaction failure paired with the implementation that produced it.
+///
+/// `implementation` is `None` when the failure happened before any compaction implementation ran.
+pub(super) struct AutoCompactError {
+    pub(super) error: CodexErr,
+    pub(super) implementation: Option<CompactionImplementation>,
+}
+
+impl From<CodexErr> for AutoCompactError {
+    fn from(error: CodexErr) -> Self {
+        Self {
+            error,
+            implementation: None,
+        }
+    }
+}
+
+impl From<AutoCompactError> for CodexErr {
+    fn from(err: AutoCompactError) -> Self {
+        err.error
+    }
+}
+
 #[instrument(
     level = "trace",
     skip_all,
@@ -1450,8 +1484,8 @@ async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
-) -> CodexResult<()> {
-    let turn_context = &step_context.turn;
+) -> Result<(), AutoCompactError> {
+    let turn_context = Arc::clone(&step_context.turn);
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
     if turn_context.config.features.enabled(Feature::TokenBudget) {
         // Compaction is the reset request, so force a new context window
@@ -1472,16 +1506,46 @@ async fn run_auto_compact(
                 "remote_v2",
                 /*manual*/ false,
             );
-            run_inline_remote_auto_compact_task_v2(
+            match run_inline_remote_auto_compact_task_v2(
                 Arc::clone(sess),
                 step_context,
                 fallback_step_context,
                 client_session,
-                initial_context_injection,
+                initial_context_injection.clone(),
                 reason,
                 phase,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(err) if should_fall_back_to_local_compaction(&err) => {
+                    // Providers that only present themselves as OpenAI cannot serve remote
+                    // compaction; summarize locally instead of failing the turn.
+                    emit_compact_metric(
+                        &sess.services.session_telemetry,
+                        "local",
+                        /*manual*/ false,
+                    );
+                    run_inline_auto_compact_task(
+                        Arc::clone(sess),
+                        turn_context,
+                        initial_context_injection,
+                        reason,
+                        phase,
+                    )
+                    .await
+                    .map_err(|error| AutoCompactError {
+                        error,
+                        implementation: Some(CompactionImplementation::Responses),
+                    })?;
+                }
+                Err(error) => {
+                    return Err(AutoCompactError {
+                        error,
+                        implementation: Some(CompactionImplementation::ResponsesCompactionV2),
+                    });
+                }
+            }
         }
         RemoteCompactionSupport::Unsupported => {
             emit_compact_metric(
@@ -1491,12 +1555,16 @@ async fn run_auto_compact(
             );
             run_inline_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
+                turn_context,
                 initial_context_injection,
                 reason,
                 phase,
             )
-            .await?;
+            .await
+            .map_err(|error| AutoCompactError {
+                error,
+                implementation: Some(CompactionImplementation::Responses),
+            })?;
         }
     }
     Ok(())
