@@ -5409,3 +5409,260 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
 
     Ok(())
 }
+
+fn usage_limit_response() -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(/*status*/ 429).set_body_json(json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "code": "usage_limit_reached",
+            "message": "Rate limit exceeded. Try again in 300s",
+            "resets_at": 1_704_067_242,
+        }
+    }))
+}
+
+fn usage_not_included_response() -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(/*status*/ 429).set_body_json(json!({
+        "error": {
+            "type": "usage_not_included",
+            "message": "usage is not included in this plan",
+        }
+    }))
+}
+
+/// Collects `Error` events until the current turn completes.
+async fn collect_errors_until_turn_complete(codex: &codex_core::CodexThread) -> Vec<String> {
+    let mut errors = Vec::new();
+    wait_for_event(codex, |event| match event {
+        EventMsg::Error(error) => {
+            errors.push(error.message.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    errors
+}
+
+fn assert_remote_v2_compaction_request(request: &responses::ResponsesRequest) {
+    assert_eq!(
+        request.input().last(),
+        Some(&json!({"type": "compaction_trigger"})),
+        "remote-v2 compact request should append exactly one compaction trigger"
+    );
+}
+
+fn assert_local_compaction_request(request: &responses::ResponsesRequest) {
+    assert!(
+        request.inputs_of_type("compaction_trigger").is_empty(),
+        "local compaction must not send a compaction_trigger item"
+    );
+    let last_user_message = request
+        .message_input_texts("user")
+        .pop()
+        .expect("local compaction sends the summarization prompt as a user message");
+    assert!(
+        last_user_message.contains(SUMMARIZATION_PROMPT),
+        "local compaction request should end with the summarization prompt, got {last_user_message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_falls_back_to_local_when_remote_v2_hits_usage_limit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    // Turn 1 crosses the auto-compaction limit; turn 2 triggers pre-turn compaction: the
+    // remote-v2 attempt is rejected with a usage limit, so local summarization runs instead.
+    let server = start_mock_server().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+            ])),
+            usage_limit_response(),
+            sse_response(sse(vec![
+                ev_assistant_message("compact-message", AUTO_SUMMARY_TEXT),
+                ev_completed_with_tokens("compact-response", /*total_tokens*/ 10),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("m2", FINAL_REPLY),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+            ])),
+        ],
+    )
+    .await;
+    let provider = openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(90);
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn(FIRST_AUTO_MSG).await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let errors = collect_errors_until_turn_complete(&test.codex).await;
+    assert_eq!(
+        errors,
+        Vec::<String>::new(),
+        "falling back to local compaction must not surface the remote failure"
+    );
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected first turn, rejected remote compaction, local compaction, and follow-up"
+    );
+    assert_remote_v2_compaction_request(&requests[1]);
+    assert_local_compaction_request(&requests[2]);
+    let follow_up = requests[3].body_json().to_string();
+    assert!(
+        requests[3].inputs_of_type("compaction_trigger").is_empty(),
+        "follow-up turn must not carry a compaction trigger"
+    );
+    assert!(
+        follow_up.contains(AUTO_SUMMARY_TEXT),
+        "follow-up turn should carry the local summary"
+    );
+    assert!(
+        follow_up.contains(POST_AUTO_USER_MSG),
+        "follow-up turn should still carry the preserved user prompt"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_falls_back_to_local_when_remote_v2_hits_usage_limit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed("r1"),
+            ])),
+            usage_limit_response(),
+            sse_response(sse(vec![
+                ev_assistant_message("compact-message", SUMMARY_TEXT),
+                ev_completed("compact-response"),
+            ])),
+            sse_response(sse(vec![
+                ev_assistant_message("m2", FINAL_REPLY),
+                ev_completed("r2"),
+            ])),
+        ],
+    )
+    .await;
+    let provider = openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = provider;
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("first turn").await?;
+    test.codex.submit(Op::Compact).await?;
+    let mut errors = Vec::new();
+    let mut turn_started_count = 0;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::TurnStarted(_) => {
+            turn_started_count += 1;
+            false
+        }
+        EventMsg::Error(error) => {
+            errors.push(error.message.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        turn_started_count, 1,
+        "the local fallback must reuse the turn the remote attempt already started"
+    );
+    test.submit_turn(THIRD_USER_MSG).await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 4);
+    assert_remote_v2_compaction_request(&requests[1]);
+    assert_local_compaction_request(&requests[2]);
+    let follow_up = requests[3].body_json().to_string();
+    assert!(
+        requests[3].inputs_of_type("compaction_trigger").is_empty(),
+        "follow-up turn must not carry a compaction trigger"
+    );
+    assert!(
+        follow_up.contains(SUMMARY_TEXT),
+        "follow-up turn should carry the local summary"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_reports_remote_v2_failures_that_do_not_fall_back() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    // Negative control: an account-level rejection is not model-specific, so remote compaction
+    // fails the turn without attempting local compaction.
+    let server = start_mock_server().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+            ])),
+            usage_not_included_response(),
+        ],
+    )
+    .await;
+    let provider = openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(90);
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn(FIRST_AUTO_MSG).await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let errors = collect_errors_until_turn_complete(&test.codex).await;
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one compaction error, got {errors:?}"
+    );
+    assert!(
+        errors[0].starts_with("Error running remote compact task"),
+        "non-fallback failures keep the remote prefix, got {}",
+        errors[0]
+    );
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2, "no local compaction request may follow");
+    assert_remote_v2_compaction_request(&requests[1]);
+    Ok(())
+}
