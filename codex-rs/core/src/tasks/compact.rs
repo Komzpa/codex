@@ -3,13 +3,15 @@ use std::sync::Arc;
 use super::SessionTask;
 use super::SessionTaskResult;
 use super::emit_compact_metric;
+use crate::compact::run_compact_task;
+use crate::compact::summarization_input;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_model_provider::RemoteCompactionSupport;
-use codex_user_input::ResolvedUserInput;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default)]
@@ -68,12 +70,25 @@ impl SessionTask for CompactTask {
                     "remote_v2",
                     /*manual*/ true,
                 );
-                crate::compact_remote_v2::run_remote_compact_task(
+                match crate::compact_remote_v2::run_remote_compact_task(
                     session.clone(),
-                    step_context,
-                    world_state,
+                    Arc::clone(&step_context),
+                    Arc::clone(&world_state),
                 )
                 .await
+                {
+                    Err(err) if should_fall_back_to_local_compaction(&err) => {
+                        emit_compact_metric(
+                            &session.services.session_telemetry,
+                            "local",
+                            /*manual*/ true,
+                        );
+                        // The task already emitted `TurnStarted`; local compaction reuses that turn.
+                        let input = summarization_input(&ctx.config);
+                        run_compact_task(session.clone(), step_context, world_state, input).await
+                    }
+                    result => result,
+                }
             }
             RemoteCompactionSupport::Unsupported => {
                 emit_compact_metric(
@@ -81,15 +96,8 @@ impl SessionTask for CompactTask {
                     "local",
                     /*manual*/ true,
                 );
-                let input = vec![ResolvedUserInput::text(
-                    ctx.config
-                        .compact_prompt
-                        .as_deref()
-                        .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
-                        .to_string(),
-                )];
-                crate::compact::run_compact_task(session.clone(), step_context, world_state, input)
-                    .await
+                let input = summarization_input(&ctx.config);
+                run_compact_task(session.clone(), step_context, world_state, input).await
             }
         };
         if let Err(err) = result {
