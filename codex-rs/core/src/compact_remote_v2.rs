@@ -13,6 +13,8 @@ use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::compaction_status_from_result;
 use crate::compact_model_fallback::record_model_fallback;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
@@ -264,6 +266,22 @@ async fn run_remote_compact_task_inner(
             if matches!(err.details(), CodexErrorDetails::TurnAborted)
                 || matches!(phase, CompactionPhase::PostTurn) =>
         {
+            Err(err)
+        }
+        Err(err) if should_fall_back_to_local_compaction(&err) => {
+            // The caller retries with local compaction, so this attempt is not a user-facing error.
+            tracing::warn!(
+                error = %err,
+                "remote compaction v2 failed; falling back to local compaction"
+            );
+            Err(err)
+        }
+        Err(err) if should_fall_back_to_local_compaction(&err) => {
+            // The caller retries with local compaction, so this attempt is not a user-facing error.
+            tracing::warn!(
+                error = %err,
+                "remote compaction v2 failed; falling back to local compaction"
+            );
             Err(err)
         }
         Err(err) => {

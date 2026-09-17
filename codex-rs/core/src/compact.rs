@@ -114,6 +114,19 @@ fn assemble_compaction_history(
         .collect()
 }
 
+/// Builds the summarization request that local compaction sends to the model.
+pub(crate) fn summarization_input(config: &crate::config::Config) -> Vec<UserInput> {
+    vec![UserInput::Text {
+        text: config
+            .compact_prompt
+            .as_deref()
+            .unwrap_or(SUMMARIZATION_PROMPT)
+            .to_string(),
+        // Compaction prompt is synthesized; no UI element ranges to preserve.
+        text_elements: Vec::new(),
+    }]
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -122,17 +135,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
-    let prompt = turn_context
-        .config
-        .compact_prompt
-        .as_deref()
-        .unwrap_or(SUMMARIZATION_PROMPT)
-        .to_string();
-    let input = vec![UserInput::Text {
-        text: prompt,
-        // Compaction prompt is synthesized; no UI element ranges to preserve.
-        text_elements: Vec::new(),
-    }];
+    let input = summarization_input(&turn_context.config);
 
     run_compact_task_inner(
         sess,

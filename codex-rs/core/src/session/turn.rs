@@ -11,6 +11,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::AutoCompactionDisabled;
 use crate::compact::run_inline_auto_compact_task;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
 use crate::compact_remote_v2::BackgroundCompactionCandidate;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
@@ -71,6 +72,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
+use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::InvocationType;
@@ -217,7 +219,10 @@ pub(crate) async fn run_turn(
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
     if auto_compaction_enabled
-        && let Err(err) = run_pre_sampling_compact(
+        && let Err(AutoCompactError {
+            error: err,
+            implementation,
+        }) = run_pre_sampling_compact(
             &sess,
             &turn_context,
             &mut client_session,
@@ -245,9 +250,15 @@ pub(crate) async fn run_turn(
             .await;
         // Publish the failure only after prompt hooks finish, so clients cannot react to
         // an error by steering follow-up input into a turn still preserving its prompt.
-        let message_prefix = match turn_context.provider.capabilities().remote_compaction {
-            RemoteCompactionSupport::V2 => Some("Error running remote compact task".to_string()),
-            RemoteCompactionSupport::Unsupported => None,
+        // Name the implementation that failed: remote compaction may have fallen back to local.
+        let remote_prefix = || Some("Error running remote compact task".to_string());
+        let message_prefix = match implementation {
+            Some(CompactionImplementation::ResponsesCompactionV2) => remote_prefix(),
+            Some(CompactionImplementation::Responses) => None,
+            None => match turn_context.provider.capabilities().remote_compaction {
+                RemoteCompactionSupport::V2 => remote_prefix(),
+                RemoteCompactionSupport::Unsupported => None,
+            },
         };
         sess.send_event(
             turn_context.as_ref(),
@@ -1462,7 +1473,7 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
+) -> Result<(), AutoCompactError> {
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
         .await?;
     let token_status =
@@ -1475,7 +1486,7 @@ async fn run_pre_sampling_compact(
         let step_context = sess
             .capture_step_context(Arc::clone(turn_context), cancellation_token)
             .await?;
-        run_auto_compact(
+        run_auto_compact_with_implementation(
             sess,
             Arc::clone(&step_context),
             step_context,
@@ -1506,7 +1517,7 @@ async fn maybe_run_previous_model_inline_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
+) -> Result<(), AutoCompactError> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
     };
@@ -1572,7 +1583,7 @@ async fn maybe_run_previous_model_inline_compact(
     let replacement_step_context = sess
         .capture_speculative_step_context(Arc::clone(turn_context), cancellation_token)
         .await?;
-    run_auto_compact(
+    run_auto_compact_with_implementation(
         sess,
         step_context,
         replacement_step_context,
@@ -1585,13 +1596,30 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
-/// The replacement context may use a different model than the compactor.
+/// Auto-compaction failure paired with the implementation that produced it.
+///
+/// `implementation` is `None` when the failure happened before any compaction implementation ran.
+pub(super) struct AutoCompactError {
+    pub(super) error: CodexErr,
+    pub(super) implementation: Option<CompactionImplementation>,
+}
+
+impl From<CodexErr> for AutoCompactError {
+    fn from(error: CodexErr) -> Self {
+        Self {
+            error,
+            implementation: None,
+        }
+    }
+}
+
+impl From<AutoCompactError> for CodexErr {
+    fn from(err: AutoCompactError) -> Self {
+        err.error
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-#[instrument(
-    level = "trace",
-    skip_all,
-    fields(reason = ?reason, phase = ?phase)
-)]
 async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
@@ -1601,6 +1629,35 @@ async fn run_auto_compact(
     phase: CompactionPhase,
     candidate: Option<Box<BackgroundCompactionCandidate>>,
 ) -> CodexResult<bool> {
+    run_auto_compact_with_implementation(
+        sess,
+        step_context,
+        replacement_step_context,
+        client_session,
+        reason,
+        phase,
+        candidate,
+    )
+    .await
+    .map_err(CodexErr::from)
+}
+
+/// The replacement context may use a different model than the compactor.
+#[allow(clippy::too_many_arguments)]
+#[instrument(
+    level = "trace",
+    skip_all,
+    fields(reason = ?reason, phase = ?phase)
+)]
+async fn run_auto_compact_with_implementation(
+    sess: &Arc<Session>,
+    step_context: Arc<StepContext>,
+    replacement_step_context: Arc<StepContext>,
+    client_session: &mut ModelClientSession,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+    candidate: Option<Box<BackgroundCompactionCandidate>>,
+) -> Result<bool, AutoCompactError> {
     let turn_context = &step_context.turn;
     if matches!(phase, CompactionPhase::PreTurn)
         && crate::guardian::is_basic_session_source(&turn_context.session_source)
@@ -1658,18 +1715,51 @@ async fn run_auto_compact(
             } else {
                 crate::compact_remote_v2::CompactionFallback::Foreground
             };
-            let installed = run_inline_remote_auto_compact_task_v2(
+            let remote_world_state = Arc::clone(&world_state);
+            let installed = match run_inline_remote_auto_compact_task_v2(
                 Arc::clone(sess),
                 step_context,
-                replacement_step_context,
+                Arc::clone(&replacement_step_context),
                 client_session,
-                world_state,
+                remote_world_state,
                 reason,
                 phase,
                 candidate,
                 fallback,
             )
-            .await?;
+            .await
+            {
+                Ok(installed) => installed,
+                Err(err) if should_fall_back_to_local_compaction(&err) => {
+                    // Providers that only present themselves as OpenAI cannot serve remote
+                    // compaction; summarize locally instead of failing the turn.
+                    emit_compact_metric(
+                        &sess.services.session_telemetry,
+                        "local",
+                        /*manual*/ false,
+                    );
+                    run_inline_auto_compact_task(
+                        Arc::clone(sess),
+                        Arc::clone(turn_context),
+                        replacement_step_context,
+                        world_state,
+                        reason,
+                        phase,
+                    )
+                    .await
+                    .map_err(|error| AutoCompactError {
+                        error,
+                        implementation: Some(CompactionImplementation::Responses),
+                    })?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(AutoCompactError {
+                        error,
+                        implementation: Some(CompactionImplementation::ResponsesCompactionV2),
+                    });
+                }
+            };
             if has_candidate && installed {
                 emit_compact_metric(
                     &sess.services.session_telemetry,
@@ -1693,7 +1783,11 @@ async fn run_auto_compact(
                 reason,
                 phase,
             )
-            .await?;
+            .await
+            .map_err(|error| AutoCompactError {
+                error,
+                implementation: Some(CompactionImplementation::Responses),
+            })?;
             Ok(true)
         }
     }
