@@ -150,3 +150,34 @@ fn masked_wslg_alias_does_not_allow_other_exposed_aliases() {
         assert!(super::check_mounts(directory, "0:1", mount_id, exposed.as_bytes(), mask).is_err());
     }
 }
+
+#[test]
+fn accepts_a_namespace_mount_whose_root_is_not_a_path() {
+    // nsfs reports the namespace identity where every other filesystem reports
+    // a path. A host running containers or snaps carries one such line per
+    // bind-mounted namespace, and rejecting them stopped every sandboxed
+    // command with "mountinfo path is not absolute".
+    let mounts = b"1 0 0:1 / / rw - ext4 disk rw\n\
+        52 1 0:4 net:[4026533192] /run/netns/example rw - nsfs nsfs rw\n";
+    for mount_id in [Some("1"), None] {
+        assert!(
+            check_mounts(Path::new("/tmp/codex-daemon-1000"), "0:1", mount_id, mounts).is_ok(),
+            "mount_id: {mount_id:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_an_unparseable_root_on_the_socket_device() {
+    // The leniency is scoped to other devices. A mount that could back the
+    // socket directory must still present a root the alias check can compare,
+    // so an unreadable one fails closed rather than being skipped.
+    let mounts = b"1 0 0:1 / / rw - ext4 disk rw\n\
+        2 1 0:1 net:[4026533192] /tmp rw - nsfs nsfs rw\n";
+    for mount_id in [Some("2"), None] {
+        assert!(
+            check_mounts(Path::new("/tmp/codex-daemon-1000"), "0:1", mount_id, mounts).is_err(),
+            "mount_id: {mount_id:?}"
+        );
+    }
+}

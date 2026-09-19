@@ -62,7 +62,17 @@ fn check_mounts(
         let [id, parent, mount_device, root, destination] = fields.as_slice() else {
             return Err(invalid());
         };
-        let root = mount_path(root)?;
+        // nsfs puts an identity such as `net:[4026533192]` in the root field
+        // instead of a path, once per bind-mounted namespace; a host running
+        // containers or snaps carries dozens of them. Such a filesystem can
+        // never back the socket directory, and only its destination can
+        // obstruct it, so accept an unparseable root unless the mount shares
+        // our device, where the root is what the alias check relies on.
+        let root = match mount_path(root) {
+            Ok(path) => Some(path),
+            Err(_) if *mount_device != device.as_bytes() => None,
+            Err(error) => return Err(error),
+        };
         let destination = mount_path(destination)?;
         mounts.push((*id, *parent, *mount_device, root, destination));
     }
@@ -77,6 +87,8 @@ fn check_mounts(
         if *mount_device != device.as_bytes() {
             return Err(invalid());
         }
+        // Sharing our device, so its root parsed as a path above.
+        let root = root.as_deref().ok_or_else(invalid)?;
         let relative = directory.strip_prefix(destination).map_err(|_| invalid())?;
         let mut current = Some(selected);
         let mut visible_child: Option<&Path> = None;
@@ -108,6 +120,8 @@ fn check_mounts(
             .iter()
             .filter(|(_, _, mount_device, ..)| *mount_device == device.as_bytes())
             .filter_map(|(_, _, _, root, destination)| {
+                // Filtered to our device, so the root parsed as a path above.
+                let root = root.as_deref()?;
                 directory
                     .strip_prefix(destination)
                     .ok()
@@ -123,6 +137,8 @@ fn check_mounts(
         // Nested mounts can introduce another filesystem (or an individual socket) under the mask.
         let nested = destination != directory && destination.starts_with(directory);
         let alias = if *mount_device == device.as_bytes() {
+            // Sharing our device, so its root parsed as a path above.
+            let root = root.as_deref().ok_or_else(invalid)?;
             if let Ok(relative) = location.strip_prefix(root) {
                 Some(destination.join(relative))
             } else if root.starts_with(&location) {
