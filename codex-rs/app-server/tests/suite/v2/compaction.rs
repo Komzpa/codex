@@ -18,6 +18,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ResponseUsageMetadata;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
+use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -30,6 +31,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
@@ -52,6 +54,119 @@ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 enum CompactionRoute {
     Local,
     Remote,
+}
+
+#[test_case(CompactionRoute::Local; "local")]
+#[test_case(CompactionRoute::Remote; "streamed remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_turn_compaction_rehydrates_current_goal(route: CompactionRoute) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let old_request = "Write and commit the observatory calibration plan.";
+    let objective = "Execute the calibration plan and record the beacon measurements.";
+    let summary = match route {
+        CompactionRoute::Local => {
+            responses::ev_assistant_message("summary", "The plan is written.")
+        }
+        CompactionRoute::Remote => serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "compaction", "encrypted_content": "ENCRYPTED_SUMMARY"},
+        }),
+    };
+    let scripts = vec![
+        responses::sse(vec![
+            responses::ev_assistant_message("plan", "The plan is committed."),
+            responses::ev_completed_with_tokens("plan", /*total_tokens*/ 200),
+        ]),
+        responses::sse(vec![
+            responses::ev_function_call("probe", "exec_command", r#"{"cmd":"true"}"#),
+            responses::ev_completed_with_tokens("probe", /*total_tokens*/ 330_000),
+        ]),
+        responses::sse(vec![summary.clone(), responses::ev_completed("compact")]),
+        responses::sse(vec![
+            responses::ev_function_call("finish", "update_goal", r#"{"status":"complete"}"#),
+            responses::ev_completed_with_tokens("finish", /*total_tokens*/ 200),
+        ]),
+        responses::sse(vec![
+            responses::ev_assistant_message("done", "Measurements are recorded."),
+            responses::ev_completed_with_tokens("done", /*total_tokens*/ 200),
+        ]),
+        responses::sse(vec![summary, responses::ev_completed("compact-inactive")]),
+        responses::sse(vec![
+            responses::ev_assistant_message("status", "The calibration is complete."),
+            responses::ev_completed_with_tokens("status", /*total_tokens*/ 200),
+        ]),
+    ];
+    let observed = responses::mount_sse_sequence(&server, scripts).await;
+    let codex_home = TempDir::new()?;
+    let mut config = compaction_config(&server.uri(), /*auto_compact_limit*/ 200_000)
+        .with_model("gpt-5.4")
+        .enable_feature(Feature::Goals);
+    if let CompactionRoute::Remote = route {
+        config = config.with_provider_name("OpenAI");
+    }
+    config.write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let request = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp.read_response(request).await?;
+    send_turn_and_wait(&mut mcp, &thread.id, old_request).await?;
+    let request = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(serde_json::json!({"threadId": thread.id, "objective": objective})),
+        )
+        .await?;
+    let _: ThreadGoalSetResponse = mcp.read_response(request).await?;
+    let _: TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    let requests = observed.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0].body_contains_text(old_request));
+    assert_eq!(
+        requests[3]
+            .message_input_texts("developer")
+            .iter()
+            .filter(|text| text.contains(objective))
+            .count(),
+        1,
+        "the very next sample in the same turn must see the current goal",
+    );
+    if let CompactionRoute::Remote = route {
+        assert_eq!(requests[2].inputs_of_type("compaction_trigger").len(), 1);
+        assert!(requests[3].body_contains_text(old_request));
+    }
+    mcp.clear_message_buffer();
+    let request = mcp
+        .send_thread_compact_start_request(ThreadCompactStartParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let _: ThreadCompactStartResponse = mcp.read_response(request).await?;
+    let _: TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    send_turn_and_wait(&mut mcp, &thread.id, "Report current status.").await?;
+    let requests = observed.requests();
+    assert_eq!(requests.len(), 7);
+    assert!(
+        requests[6]
+            .message_input_texts("developer")
+            .iter()
+            .all(|text| !text.contains(objective)),
+        "a completed goal must not return after another compaction",
+    );
+    Ok(())
 }
 
 #[test_case(CompactionRoute::Local; "local")]

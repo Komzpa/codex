@@ -5,10 +5,13 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_core::ThreadManager;
 use codex_core::TurnStartOptions;
 use codex_extension_api::ConfigContributor;
+use codex_extension_api::ContentItemKind;
+use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::PromptFragment;
 use codex_extension_api::ThreadIdleInput;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadResumeInput;
@@ -48,12 +51,15 @@ use crate::runtime::GoalRuntimeHandle;
 use crate::spec::CREATE_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::steering::budget_limit_steering_item;
+use crate::steering::continuation_prompt;
 use crate::tool::GoalToolExecutor;
+use crate::tool::protocol_goal_from_state;
 
 #[derive(Clone, Debug)]
 pub struct GoalExtensionConfig {
     pub enabled: bool,
     pub max_goal_token_budget: Option<i64>,
+    pub update_plan_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -197,6 +203,48 @@ where
             if let Some(runtime) = goal_runtime_handle(input.thread_store) {
                 self.goal_service.unregister_runtime(&runtime);
             }
+        })
+    }
+}
+
+// Compaction removes transient goal steering before resuming the same turn.
+// Rebuild from the goal owner so changed or inactive goals cannot be replayed
+// from an older copy of the conversation.
+impl<C> ContextContributor for GoalExtension<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn contribute_thread_context<'a>(
+        &'a self,
+        _session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let Some(config) = thread_store.get::<GoalExtensionConfig>() else {
+                return Vec::new();
+            };
+            if !config.enabled {
+                return Vec::new();
+            }
+            let Ok(thread_id) = ThreadId::from_string(thread_store.level_id()) else {
+                return Vec::new();
+            };
+            let Ok(Some(goal)) = self
+                .state_dbs
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await
+            else {
+                return Vec::new();
+            };
+            if goal.status != codex_state::ThreadGoalStatus::Active {
+                return Vec::new();
+            }
+
+            vec![PromptFragment::developer_policy(
+                continuation_prompt(&protocol_goal_from_state(goal), config.update_plan_enabled),
+                ContentItemKind("goal.continuation".to_string()),
+            )]
         })
     }
 }
@@ -608,6 +656,7 @@ pub fn install_with_backend<C>(
     registry.config_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
     registry.token_usage_contributor(extension.clone());
+    registry.prompt_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
     registry.tool_contributor(extension);
 }

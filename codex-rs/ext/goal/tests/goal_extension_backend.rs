@@ -99,6 +99,64 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+    assert!(harness.thread_context().await.is_empty());
+    let old_objective = "Survey the beacon calibration procedure.";
+    let objective = "Calibrate beacon seventeen and save its measurements.";
+    for current in [old_objective, objective] {
+        let outcome = harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Set(current),
+                    status: Some(ThreadGoalStatus::Active),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+            )
+            .await?;
+        outcome.apply_runtime_effects(&harness.goal_service).await;
+        let context = harness.thread_context().await;
+        assert_eq!(context.len(), 1);
+        assert!(context[0].text().contains(current));
+    }
+
+    let context = harness.thread_context().await;
+    assert_eq!(context.len(), 1);
+    assert!(context[0].text().contains(objective));
+    assert!(
+        !context[0].text().contains(old_objective),
+        "only canonical active goal state may be rehydrated"
+    );
+
+    for status in [ThreadGoalStatus::Complete, ThreadGoalStatus::Paused] {
+        let outcome = harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(status),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+            )
+            .await?;
+        outcome.apply_runtime_effects(&harness.goal_service).await;
+        assert_eq!(harness.thread_context().await.len(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
@@ -107,6 +165,7 @@ async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()>
     harness.thread_store.insert(GoalExtensionConfig {
         enabled: true,
         max_goal_token_budget: Some(100),
+        update_plan_enabled: true,
     });
     let tools = harness.tools();
     let create_tool = tool_by_name(&tools, "create_goal");
@@ -1628,6 +1687,7 @@ async fn installed_tools_with_start(
         |_| GoalExtensionConfig {
             enabled: true,
             max_goal_token_budget: None,
+            update_plan_enabled: true,
         },
     );
     let registry = builder.build();
@@ -1685,6 +1745,7 @@ impl GoalExtensionHarness {
             |_| GoalExtensionConfig {
                 enabled: true,
                 max_goal_token_budget: None,
+                update_plan_enabled: true,
             },
         );
         let registry = Arc::new(builder.build());
@@ -1763,6 +1824,18 @@ impl GoalExtensionHarness {
             .iter()
             .flat_map(|contributor| contributor.tools(&self.session_store, &self.thread_store))
             .collect()
+    }
+
+    async fn thread_context(&self) -> Vec<codex_extension_api::PromptFragment> {
+        let mut context = Vec::new();
+        for contributor in self.registry.context_contributors() {
+            context.extend(
+                contributor
+                    .contribute_thread_context(&self.session_store, &self.thread_store)
+                    .await,
+            );
+        }
+        context
     }
 
     async fn start_turn(&self, turn_id: &str, usage: &TokenUsage) {

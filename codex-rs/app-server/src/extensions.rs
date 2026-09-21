@@ -84,6 +84,7 @@ pub(crate) fn thread_extensions(
             |config: &Config| GoalExtensionConfig {
                 enabled: config.features.enabled(codex_features::Feature::Goals),
                 max_goal_token_budget: config.max_goal_token_budget,
+                update_plan_enabled: config.update_plan_enabled,
             },
         );
     }
