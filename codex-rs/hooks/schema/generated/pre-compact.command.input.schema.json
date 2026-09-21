@@ -9,15 +9,47 @@
       ]
     }
   },
+  "description": "Context accounting already computed by the engine for the active turn.\n\nOptional fields keep command-hook payloads forwards and backwards compatible when a limit is not defined, while the runtime supplies every available value.",
   "properties": {
+    "active_context_tokens": {
+      "format": "int64",
+      "type": "integer"
+    },
     "agent_id": {
       "type": "string"
     },
     "agent_type": {
       "type": "string"
     },
+    "auto_compact_scope_limit": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "auto_compact_scope_tokens": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "auto_compact_window_prefill_tokens": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "base_window_tokens_remaining": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "buffered_auto_compact_limit": {
+      "format": "int64",
+      "type": "integer"
+    },
     "cwd": {
       "type": "string"
+    },
+    "full_context_window_limit": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "full_context_window_limit_reached": {
+      "type": "boolean"
     },
     "hook_event_name": {
       "const": "PreCompact",
@@ -28,6 +60,9 @@
     },
     "session_id": {
       "type": "string"
+    },
+    "token_limit_reached": {
+      "type": "boolean"
     },
     "transcript_path": {
       "$ref": "#/definitions/NullableString"

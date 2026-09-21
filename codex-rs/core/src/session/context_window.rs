@@ -11,6 +11,7 @@ pub(crate) struct ContextWindowTokenStatus {
     // Usage counted against `model_auto_compact_token_limit` for the current scope.
     pub(crate) auto_compact_scope_tokens: i64,
     pub(crate) auto_compact_scope_limit: Option<i64>,
+    pub(crate) buffered_auto_compact_limit: Option<i64>,
     pub(crate) full_context_window_limit: Option<i64>,
     pub(crate) base_window_tokens_remaining: Option<i64>,
     pub(crate) auto_compact_window_prefill_tokens: Option<i64>,
@@ -120,6 +121,7 @@ async fn context_window_token_status_with_config(
         active_context_tokens,
         auto_compact_scope_tokens,
         auto_compact_scope_limit,
+        buffered_auto_compact_limit,
         full_context_window_limit,
         base_window_tokens_remaining,
         auto_compact_window_prefill_tokens,

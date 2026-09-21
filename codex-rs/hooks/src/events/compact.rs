@@ -11,6 +11,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
 
 use super::common;
+use crate::ContextWindowUsage;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
@@ -29,6 +30,7 @@ pub struct PreCompactRequest {
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub trigger: String,
+    pub context_window: ContextWindowUsage,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +136,7 @@ fn pre_command_input(request: &PreCompactRequest) -> Result<Value, serde_json::E
         hook_event_name: "PreCompact".to_string(),
         model: request.model.clone(),
         trigger: request.trigger.clone(),
+        context_window: request.context_window.clone(),
     })
 }
 
@@ -376,6 +379,15 @@ mod tests {
                 "hook_event_name": "PreCompact",
                 "model": "gpt-test",
                 "trigger": "manual",
+                "active_context_tokens": 123,
+                "auto_compact_scope_tokens": 100,
+                "auto_compact_scope_limit": 900,
+                "buffered_auto_compact_limit": 1000,
+                "full_context_window_limit": 1200,
+                "base_window_tokens_remaining": 800,
+                "auto_compact_window_prefill_tokens": 23,
+                "full_context_window_limit_reached": false,
+                "token_limit_reached": false,
             })
         );
     }
@@ -502,6 +514,17 @@ mod tests {
             transcript_path: None,
             model: "gpt-test".to_string(),
             trigger: "manual".to_string(),
+            context_window: crate::ContextWindowUsage {
+                active_context_tokens: Some(123),
+                auto_compact_scope_tokens: Some(100),
+                auto_compact_scope_limit: Some(900),
+                buffered_auto_compact_limit: Some(1000),
+                full_context_window_limit: Some(1200),
+                base_window_tokens_remaining: Some(800),
+                auto_compact_window_prefill_tokens: Some(23),
+                full_context_window_limit_reached: Some(false),
+                token_limit_reached: Some(false),
+            },
         }
     }
 
