@@ -103,7 +103,10 @@ fn map_api_error_maps_server_draining_503_to_delayed_retry() {
         panic!("expected server-draining retry, got {err:?}");
     };
     assert_eq!(message, "Server is draining");
-    assert_eq!(err.retry_delay(), Some(std::time::Duration::from_secs(2)));
+    assert_eq!(
+        err.server_retry_delay(),
+        Some(std::time::Duration::from_secs(2))
+    );
 }
 
 #[test]

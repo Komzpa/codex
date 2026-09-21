@@ -758,7 +758,7 @@ pub(crate) async fn run_turn(
                         .turn_end_compaction_threshold_reached
                         && !sess.input_queue.has_pending_input(&sess.active_turn).await
                         && !cancellation_token.is_cancelled()
-                        && let Err(err) = run_auto_compact(
+                        && let Err(AutoCompactError { error: err, .. }) = run_auto_compact(
                             &sess,
                             Arc::clone(&step_context),
                             /*fallback_step_context*/ None,

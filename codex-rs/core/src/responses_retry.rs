@@ -66,7 +66,6 @@ pub(crate) async fn handle_response_stream_error(
     };
 
     if matches!(err.details(), CodexErrorDetails::ServerDraining(_)) {
-        let delay = err.retry_delay().unwrap_or_else(|| backoff(1));
         warn!(
             ?delay,
             "server is draining; retrying without consuming the transport retry budget"
