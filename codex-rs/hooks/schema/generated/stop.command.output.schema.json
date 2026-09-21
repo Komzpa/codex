@@ -7,6 +7,23 @@
         "block"
       ],
       "type": "string"
+    },
+    "StopHookSpecificOutputWire": {
+      "additionalProperties": false,
+      "properties": {
+        "hookEventName": {
+          "const": "Stop",
+          "type": "string"
+        },
+        "requestCompaction": {
+          "default": null,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hookEventName"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -18,6 +35,14 @@
       "allOf": [
         {
           "$ref": "#/definitions/BlockDecisionWire"
+        }
+      ],
+      "default": null
+    },
+    "hookSpecificOutput": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/StopHookSpecificOutputWire"
         }
       ],
       "default": null

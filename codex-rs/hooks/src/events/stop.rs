@@ -102,6 +102,7 @@ pub struct StopOutcome {
     pub stop_reason: Option<String>,
     pub should_block: bool,
     pub block_reason: Option<String>,
+    pub should_compact: bool,
     pub continuation_fragments: Vec<HookPromptFragment>,
 }
 
@@ -111,6 +112,7 @@ struct StopHandlerData {
     stop_reason: Option<String>,
     should_block: bool,
     block_reason: Option<String>,
+    should_compact: bool,
     continuation_fragments: Vec<HookPromptFragment>,
 }
 
@@ -136,6 +138,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
             stop_reason: None,
             should_block: false,
             block_reason: None,
+            should_compact: false,
             continuation_fragments: Vec::new(),
         };
     }
@@ -232,6 +235,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         stop_reason: aggregate.stop_reason,
         should_block: aggregate.should_block,
         block_reason: aggregate.block_reason,
+        should_compact: aggregate.should_compact,
         continuation_fragments: aggregate.continuation_fragments,
     }
 }
@@ -262,6 +266,7 @@ fn parse_completed(
     let mut stop_reason = None;
     let mut should_block = false;
     let mut block_reason = None;
+    let mut should_compact = false;
     let mut continuation_prompt = None;
     let hook_event_name = match handler.event_name {
         HookEventName::Stop | HookEventName::SubagentStop => handler.event_name,
@@ -297,6 +302,9 @@ fn parse_completed(
                     }
                     let _ = parsed.universal.suppress_output;
                     if handler.can_apply_control_effects() {
+                        if parsed.should_compact {
+                            should_compact = true;
+                        }
                         if !parsed.universal.continue_processing {
                             status = HookRunStatus::Stopped;
                             should_stop = true;
@@ -408,6 +416,7 @@ fn parse_completed(
             stop_reason,
             should_block,
             block_reason,
+            should_compact,
             continuation_fragments,
         },
         completion_order: 0,
@@ -421,6 +430,7 @@ fn aggregate_results<'a>(
     let should_stop = results.iter().any(|result| result.should_stop);
     let stop_reason = results.iter().find_map(|result| result.stop_reason.clone());
     let should_block = !should_stop && results.iter().any(|result| result.should_block);
+    let should_compact = results.iter().any(|result| result.should_compact);
     let block_reason = if should_block {
         common::join_text_chunks(
             results
@@ -446,6 +456,7 @@ fn aggregate_results<'a>(
         stop_reason,
         should_block,
         block_reason,
+        should_compact,
         continuation_fragments,
     }
 }
@@ -457,6 +468,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOu
         stop_reason: None,
         should_block: false,
         block_reason: None,
+        should_compact: false,
         continuation_fragments: Vec::new(),
     }
 }
@@ -528,6 +540,51 @@ mod tests {
     }
 
     #[test]
+    fn stop_hook_request_compaction_sets_control_effect() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"Stop","requestCompaction":true}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert!(parsed.data.should_compact);
+    }
+
+    #[test]
+    fn stop_hook_request_compaction_false_does_not_set_control_effect() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"Stop","requestCompaction":false}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert!(!parsed.data.should_compact);
+    }
+
+    #[test]
+    fn async_stop_hook_request_compaction_does_not_set_control_effect() {
+        let parsed = parse_completed(
+            &handler_with_async(/*async*/ true),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"Stop","requestCompaction":true}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert!(!parsed.data.should_compact);
+    }
+
+    #[test]
     fn block_decision_with_reason_sets_continuation_prompt() {
         let parsed = parse_completed(
             &handler(),
@@ -546,6 +603,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("retry with tests".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
@@ -602,6 +660,7 @@ mod tests {
                 stop_reason: Some("done".to_string()),
                 should_block: false,
                 block_reason: None,
+                should_compact: false,
                 continuation_fragments: Vec::new(),
             }
         );
@@ -623,6 +682,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("retry with tests".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
@@ -708,6 +768,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("first".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment::from_single_hook(
                     "first", "run-1",
                 )],
@@ -717,6 +778,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("second".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![HookPromptFragment::from_single_hook(
                     "second", "run-2",
                 )],
@@ -730,6 +792,7 @@ mod tests {
                 stop_reason: None,
                 should_block: true,
                 block_reason: Some("first\n\nsecond".to_string()),
+                should_compact: false,
                 continuation_fragments: vec![
                     HookPromptFragment::from_single_hook("first", "run-1"),
                     HookPromptFragment::from_single_hook("second", "run-2"),

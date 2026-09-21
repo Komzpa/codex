@@ -416,6 +416,7 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut hook_requested_compaction = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -669,6 +670,39 @@ pub(crate) async fn run_turn(
                         return Err(CodexErr::InvalidRequest(
                             "Memory consolidation was rejected by a Stop hook.".to_string(),
                         ));
+                    }
+                    if stop_outcome.should_compact && !hook_requested_compaction {
+                        hook_requested_compaction = true;
+                        if let Err(AutoCompactError { error: err, .. }) = run_auto_compact(
+                            &sess,
+                            Arc::clone(&step_context),
+                            /*fallback_step_context*/ None,
+                            &mut client_session,
+                            InitialContextInjection::BeforeLastUserMessage {
+                                world_state: Arc::clone(&world_state),
+                                step_context: Arc::clone(&step_context),
+                            },
+                            CompactionReason::HookRequested,
+                            CompactionPhase::MidTurn,
+                        )
+                        .await
+                        {
+                            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+                                return Err(err);
+                            }
+                            let error = err.to_codex_protocol_error();
+                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                                .await;
+                            return Ok(None);
+                        }
+                        if run_pending_session_start_hooks(&sess, &turn_context).await {
+                            return Ok(None);
+                        }
+                        // Deliberately fall through instead of continuing the
+                        // loop: the hook asked for room, not for another
+                        // sampling request. Falling through lets a hook that
+                        // also blocked inject its continuation below, and lets
+                        // a hook that only wanted room end the turn here.
                     }
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =

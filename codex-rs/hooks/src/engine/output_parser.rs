@@ -59,6 +59,7 @@ pub(crate) struct StopOutput {
     pub should_block: bool,
     pub reason: Option<String>,
     pub invalid_block_reason: Option<String>,
+    pub should_compact: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +294,8 @@ pub(crate) fn parse_stop(stdout: &str) -> Option<StopOutput> {
         wire.universal,
         wire.decision,
         wire.reason,
+        wire.hook_specific_output
+            .is_some_and(|output| output.request_compaction == Some(true)),
         "Stop",
     ))
 }
@@ -303,6 +306,7 @@ pub(crate) fn parse_subagent_stop(stdout: &str) -> Option<StopOutput> {
         wire.universal,
         wire.decision,
         wire.reason,
+        false,
         "SubagentStop",
     ))
 }
@@ -311,6 +315,7 @@ fn stop_output(
     universal: HookUniversalOutputWire,
     decision: Option<BlockDecisionWire>,
     reason: Option<String>,
+    should_compact: bool,
     event_name: &str,
 ) -> StopOutput {
     let should_block = matches!(decision, Some(BlockDecisionWire::Block));
@@ -328,6 +333,7 @@ fn stop_output(
         should_block: should_block && invalid_block_reason.is_none(),
         reason,
         invalid_block_reason,
+        should_compact,
     }
 }
 

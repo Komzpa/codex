@@ -22,6 +22,8 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
 use codex_plugin::PluginHookSource;
 use codex_plugin::PluginId;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::TurnItem;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
@@ -232,6 +234,41 @@ else:
 
     fs::write(&script_path, script).context("write stop hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_request_compaction_stop_hook(home: &Path) -> Result<()> {
+    let script_path = home.join("request_compaction_stop_hook.py");
+    let log_path = home.join("request_compaction_stop_hook_log.jsonl");
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+
+log_path = Path(r"{log_path}")
+payload = json.load(sys.stdin)
+existing = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()] if log_path.exists() else []
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+print(json.dumps({{"hookSpecificOutput": {{"hookEventName": "Stop", "requestCompaction": True}}}}))
+"#,
+        log_path = log_path.display(),
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write request compaction stop hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string())
+        .context("write request compaction hooks.json")?;
     Ok(())
 }
 
@@ -1420,6 +1457,79 @@ async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()> {
     assert!(
         hook_prompt_texts.contains(&SECOND_CONTINUATION_PROMPT.to_string()),
         "rollout should persist the second continuation prompt",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_hook_request_compaction_runs_in_same_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    // Exactly one sampling response is mounted on purpose. The hook asks for
+    // room, not for more work, so the turn must answer once and end. If the
+    // compaction restarted the turn, a second sampling request would arrive
+    // with nothing mounted to answer it.
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "before compaction"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_request_compaction_stop_hook(home)
+                .expect("failed to write request compaction stop hook fixture");
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("token budget should be available");
+            trust_discovered_hooks(config);
+        })
+        .build(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "compact after this answer".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let mut saw_compaction = false;
+    let mut agent_messages: Vec<String> = Vec::new();
+    loop {
+        let event = test.codex.next_event().await.expect("next event");
+        match event.msg {
+            EventMsg::ItemStarted(event) => match event.item {
+                TurnItem::ContextCompaction(_) => saw_compaction = true,
+                TurnItem::AgentMessage(item) => agent_messages.extend(
+                    item.content
+                        .into_iter()
+                        .map(|AgentMessageContent::Text { text }| text),
+                ),
+                _ => {}
+            },
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(saw_compaction, "Stop hook request should run compaction");
+    assert_eq!(
+        agent_messages,
+        vec!["before compaction".to_string()],
+        "a compaction-only request must not make the model answer again",
+    );
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "the compaction must make room inside the turn, not start another one",
     );
 
     Ok(())
