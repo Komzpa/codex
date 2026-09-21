@@ -1,6 +1,6 @@
 # Local source-refresh patches
 
-This branch is rebased on upstream `c775dd3c33`. It retains twelve focused
+This branch is rebased on upstream `2fe4a2b4d8`. It retains twelve focused
 patches that upstream did not yet cover. The archive used to reconstruct the
 set was `9c57bef5d1`; the entries below describe the current behavior, not the
 old replay chronology.
@@ -28,6 +28,19 @@ exposed the problem.
 | `fix(hooks): let Stop hooks request one mid-turn compaction` | Stop hooks could judge that compaction was timely but had no control output that reached the engine. `hooks/src/schema.rs`, `hooks/src/events/stop.rs`, and `core/src/session/turn.rs` now carry `hookSpecificOutput.requestCompaction` through the existing control-effect gate and invoke the existing mid-turn `run_auto_compact` path once per turn with `CompactionReason::HookRequested`. The call deliberately falls through instead of continuing the turn loop: the hook asked for room, not for another sampling request, so a compaction-only request lets the turn end and a hook that also blocked gets its continuation injected below, in that order. | **Keep locally; upstream candidate.** Drop only when upstream Stop output accepts the same optional `hookSpecificOutput.requestCompaction` field and the engine performs one same-turn compaction while keeping `{}`, explicit `false`, and `async: true` non-operative. | `stop_hook_request_compaction_sets_control_effect`; `stop_hook_request_compaction_false_does_not_set_control_effect`; `async_stop_hook_request_compaction_does_not_set_control_effect`; `suite::hooks::stop_hook_request_compaction_runs_in_same_turn`, which mounts exactly one sampling response and asserts one assistant message and one request, so restarting the turn fails it. Installed oracle: isolated `CODEX_HOME` Stop hook returning `requestCompaction: true` must produce a compaction in that turn's rollout. |
 
 ## Dropped upstream-superseded families
+
+- **Remote environment test initializer:** dropped during the 2026-09-21
+  rebase. Upstream `62ea6d41e8` already initializes the same
+  `EnvironmentConfig` fields in `core/tests/suite/remote_env.rs`, so Git
+  skipped local test-only commit `4c5f29b7f9`. Keep the upstream test rather
+  than duplicating the initializer.
+
+- **Linux sandbox mountinfo namespace roots:** external companion patch
+  `67a5e7f920d4d4b4db43327f4560ac2b327a2fc3` is superseded by upstream
+  `22dea110204c8a07abcbd6495d7eeae65faa0d9f` (#46535). Both parse a mount root
+  only for the socket directory device, while every destination remains strict;
+  upstream additionally covers nested namespace mounts and socket aliases. Do
+  not cherry-pick the local patch.
 
 - **Bounded malformed model catalogue diagnostics:** dropped on 2026-09-18.
   Upstream `977193486d` (#45928) makes `codex-api/src/endpoint/models.rs::list_models`
