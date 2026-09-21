@@ -76,7 +76,7 @@ fn goal_context_input_item(prompt: String) -> ResponseItem {
     ))
 }
 
-fn continuation_prompt(goal: &ThreadGoal, update_plan_enabled: bool) -> String {
+pub(crate) fn continuation_prompt(goal: &ThreadGoal, update_plan_enabled: bool) -> String {
     let tokens_used = goal.tokens_used.to_string();
     let token_budget = goal
         .token_budget
