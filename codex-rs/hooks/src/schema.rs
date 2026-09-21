@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::events::common::ContextWindowUsage;
 use crate::events::common::SubagentHookContext;
 
 const GENERATED_DIR: &str = "generated";
@@ -359,6 +360,8 @@ pub(crate) struct PreCompactCommandInput {
     pub model: String,
     #[schemars(schema_with = "compaction_trigger_schema")]
     pub trigger: String,
+    #[serde(flatten)]
+    pub context_window: ContextWindowUsage,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -598,6 +601,8 @@ pub(crate) struct StopCommandInput {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: NullableString,
+    #[serde(flatten)]
+    pub context_window: ContextWindowUsage,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

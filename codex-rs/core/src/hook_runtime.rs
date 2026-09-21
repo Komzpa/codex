@@ -8,6 +8,7 @@ use codex_analytics::build_track_events_context;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_connectors::AppToolPolicyInput;
 use codex_core_plugins::executor_plugin_hook_sources;
+use codex_hooks::ContextWindowUsage;
 use codex_hooks::InterruptRequest;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
@@ -63,6 +64,7 @@ use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
 use crate::guardian::GuardianReviewContext;
 use crate::session::TurnInput;
+use crate::session::context_window::ContextWindowTokenStatus;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -438,6 +440,13 @@ pub(crate) async fn run_turn_stop_hooks(
         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
     let request_metadata = build_request_metadata(Some(step_context), turn_context);
+    let context_window = context_window_usage(
+        &crate::session::context_window::context_window_token_status(
+            sess.as_ref(),
+            turn_context.as_ref(),
+        )
+        .await,
+    );
     let request = codex_hooks::StopRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -449,6 +458,7 @@ pub(crate) async fn run_turn_stop_hooks(
         request_metadata: (!request_metadata.is_empty()).then_some(request_metadata),
         stop_hook_active,
         last_assistant_message,
+        context_window,
         target,
     };
     let executor_hook_sources = executor_hook_sources_for_step(step_context);
@@ -539,6 +549,13 @@ pub(crate) async fn run_pre_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
+    let context_window = context_window_usage(
+        &crate::session::context_window::context_window_token_status(
+            sess.as_ref(),
+            turn_context.as_ref(),
+        )
+        .await,
+    );
     let request = codex_hooks::PreCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -548,6 +565,7 @@ pub(crate) async fn run_pre_compact_hooks(
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
+        context_window,
     };
     let preview_runs = sess.hooks().preview_pre_compact(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
@@ -558,6 +576,20 @@ pub(crate) async fn run_pre_compact_hooks(
         PreCompactHookOutcome::Stopped
     } else {
         PreCompactHookOutcome::Continue
+    }
+}
+
+fn context_window_usage(status: &ContextWindowTokenStatus) -> ContextWindowUsage {
+    ContextWindowUsage {
+        active_context_tokens: Some(status.active_context_tokens),
+        auto_compact_scope_tokens: Some(status.auto_compact_scope_tokens),
+        auto_compact_scope_limit: status.auto_compact_scope_limit,
+        buffered_auto_compact_limit: status.buffered_auto_compact_limit,
+        full_context_window_limit: status.full_context_window_limit,
+        base_window_tokens_remaining: status.base_window_tokens_remaining,
+        auto_compact_window_prefill_tokens: status.auto_compact_window_prefill_tokens,
+        full_context_window_limit_reached: Some(status.full_context_window_limit_reached),
+        token_limit_reached: Some(status.token_limit_reached),
     }
 }
 

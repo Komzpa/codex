@@ -4,6 +4,8 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerSourcePath;
@@ -15,6 +17,33 @@ use crate::output_spill::AdditionalContext;
 pub struct SubagentHookContext {
     pub agent_id: String,
     pub agent_type: String,
+}
+
+/// Context accounting already computed by the engine for the active turn.
+///
+/// Optional fields keep command-hook payloads forwards and backwards compatible
+/// when a limit is not defined, while the runtime supplies every available value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ContextWindowUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_context_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_scope_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_scope_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffered_auto_compact_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_context_window_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_window_tokens_remaining: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_window_prefill_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_context_window_limit_reached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit_reached: Option<bool>,
 }
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
@@ -177,9 +206,18 @@ mod tests {
     use codex_protocol::protocol::HookEventName;
     use pretty_assertions::assert_eq;
 
+    use super::ContextWindowUsage;
     use super::matcher_pattern_for_event;
     use super::matches_matcher;
     use super::validate_matcher_pattern;
+
+    #[test]
+    fn context_window_usage_accepts_payloads_without_new_fields() {
+        assert_eq!(
+            serde_json::from_str::<ContextWindowUsage>("{}").expect("deserialize old payload"),
+            ContextWindowUsage::default()
+        );
+    }
 
     #[test]
     fn matcher_omitted_matches_all_occurrences() {

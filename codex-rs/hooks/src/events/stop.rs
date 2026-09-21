@@ -14,6 +14,7 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::common;
+use crate::ContextWindowUsage;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
@@ -35,6 +36,7 @@ pub struct StopRequest {
     pub request_metadata: Option<Map<String, Value>>,
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
+    pub context_window: ContextWindowUsage,
     pub target: StopHookTarget,
 }
 
@@ -149,20 +151,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
     });
     let input_json = match request.target {
         StopHookTarget::Stop | StopHookTarget::MemoryConsolidation => {
-            let input = StopCommandInput {
-                session_id: request.session_id.to_string(),
-                turn_id: request.turn_id.clone(),
-                transcript_path: NullableString::from_path(request.transcript_path.clone()),
-                cwd: request.cwd.display().to_string(),
-                hook_event_name: "Stop".to_string(),
-                model: request.model.clone(),
-                permission_mode: request.permission_mode.clone(),
-                stop_hook_active: request.stop_hook_active,
-                last_assistant_message: NullableString::from_string(
-                    request.last_assistant_message.clone(),
-                ),
-            };
-            match serde_json::to_string(&input) {
+            match stop_command_input_json(&request) {
                 Ok(input_json) => input_json,
                 Err(error) => {
                     return serialization_failure_outcome(
@@ -245,6 +234,21 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         block_reason: aggregate.block_reason,
         continuation_fragments: aggregate.continuation_fragments,
     }
+}
+
+fn stop_command_input_json(request: &StopRequest) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&StopCommandInput {
+        session_id: request.session_id.to_string(),
+        turn_id: request.turn_id.clone(),
+        transcript_path: NullableString::from_path(request.transcript_path.clone()),
+        cwd: request.cwd.display().to_string(),
+        hook_event_name: "Stop".to_string(),
+        model: request.model.clone(),
+        permission_mode: request.permission_mode.clone(),
+        stop_hook_active: request.stop_hook_active,
+        last_assistant_message: NullableString::from_string(request.last_assistant_message.clone()),
+        context_window: request.context_window.clone(),
+    })
 }
 
 fn parse_completed(
@@ -459,6 +463,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOu
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::ThreadId;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookOutputEntry;
     use codex_protocol::protocol::HookOutputEntryKind;
@@ -472,8 +477,55 @@ mod tests {
     use super::StopHandlerData;
     use super::aggregate_results;
     use super::parse_completed;
+    use super::stop_command_input_json;
+    use crate::ContextWindowUsage;
     use crate::engine::ConfiguredHandler;
     use crate::engine::HandlerRunResult;
+
+    #[test]
+    fn stop_input_includes_engine_context_usage() {
+        let request = super::StopRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            cwd: test_path_buf("/tmp").abs(),
+            transcript_path: None,
+            model: "gpt-test".to_string(),
+            permission_mode: "default".to_string(),
+            request_metadata: None,
+            stop_hook_active: false,
+            last_assistant_message: None,
+            context_window: ContextWindowUsage {
+                active_context_tokens: Some(123),
+                auto_compact_scope_tokens: Some(100),
+                auto_compact_scope_limit: Some(900),
+                buffered_auto_compact_limit: Some(1000),
+                full_context_window_limit: Some(1200),
+                base_window_tokens_remaining: Some(800),
+                auto_compact_window_prefill_tokens: Some(23),
+                full_context_window_limit_reached: Some(false),
+                token_limit_reached: Some(false),
+            },
+            target: super::StopHookTarget::Stop,
+        };
+        let input: serde_json::Value =
+            serde_json::from_str(&stop_command_input_json(&request).expect("serialize stop input"))
+                .expect("parse stop input");
+        assert_eq!(input["active_context_tokens"], 123);
+        assert_eq!(input["buffered_auto_compact_limit"], 1000);
+        assert_eq!(input["token_limit_reached"], false);
+    }
+
+    #[test]
+    fn empty_stop_hook_output_changes_nothing() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), "{}", ""),
+            Some("turn-1".to_string()),
+        );
+        assert!(!parsed.data.should_stop);
+        assert!(!parsed.data.should_block);
+        assert_eq!(parsed.data.stop_reason, None);
+    }
 
     #[test]
     fn block_decision_with_reason_sets_continuation_prompt() {

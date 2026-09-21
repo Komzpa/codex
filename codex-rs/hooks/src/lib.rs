@@ -18,6 +18,7 @@ pub use engine::HookListEntry;
 pub use engine::HookListEntryHandler;
 pub use engine::dispatcher::hook_execution_mode_label;
 pub use engine::dispatcher::hook_handler_type_label;
+pub use events::common::ContextWindowUsage;
 pub use events::common::SubagentHookContext;
 /// Hook event names as they appear in hooks JSON and config files.
 pub const HOOK_EVENT_NAMES: [&str; 12] = [

@@ -2359,6 +2359,7 @@ fn executor_stop_hook_fixture() -> (
         request_metadata: request_metadata.clone(),
         stop_hook_active: false,
         last_assistant_message: None,
+        context_window: crate::ContextWindowUsage::default(),
         target: StopHookTarget::Stop,
     };
 
