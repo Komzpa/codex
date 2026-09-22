@@ -35,6 +35,8 @@ use crate::dynamic_tools::DynamicToolCallResult;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
 use crate::error::Result as CodexResult;
+pub use crate::goal::GoalQuotaSnapshot;
+pub use crate::goal::ThreadGoalStage;
 use crate::items::AgentMessageDelivery;
 use crate::items::AsyncUserInputQuestion;
 use crate::items::TurnItem;
@@ -4589,7 +4591,7 @@ pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "protocol/")]
 pub struct ThreadGoal {
@@ -4603,9 +4605,23 @@ pub struct ThreadGoal {
     pub time_used_seconds: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// IANA timezone selected when the goal was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub timezone: Option<String>,
+    /// Ordered milestones. Empty retains the legacy no-deadline behavior.
+    #[serde(default)]
+    pub stages: Vec<ThreadGoalStage>,
+    /// Immutable quota observations captured when the goal began.
+    #[serde(default)]
+    pub initial_quota_snapshots: Vec<GoalQuotaSnapshot>,
+    /// Immutable explicit budget selected at goal creation, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub initial_token_budget: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "protocol/")]
 pub struct ThreadGoalUpdatedEvent {

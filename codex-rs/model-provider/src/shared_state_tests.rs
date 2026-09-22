@@ -413,6 +413,7 @@ async fn models_cache_is_reused_only_for_matching_gateway_configuration() {
     );
     let mut info = ModelProviderInfo {
         model_catalog_url: Some(format!("{}/models", server.uri()).into()),
+        usage_url: None,
         http_headers: Some(std::collections::HashMap::from([(
             codex_login::default_client::RESIDENCY_HEADER_NAME.to_string(),
             "us".into(),
@@ -502,6 +503,7 @@ async fn models_observe_gateway_rotation(instance: ProviderInstance) {
     );
     let info = ModelProviderInfo {
         model_catalog_url: Some(format!("{}/models", server.uri()).into()),
+        usage_url: None,
         gateway_oauth: Some(GatewayOAuthConfig::OAuth(GatewayOAuthSettings {
             authorization_url: format!("{}/authorize", server.uri()),
             device_authorization_url: None,

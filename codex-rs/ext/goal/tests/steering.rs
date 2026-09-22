@@ -57,6 +57,10 @@ fn disabled_checklist_preserves_goal_text_that_mentions_the_tool() {
 
 fn test_goal(objective: &str) -> ThreadGoal {
     ThreadGoal {
+        timezone: None,
+        stages: Vec::new(),
+        initial_quota_snapshots: Vec::new(),
+        initial_token_budget: Some(10000),
         thread_id: ThreadId::new(),
         objective: objective.to_string(),
         status: ThreadGoalStatus::Active,

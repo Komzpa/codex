@@ -667,6 +667,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadGoalGetResponse,
     },
+    #[experimental("thread/goal/stage/deliver")]
+    ThreadGoalStageDelivery => "thread/goal/stage/deliver" {
+        params: v2::ThreadGoalStageDeliveryParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalStageDeliveryResponse,
+    },
     ThreadGoalClear => "thread/goal/clear" {
         params: v2::ThreadGoalClearParams,
         serialization: thread_id(params.thread_id),
@@ -2714,6 +2720,8 @@ mod tests {
             request_id: request_id(),
             params: v2::ThreadGoalSetParams {
                 origin: None,
+                timezone: None,
+                stages: None,
                 thread_id: "goal-thread".to_string(),
                 objective: Some("ship it".to_string()),
                 status: None,
@@ -4592,6 +4600,8 @@ mod tests {
             request_id: RequestId::Integer(1),
             params: v2::ThreadGoalSetParams {
                 origin: None,
+                timezone: None,
+                stages: None,
                 thread_id: "thr_123".to_string(),
                 objective: Some("ship goal mode".to_string()),
                 status: Some(v2::ThreadGoalStatus::Active),
@@ -4629,6 +4639,10 @@ mod tests {
     #[test]
     fn thread_goal_notifications_are_not_marked_experimental() {
         let goal = v2::ThreadGoal {
+            timezone: None,
+            stages: Vec::new(),
+            initial_quota_snapshots: Vec::new(),
+            initial_token_budget: None,
             thread_id: "thr_123".to_string(),
             objective: "ship goal mode".to_string(),
             status: v2::ThreadGoalStatus::Active,

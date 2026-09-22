@@ -37,6 +37,8 @@ pub(crate) struct GoalRuntimeConfig {
     pub(crate) tools_available_for_thread: bool,
     pub(crate) tools_visible_for_thread: bool,
     pub(crate) root_accounting_state: Option<Arc<GoalAccountingState>>,
+    pub(crate) quota_provider: Option<Arc<codex_core::GoalQuotaProvider>>,
+    pub(crate) inherited_goal_thread_id: Option<ThreadId>,
 }
 
 pub(crate) enum ActiveGoalStopReason {
@@ -59,6 +61,8 @@ struct GoalRuntimeInner {
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
     goal_state_lock: Semaphore,
+    quota_provider: Option<Arc<codex_core::GoalQuotaProvider>>,
+    inherited_goal_thread_id: Option<ThreadId>,
     daybreak: Mutex<Option<(String, GoalDaybreakPreference)>>,
 }
 
@@ -127,6 +131,8 @@ impl GoalRuntimeHandle {
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
                 daybreak: Mutex::new(None),
+                quota_provider: config.quota_provider,
+                inherited_goal_thread_id: config.inherited_goal_thread_id,
             }),
         }
     }
@@ -145,6 +151,14 @@ impl GoalRuntimeHandle {
 
     pub(crate) fn tools_available(&self) -> bool {
         self.is_enabled() && self.inner.tools_available_for_thread
+    }
+
+    pub(crate) fn quota_provider(&self) -> Option<Arc<codex_core::GoalQuotaProvider>> {
+        self.inner.quota_provider.clone()
+    }
+
+    pub(crate) fn inherited_goal_thread_id(&self) -> Option<ThreadId> {
+        self.inner.inherited_goal_thread_id
     }
 
     pub(crate) fn thread_id(&self) -> ThreadId {
