@@ -449,6 +449,7 @@ pub(crate) async fn run_turn_stop_hooks(
         stop_hook_active,
         last_assistant_message,
         context_window,
+        goal_context: goal_execution_context(sess).await,
         target,
     };
     let executor_hook_sources = step_context.executor_hook_sources.clone();
@@ -576,6 +577,7 @@ pub(crate) async fn run_pre_compact_hooks(
         model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
         context_window,
+        goal_context: goal_execution_context(sess).await,
     };
     let hooks = with_environment_hooks(
         sess,
@@ -592,6 +594,23 @@ pub(crate) async fn run_pre_compact_hooks(
     } else {
         PreCompactHookOutcome::Continue
     }
+}
+
+async fn goal_execution_context(
+    sess: &Session,
+) -> Option<codex_protocol::goal_execution::GoalExecutionContext> {
+    for contributor in sess.services.extensions.context_contributors() {
+        if let Some(context) = contributor
+            .goal_execution_context(
+                &sess.services.session_extension_data,
+                &sess.services.thread_extension_data,
+            )
+            .await
+        {
+            return Some(context);
+        }
+    }
+    None
 }
 
 fn context_window_usage(status: &ContextWindowTokenStatus) -> ContextWindowUsage {

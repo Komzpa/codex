@@ -44,6 +44,8 @@ pub struct RateLimitResetCreditDetails {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitsWithResetCredits {
     pub rate_limits: Vec<RateLimitSnapshot>,
+    /// Rate limits parsed from response headers on the passive usage request.
+    pub header_rate_limits: Vec<RateLimitSnapshot>,
     /// Backend decision for ordinary included usage; absence is not permission to recover.
     pub ordinary_usage_allowed: Option<bool>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
@@ -64,6 +66,8 @@ pub(crate) struct RateLimitStatusWithResetCredits {
     pub user_id: Option<String>,
     // Preserve the backend-owned banner contract without making optional UI data break usage.
     pub rate_limit_upsell: Option<Value>,
+    #[serde(skip)]
+    pub header_rate_limits: Vec<RateLimitSnapshot>,
 }
 
 /// Additional quota details plus the normal model whose picker metadata should be used.

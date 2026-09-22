@@ -31,6 +31,7 @@ pub struct PreCompactRequest {
     pub model: String,
     pub trigger: String,
     pub context_window: ContextWindowUsage,
+    pub goal_context: Option<codex_protocol::goal_execution::GoalExecutionContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +138,7 @@ fn pre_command_input(request: &PreCompactRequest) -> Result<Value, serde_json::E
         model: request.model.clone(),
         trigger: request.trigger.clone(),
         context_window: request.context_window.clone(),
+        goal_context: request.goal_context.clone(),
     })
 }
 
@@ -514,6 +516,7 @@ mod tests {
             transcript_path: None,
             model: "gpt-test".to_string(),
             trigger: "manual".to_string(),
+            goal_context: None,
             context_window: crate::ContextWindowUsage {
                 active_context_tokens: Some(123),
                 auto_compact_scope_tokens: Some(100),

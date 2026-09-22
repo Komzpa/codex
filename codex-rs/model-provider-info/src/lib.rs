@@ -164,6 +164,9 @@ pub struct ModelProviderInfo {
     /// Setting this URL does not grant catalog access or guarantee that the endpoint
     /// accepts a regional API key. Existing discovery gates and entitlement checks apply.
     pub model_catalog_url: Option<RedactedString>,
+    /// Optional authenticated endpoint returning provider quota information.
+    #[serde(default)]
+    pub usage_url: Option<RedactedString>,
     /// Environment variable that stores the user's API key for this provider.
     pub env_key: Option<String>,
 
@@ -570,6 +573,7 @@ other non-default provider fields are not supported"
             name: OPENAI_PROVIDER_NAME.into(),
             base_url,
             model_catalog_url: None,
+            usage_url: None,
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
@@ -623,6 +627,7 @@ other non-default provider fields are not supported"
             // endpoint override.
             base_url: None,
             model_catalog_url: None,
+            usage_url: None,
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
@@ -916,6 +921,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         name: "gpt-oss".into(),
         base_url: Some(base_url.into()),
         model_catalog_url: None,
+        usage_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,

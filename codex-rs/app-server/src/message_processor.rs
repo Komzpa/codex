@@ -1440,6 +1440,11 @@ impl MessageProcessor {
             ClientRequest::ThreadGoalGet { params, .. } => {
                 self.thread_goal_processor.thread_goal_get(params).await
             }
+            ClientRequest::ThreadGoalStageDelivery { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_stage_delivery(params)
+                    .await
+            }
             ClientRequest::ThreadGoalClear { params, .. } => {
                 self.thread_goal_processor
                     .thread_goal_clear(request_id.clone(), params)

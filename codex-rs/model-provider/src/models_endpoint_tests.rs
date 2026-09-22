@@ -514,6 +514,7 @@ async fn explicit_catalog_reuses_auth_headers_and_query_parameters() {
         // The parallel residency test must not change this catalog's cache identity.
         let provider = ModelProviderInfo {
             model_catalog_url: Some(format!("{}/codex/models?deployment=one", server.uri()).into()),
+            usage_url: None,
             query_params: Some(std::collections::HashMap::from([(
                 "api-version".to_string(),
                 "2026-09".into(),
@@ -612,6 +613,7 @@ async fn explicit_catalog_rejects_redirects_without_forwarding_provider_credenti
             model_catalog_url: Some(
                 format!("{}/codex/models?token=catalog-secret", server.uri()).into(),
             ),
+            usage_url: None,
             experimental_bearer_token: Some("provider-key".into()),
             ..ModelProviderInfo::default()
         },

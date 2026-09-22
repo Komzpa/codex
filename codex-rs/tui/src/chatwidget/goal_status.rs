@@ -221,6 +221,10 @@ mod tests {
                 time_used_seconds,
                 created_at: 1,
                 updated_at: 1,
+                timezone: None,
+                stages: Vec::new(),
+                initial_quota_snapshots: Vec::new(),
+                initial_token_budget: None,
             },
             observed_at,
         )

@@ -54,6 +54,7 @@ message ModelProvider {
   optional string location = 21;
   optional string credential_file = 22;
   optional ModelProviderCapabilities capabilities = 23;
+  optional string usage_url = 24;
 }
 
 message ModelProviderCapabilities {
