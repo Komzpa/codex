@@ -66,7 +66,6 @@ impl GoalQuotaProvider {
             },
             scope_hint: auth
                 .get_account_id()
-                .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             usage_url: provider.usage_url.as_ref().map(|url| url.to_string()),
             pool_scope: format!("pool@{}", normalize_endpoint(&base_url)),
@@ -162,17 +161,18 @@ impl GoalQuotaProvider {
             });
             return;
         }
-        let cached = cache.as_mut().expect("cache initialized");
+        let Some(cached) = cache.as_mut() else {
+            return;
+        };
         if !self.passive_usage_enabled() {
             cached.fetched = Instant::now();
         }
         if cached.result.is_err() {
             cached.result = Ok(Vec::new());
         }
-        let snapshots = cached
-            .result
-            .as_mut()
-            .expect("observation replaces failed read");
+        let Ok(snapshots) = cached.result.as_mut() else {
+            return;
+        };
         let snapshot = snapshots
             .iter_mut()
             .find(|snapshot| snapshot.source == "provider-pool");
@@ -232,7 +232,9 @@ impl GoalQuotaProvider {
                 if result.is_err() {
                     result = Ok(Vec::new());
                 }
-                let snapshots = result.as_mut().expect("fresh observation");
+                let Ok(snapshots) = result.as_mut() else {
+                    continue;
+                };
                 if !snapshots.iter().any(|snapshot| {
                     snapshot.source == observed.source && snapshot.scope_id == observed.scope_id
                 }) {
@@ -404,7 +406,6 @@ fn has_quota_data(limit: &codex_protocol::protocol::RateLimitSnapshot) -> bool {
         || limit.credits.is_some()
         || limit.individual_limit.is_some()
         || limit.spend_control_reached.is_some()
-        || limit.plan_type.is_some()
         || limit.rate_limit_reached_type.is_some()
 }
 

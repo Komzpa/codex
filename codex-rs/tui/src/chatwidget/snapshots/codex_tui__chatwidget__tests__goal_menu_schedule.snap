@@ -1,0 +1,18 @@
+---
+source: tui/src/chatwidget/tests/goal_menu.rs
+assertion_line: 88
+expression: "lines_to_single_string(&super::super::goal_menu::goal_summary_lines_at(&goal,\n1_790_776_800))"
+---
+Goal
+Status: active
+Objective: Keep improving the bare goal command until it feels calm and useful.
+Time used: 1m
+Tokens used: 12.5K
+Token budget: 80K
+Timezone: Asia/Tbilisi
+Stages
+  Draft result [2026-09-30 14:00 UTC] — A reviewable artifact
+  Current: Draft result — 0s remaining
+  Final: 1790776800 — 0s remaining
+
+Commands: /goal edit, /goal pause, /goal clear
