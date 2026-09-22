@@ -116,6 +116,35 @@ pub trait ContextContributor: Send + Sync {
         })
     }
 
+    /// Returns request-scoped context immediately before every model inference.
+    ///
+    /// Use this only for state that must be recomputed for tool follow-ups and
+    /// resumed turns. Hosts append these fragments on every sampling request.
+    fn contribute_sampling_context<'a>(
+        &'a self,
+        input: TurnContextContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = input;
+            Vec::new()
+        })
+    }
+
+    /// Returns bounded canonical goal facts for non-model consumers such as hooks.
+    fn goal_execution_context<'a>(
+        &'a self,
+        session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Option<codex_protocol::goal_execution::GoalExecutionContext>> {
+        Box::pin(async move {
+            let _self = self;
+            let _session_store = session_store;
+            let _thread_store = thread_store;
+            None
+        })
+    }
+
     fn contribute_world_state<'a>(
         &'a self,
         input: WorldStateContributionInput<'a>,

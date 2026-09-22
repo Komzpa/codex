@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use codex_analytics::AnalyticsEventsClient;
+use codex_core::GoalQuotaProvider;
 use codex_core::ThreadManager;
 use codex_core::TurnStartOptions;
 use codex_extension_api::ConfigContributor;
@@ -48,7 +49,10 @@ use crate::metrics::GoalMetrics;
 use crate::runtime::ActiveGoalStopReason;
 use crate::runtime::GoalRuntimeConfig;
 use crate::runtime::GoalRuntimeHandle;
+use crate::schedule::model_reminder;
+use crate::schedule::summarize_goal_execution;
 use crate::spec::CREATE_GOAL_TOOL_NAME;
+use crate::spec::GET_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::steering::budget_limit_steering_item;
 use crate::steering::continuation_prompt;
@@ -160,6 +164,8 @@ where
                         tools_available_for_thread,
                         tools_visible_for_thread,
                         root_accounting_state,
+                        quota_provider: input.session_store.get::<GoalQuotaProvider>(),
+                        inherited_goal_thread_id: input.session_source.parent_thread_id(),
                     },
                 )
             });
@@ -245,6 +251,93 @@ where
                 continuation_prompt(&protocol_goal_from_state(goal), config.update_plan_enabled),
                 ContentItemKind("goal.continuation".to_string()),
             )]
+        })
+    }
+
+    fn contribute_sampling_context<'a>(
+        &'a self,
+        input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let Some(context) = self
+                .goal_execution_context(input.session_store, input.thread_store)
+                .await
+            else {
+                return Vec::new();
+            };
+            vec![PromptFragment::developer_policy(
+                model_reminder(&context),
+                ContentItemKind("goal.execution_reminder".to_string()),
+            )]
+        })
+    }
+
+    fn goal_execution_context<'a>(
+        &'a self,
+        _session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Option<codex_protocol::goal_execution::GoalExecutionContext>> {
+        Box::pin(async move {
+            let Some(config) = thread_store.get::<GoalExtensionConfig>() else {
+                return None;
+            };
+            if !config.enabled {
+                return None;
+            }
+            let Ok(thread_id) = ThreadId::from_string(thread_store.level_id()) else {
+                return None;
+            };
+            let mut goal = self
+                .state_dbs
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await
+                .ok()
+                .flatten();
+            let mut parent = goal_runtime_handle(thread_store)
+                .and_then(|runtime| runtime.inherited_goal_thread_id());
+            let mut visited = std::collections::HashSet::from([thread_id]);
+            while goal.is_none() {
+                let Some(parent_id) = parent.filter(|id| visited.insert(*id)) else {
+                    break;
+                };
+                goal = self
+                    .state_dbs
+                    .thread_goals()
+                    .get_thread_goal(parent_id)
+                    .await
+                    .ok()
+                    .flatten();
+                parent = self
+                    .goal_service
+                    .runtime_for_thread(parent_id)
+                    .and_then(|runtime| runtime.inherited_goal_thread_id());
+                if parent.is_none() {
+                    parent = self
+                        .state_dbs
+                        .get_thread_parent_id(parent_id)
+                        .await
+                        .ok()
+                        .flatten();
+                }
+            }
+            let Some(goal) = goal else {
+                return None;
+            };
+            if goal.status != codex_state::ThreadGoalStatus::Active {
+                return None;
+            }
+            let mut context = summarize_goal_execution(
+                &protocol_goal_from_state(goal),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs() as i64),
+            );
+            if let Some(provider) = _session_store.get::<GoalQuotaProvider>() {
+                context.current_quota_snapshots =
+                    provider.snapshot_many().await.unwrap_or_default();
+            }
+            Some(context)
         })
     }
 }
@@ -622,10 +715,13 @@ where
                 self.metrics.clone(),
             ),
         ];
+        let inherited_goal = runtime.inherited_goal_thread_id().is_some();
         tools
             .into_iter()
+            .filter(|tool| !inherited_goal || tool.tool_name().name == GET_GOAL_TOOL_NAME)
             .map(|mut tool| {
-                tool.execution_allowed = runtime.tools_available();
+                tool.execution_allowed = runtime.tools_available() && !inherited_goal;
+                tool.quota_provider = runtime.quota_provider();
                 Arc::new(tool) as Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>
             })
             .collect()

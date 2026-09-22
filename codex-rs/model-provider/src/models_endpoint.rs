@@ -811,6 +811,7 @@ mod tests {
                 model_catalog_url: Some(
                     format!("{}/codex/models?deployment=one", server.uri()).into(),
                 ),
+                usage_url: None,
                 query_params: Some(std::collections::HashMap::from([(
                     "api-version".to_string(),
                     "2026-09".into(),
@@ -867,6 +868,7 @@ mod tests {
         let endpoint = OpenAiModelsEndpoint::new(
             ModelProviderInfo {
                 model_catalog_url: Some(format!("{}/codex/models", server.uri()).into()),
+                usage_url: None,
                 ..ModelProviderInfo::default()
             },
             /*auth_manager*/ None,
@@ -908,6 +910,7 @@ mod tests {
                 model_catalog_url: Some(
                     format!("{}/codex/models?token=catalog-secret", server.uri()).into(),
                 ),
+                usage_url: None,
                 experimental_bearer_token: Some("provider-key".into()),
                 ..ModelProviderInfo::default()
             },

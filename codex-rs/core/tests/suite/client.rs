@@ -1605,6 +1605,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
         model_catalog_url: None,
+        usage_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
@@ -3107,6 +3108,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         name: "azure".into(),
         base_url: Some(format!("{}/openai", server.uri())),
         model_catalog_url: None,
+        usage_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
@@ -3736,6 +3738,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         name: "custom".to_string(),
         base_url: Some(format!("{}/openai", server.uri())),
         model_catalog_url: None,
+        usage_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         experimental_bearer_token: None,
@@ -3822,6 +3825,7 @@ async fn env_var_overrides_loaded_auth() {
         name: ModelProviderInfo::create_openai_provider(/*base_url*/ None).name,
         base_url: Some(format!("{}/openai", server.uri())),
         model_catalog_url: None,
+        usage_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         query_params: Some(std::collections::HashMap::from([(

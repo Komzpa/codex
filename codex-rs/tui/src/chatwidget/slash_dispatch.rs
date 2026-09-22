@@ -955,6 +955,9 @@ impl ChatWidget {
                 }
                 let draft = GoalDraft {
                     objective: args,
+                    schedule_editor_text: None,
+                    timezone: None,
+                    stages: None,
                     text_elements,
                     pending_pastes,
                     local_images,

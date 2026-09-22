@@ -24,6 +24,13 @@ pub struct GoalUpdate {
     pub expected_goal_id: Option<String>,
 }
 
+/// User-authored schedule fields; accounting and creation baselines are never revised here.
+pub struct GoalScheduleUpdate {
+    pub timezone: Option<String>,
+    pub stages: Vec<codex_protocol::goal::ThreadGoalStage>,
+    pub expected_goal_id: Option<String>,
+}
+
 pub enum GoalAccountingOutcome {
     Unchanged(Option<crate::ThreadGoal>),
     Updated(crate::ThreadGoal),
@@ -54,6 +61,10 @@ SELECT
     time_used_seconds,
     created_at_ms,
     updated_at_ms
+    , timezone
+    , stages_json
+    , initial_quota_snapshots_json
+    , initial_token_budget
 FROM thread_goals
 WHERE thread_id = ?
             "#,
@@ -82,7 +93,11 @@ INSERT INTO thread_goals (
     time_used_seconds,
     created_at_ms,
     updated_at_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    , timezone
+    , stages_json
+    , initial_quota_snapshots_json
+    , initial_token_budget
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
     goal_id = excluded.goal_id,
     objective = excluded.objective,
@@ -91,7 +106,11 @@ ON CONFLICT(thread_id) DO UPDATE SET
     tokens_used = excluded.tokens_used,
     time_used_seconds = excluded.time_used_seconds,
     created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
+    updated_at_ms = excluded.updated_at_ms,
+    timezone = excluded.timezone,
+    stages_json = excluded.stages_json,
+    initial_quota_snapshots_json = excluded.initial_quota_snapshots_json,
+    initial_token_budget = excluded.initial_token_budget
             "#,
         )
         .bind(goal.thread_id.to_string())
@@ -103,6 +122,10 @@ ON CONFLICT(thread_id) DO UPDATE SET
         .bind(goal.time_used_seconds)
         .bind(datetime_to_epoch_millis(goal.created_at))
         .bind(datetime_to_epoch_millis(goal.updated_at))
+        .bind(&goal.timezone)
+        .bind(serde_json::to_string(&goal.stages)?)
+        .bind(serde_json::to_string(&goal.initial_quota_snapshots)?)
+        .bind(goal.initial_token_budget)
         .execute(&mut *transaction)
         .await?;
 
@@ -120,6 +143,134 @@ ON CONFLICT(thread_id) DO NOTHING
         transaction.commit().await?;
 
         Ok(())
+    }
+
+    pub async fn update_goal_schedule(
+        &self,
+        thread_id: ThreadId,
+        mut update: GoalScheduleUpdate,
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let existing = self.get_thread_goal(thread_id).await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if update
+            .expected_goal_id
+            .as_deref()
+            .is_some_and(|id| id != existing.goal_id)
+        {
+            return Ok(None);
+        }
+        for stage in &mut update.stages {
+            if let Some(previous) = existing
+                .stages
+                .iter()
+                .find(|previous| previous.id == stage.id)
+            {
+                if previous.delivered_at.is_some() {
+                    stage.clone_from(previous);
+                } else {
+                    stage.delivered_at = None;
+                    stage.delivered_artifact = None;
+                }
+            } else {
+                stage.delivered_at = None;
+                stage.delivered_artifact = None;
+            }
+        }
+        for previous in &existing.stages {
+            if previous.delivered_at.is_some()
+                && !update.stages.iter().any(|stage| stage.id == previous.id)
+            {
+                update.stages.push(previous.clone());
+            }
+        }
+        update.stages.sort_by_key(|stage| stage.deadline_at);
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let result = sqlx::query(
+            r#"
+UPDATE thread_goals
+SET timezone = ?, stages_json = ?, updated_at_ms = ?
+WHERE thread_id = ? AND goal_id = ? AND stages_json = ?
+            "#,
+        )
+        .bind(update.timezone.or(existing.timezone))
+        .bind(serde_json::to_string(&update.stages)?)
+        .bind(now_ms)
+        .bind(thread_id.to_string())
+        .bind(&existing.goal_id)
+        .bind(serde_json::to_string(&existing.stages)?)
+        .execute(self.pool.as_ref())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_thread_goal(thread_id).await
+    }
+
+    /// Captures creation-time accounting only once; later edits cannot rewrite it.
+    pub async fn initialize_goal_baseline(
+        &self,
+        thread_id: ThreadId,
+        expected_goal_id: &str,
+        quota_snapshots: &[codex_protocol::goal::GoalQuotaSnapshot],
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let result = sqlx::query(
+            r#"
+UPDATE thread_goals
+SET initial_token_budget = COALESCE(initial_token_budget, token_budget),
+    initial_quota_snapshots_json = ?,
+    baseline_captured = 1
+WHERE thread_id = ? AND goal_id = ? AND baseline_captured = 0
+            "#,
+        )
+        .bind(serde_json::to_string(quota_snapshots)?)
+        .bind(thread_id.to_string())
+        .bind(expected_goal_id)
+        .execute(self.pool.as_ref())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_thread_goal(thread_id).await
+    }
+
+    pub async fn record_goal_stage_delivery(
+        &self,
+        thread_id: ThreadId,
+        stage_id: &str,
+        artifact: &str,
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let Some(mut goal) = self.get_thread_goal(thread_id).await? else {
+            return Ok(None);
+        };
+        let expected_goal_id = goal.goal_id.clone();
+        let expected_stages_json = serde_json::to_string(&goal.stages)?;
+        let Some(stage) = goal.stages.iter_mut().find(|stage| stage.id == stage_id) else {
+            return Ok(None);
+        };
+        stage.delivered_at = Some(Utc::now().timestamp());
+        stage.delivered_artifact = Some(artifact.to_string());
+        let delivered_stages_json = serde_json::to_string(&goal.stages)?;
+        // Update only if no concurrent schedule revision won the race.
+        let result = sqlx::query(
+            r#"
+UPDATE thread_goals
+SET stages_json = ?, updated_at_ms = ?
+WHERE thread_id = ? AND goal_id = ? AND stages_json = ?
+            "#,
+        )
+        .bind(delivered_stages_json)
+        .bind(datetime_to_epoch_millis(Utc::now()))
+        .bind(thread_id.to_string())
+        .bind(expected_goal_id)
+        .bind(expected_stages_json)
+        .execute(self.pool.as_ref())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_thread_goal(thread_id).await
     }
 
     pub async fn has_thread_goal_continuation_deferral(
@@ -171,11 +322,12 @@ INSERT INTO thread_goals (
     objective,
     status,
     token_budget,
+    initial_token_budget,
     tokens_used,
     time_used_seconds,
     created_at_ms,
     updated_at_ms
-) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
     goal_id = excluded.goal_id,
     objective = excluded.objective,
@@ -184,7 +336,12 @@ ON CONFLICT(thread_id) DO UPDATE SET
     tokens_used = 0,
     time_used_seconds = 0,
     created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
+    updated_at_ms = excluded.updated_at_ms,
+    timezone = NULL,
+    stages_json = '[]',
+    initial_quota_snapshots_json = '[]',
+    initial_token_budget = excluded.initial_token_budget,
+    baseline_captured = 0
 RETURNING
     thread_id,
     goal_id,
@@ -194,13 +351,18 @@ RETURNING
     tokens_used,
     time_used_seconds,
     created_at_ms,
-    updated_at_ms
+    updated_at_ms,
+    timezone,
+    stages_json,
+    initial_quota_snapshots_json,
+    initial_token_budget
             "#,
         )
         .bind(thread_id.to_string())
         .bind(goal_id)
         .bind(objective)
         .bind(status.as_str())
+        .bind(token_budget)
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
@@ -228,11 +390,12 @@ INSERT INTO thread_goals (
     objective,
     status,
     token_budget,
+    initial_token_budget,
     tokens_used,
     time_used_seconds,
     created_at_ms,
     updated_at_ms
-) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
     goal_id = excluded.goal_id,
     objective = excluded.objective,
@@ -241,7 +404,12 @@ ON CONFLICT(thread_id) DO UPDATE SET
     tokens_used = 0,
     time_used_seconds = 0,
     created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
+    updated_at_ms = excluded.updated_at_ms,
+    timezone = NULL,
+    stages_json = '[]',
+    initial_quota_snapshots_json = '[]',
+    initial_token_budget = excluded.initial_token_budget,
+    baseline_captured = 0
 WHERE thread_goals.status = 'complete'
 RETURNING
     thread_id,
@@ -252,13 +420,18 @@ RETURNING
     tokens_used,
     time_used_seconds,
     created_at_ms,
-    updated_at_ms
+    updated_at_ms,
+    timezone,
+    stages_json,
+    initial_quota_snapshots_json,
+    initial_token_budget
             "#,
         )
         .bind(thread_id.to_string())
         .bind(goal_id)
         .bind(objective)
         .bind(status.as_str())
+        .bind(token_budget)
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
@@ -486,7 +659,11 @@ RETURNING
     tokens_used,
     time_used_seconds,
     created_at_ms,
-    updated_at_ms
+    updated_at_ms,
+    timezone,
+    stages_json,
+    initial_quota_snapshots_json,
+    initial_token_budget
             "#,
         )
         .bind(thread_id.to_string())
@@ -594,7 +771,11 @@ RETURNING
     tokens_used,
     time_used_seconds,
     created_at_ms,
-    updated_at_ms
+    updated_at_ms,
+    timezone,
+    stages_json,
+    initial_quota_snapshots_json,
+    initial_token_budget
             "#,
         );
 
@@ -751,6 +932,74 @@ mod tests {
                 .delete_thread_goal(thread_id)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_baseline_and_delivery_survive_usage_and_schedule_revision() {
+        let runtime = test_runtime().await;
+        let thread_id = test_thread_id();
+        upsert_test_thread(&runtime, thread_id).await;
+        let goal = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "ship",
+                crate::ThreadGoalStatus::Active,
+                /*token_budget*/ Some(100),
+            )
+            .await
+            .unwrap();
+        let stage = codex_protocol::goal::ThreadGoalStage {
+            id: "deliverable".to_string(),
+            label: "deliver".to_string(),
+            expected_result: "artifact".to_string(),
+            deadline_at: 100,
+            delivered_at: None,
+            delivered_artifact: None,
+        };
+        runtime
+            .thread_goals()
+            .update_goal_schedule(
+                thread_id,
+                GoalScheduleUpdate {
+                    timezone: Some("Asia/Tbilisi".to_string()),
+                    stages: vec![stage.clone()],
+                    expected_goal_id: Some(goal.goal_id.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .thread_goals()
+            .record_goal_stage_delivery(thread_id, "deliverable", "artifact://one")
+            .await
+            .unwrap();
+        let mut forged_revision = stage;
+        forged_revision.delivered_at = Some(1);
+        forged_revision.delivered_artifact = Some("forged".to_string());
+        let revised = runtime
+            .thread_goals()
+            .update_goal_schedule(
+                thread_id,
+                GoalScheduleUpdate {
+                    timezone: Some("UTC".to_string()),
+                    stages: vec![forged_revision],
+                    expected_goal_id: Some(goal.goal_id.clone()),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(100), revised.initial_token_budget);
+        assert_eq!(
+            Some("artifact://one".to_string()),
+            revised.stages[0].delivered_artifact
+        );
+        assert!(revised.stages[0].delivered_at.is_some());
+        assert_ne!(
+            Some("forged".to_string()),
+            revised.stages[0].delivered_artifact
         );
     }
 

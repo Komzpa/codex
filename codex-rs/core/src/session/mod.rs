@@ -4161,6 +4161,35 @@ impl Session {
             .collect()
     }
 
+    async fn build_sampling_context_contribution_items(
+        &self,
+        step_context: &StepContext,
+    ) -> Vec<ResponseItem> {
+        let turn_context = step_context.turn.as_ref();
+        let mut developer_sections = Vec::new();
+        let context_contributors = self.services.extensions.context_contributors().to_vec();
+
+        for contributor in &context_contributors {
+            for fragment in contributor
+                .contribute_sampling_context(TurnContextContributionInput {
+                    thread_id: self.thread_id(),
+                    turn_id: turn_context.sub_id.as_str(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                    model_context_window: step_context.settings.model_info.usable_context_window(),
+                })
+                .await
+            {
+                developer_sections.push(fragment.into());
+            }
+        }
+
+        crate::context_manager::updates::build_rendered_message(developer_sections)
+            .into_iter()
+            .collect()
+    }
+
     /// `step_context` and `world_state` must come from the same captured step.
     /// If more callers need this pair, bundle them into a captured-context struct
     /// so callers cannot mix settings and WorldState from different steps.
@@ -4763,6 +4792,13 @@ impl Session {
     }
 
     pub(crate) async fn record_rate_limits_info(&self, new_rate_limits: RateLimitSnapshot) {
+        if let Some(provider) = self
+            .services
+            .session_extension_data
+            .get::<crate::GoalQuotaProvider>()
+        {
+            provider.observe_response(new_rate_limits.clone()).await;
+        }
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);

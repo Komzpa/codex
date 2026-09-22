@@ -823,6 +823,28 @@ v2_enum_from_core! {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct GoalQuotaSnapshot {
+    #[ts(type = "number")]
+    pub captured_at: i64,
+    pub source: String,
+    pub scope_id: String,
+    pub limits: Vec<super::RateLimitSnapshot>,
+}
+
+impl From<codex_protocol::goal::GoalQuotaSnapshot> for GoalQuotaSnapshot {
+    fn from(value: codex_protocol::goal::GoalQuotaSnapshot) -> Self {
+        Self {
+            captured_at: value.captured_at,
+            source: value.source,
+            scope_id: value.scope_id,
+            limits: value.limits.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ThreadGoal {
     pub thread_id: String,
     pub objective: String,
@@ -837,6 +859,12 @@ pub struct ThreadGoal {
     pub created_at: i64,
     #[ts(type = "number")]
     pub updated_at: i64,
+    #[ts(type = "string | null")]
+    pub timezone: Option<String>,
+    pub stages: Vec<codex_protocol::goal::ThreadGoalStage>,
+    pub initial_quota_snapshots: Vec<GoalQuotaSnapshot>,
+    #[ts(type = "number | null")]
+    pub initial_token_budget: Option<i64>,
 }
 
 impl From<codex_protocol::protocol::ThreadGoal> for ThreadGoal {
@@ -850,6 +878,14 @@ impl From<codex_protocol::protocol::ThreadGoal> for ThreadGoal {
             time_used_seconds: value.time_used_seconds,
             created_at: value.created_at,
             updated_at: value.updated_at,
+            timezone: value.timezone,
+            stages: value.stages,
+            initial_quota_snapshots: value
+                .initial_quota_snapshots
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            initial_token_budget: value.initial_token_budget,
         }
     }
 }
@@ -871,6 +907,27 @@ pub struct ThreadGoalSetParams {
     )]
     #[ts(optional = nullable, type = "number | null")]
     pub token_budget: Option<Option<i64>>,
+    #[ts(optional = nullable)]
+    pub timezone: Option<String>,
+    #[ts(optional = nullable)]
+    pub stages: Option<Vec<codex_protocol::goal::ThreadGoalStage>>,
+}
+
+/// Evidence is immutable once stored: the server supplies its timestamp.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalStageDeliveryParams {
+    pub thread_id: String,
+    pub stage_id: String,
+    pub artifact: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalStageDeliveryResponse {
+    pub goal: ThreadGoal,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

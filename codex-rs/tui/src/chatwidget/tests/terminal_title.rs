@@ -28,6 +28,10 @@ async fn goal_clock_refresh_redraws_only_when_elapsed_label_changes() {
         time_used_seconds: 60,
         created_at: 0,
         updated_at: 0,
+        timezone: None,
+        stages: Vec::new(),
+        initial_quota_snapshots: Vec::new(),
+        initial_token_budget: None,
     };
     chat.on_thread_goal_updated(goal.clone(), /*turn_id*/ None);
     let initial_indicator = chat.current_goal_status_indicator.clone();

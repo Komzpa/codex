@@ -2,6 +2,8 @@ use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use codex_app_server_protocol::ThreadGoalStageDeliveryParams;
+use codex_app_server_protocol::ThreadGoalStageDeliveryResponse;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
@@ -77,6 +79,51 @@ impl ThreadGoalRequestProcessor {
         self.thread_goal_clear_inner(request_id, params)
             .await
             .map(|()| None)
+    }
+
+    pub(crate) async fn thread_goal_stage_delivery(
+        &self,
+        params: ThreadGoalStageDeliveryParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Err(invalid_request("goals feature is disabled"));
+        }
+        let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
+        let goal = self
+            .goal_service
+            .record_stage_delivery(
+                &state_db,
+                thread_id,
+                params.stage_id.as_str(),
+                params.artifact.as_str(),
+            )
+            .await
+            .map_err(goal_service_error)?;
+        let listener_command_tx = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            let thread_state = thread_state.lock().await;
+            thread_state.listener_command_tx()
+        };
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            let item =
+                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ThreadGoalUpdated(
+                    codex_protocol::protocol::ThreadGoalUpdatedEvent {
+                        thread_id,
+                        turn_id: None,
+                        goal: goal.clone(),
+                    },
+                ));
+            if let Err(err) = thread.append_rollout_items(&[item]).await {
+                warn!("failed to persist goal delivery for live thread {thread_id}: {err}");
+            }
+        }
+        let goal = ThreadGoal::from(goal);
+        self.emit_thread_goal_updated_ordered(thread_id, goal.clone(), listener_command_tx)
+            .await;
+        Ok(Some(ThreadGoalStageDeliveryResponse { goal }.into()))
     }
 
     pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
@@ -186,6 +233,8 @@ impl ThreadGoalRequestProcessor {
                         None => GoalTokenBudgetUpdate::Keep,
                     },
                     max_goal_token_budget,
+                    timezone: params.timezone,
+                    stages: params.stages,
                 },
             )
             .await
@@ -526,6 +575,14 @@ pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> Threa
         time_used_seconds: goal.time_used_seconds,
         created_at: goal.created_at.timestamp(),
         updated_at: goal.updated_at.timestamp(),
+        timezone: goal.timezone,
+        stages: goal.stages,
+        initial_quota_snapshots: goal
+            .initial_quota_snapshots
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        initial_token_budget: goal.initial_token_budget,
     }
 }
 

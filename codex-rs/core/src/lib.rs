@@ -96,7 +96,10 @@ pub mod exec_env;
 mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
+mod goal_quota;
 mod guardian;
+pub use goal_quota::GoalQuotaProvider;
+pub use goal_quota::GoalQuotaSnapshotResult;
 pub mod guardian_review;
 mod hook_mcp_executor;
 mod hook_runtime;

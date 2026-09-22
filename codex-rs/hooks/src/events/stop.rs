@@ -37,6 +37,7 @@ pub struct StopRequest {
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
     pub context_window: ContextWindowUsage,
+    pub goal_context: Option<codex_protocol::goal_execution::GoalExecutionContext>,
     pub target: StopHookTarget,
 }
 
@@ -187,6 +188,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                 last_assistant_message: NullableString::from_string(
                     request.last_assistant_message.clone(),
                 ),
+                goal_context: request.goal_context.clone(),
             };
             match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,
@@ -252,6 +254,7 @@ fn stop_command_input_json(request: &StopRequest) -> Result<String, serde_json::
         stop_hook_active: request.stop_hook_active,
         last_assistant_message: NullableString::from_string(request.last_assistant_message.clone()),
         context_window: request.context_window.clone(),
+        goal_context: request.goal_context.clone(),
     })
 }
 
@@ -506,6 +509,7 @@ mod tests {
             request_metadata: None,
             stop_hook_active: false,
             last_assistant_message: None,
+            goal_context: None,
             context_window: ContextWindowUsage {
                 active_context_tokens: Some(123),
                 auto_compact_scope_tokens: Some(100),

@@ -39,6 +39,41 @@ async fn ordinary_usage_permission_comes_from_backend_not_display_percent() {
     }
 }
 
+#[tokio::test]
+async fn custom_usage_url_is_passive_and_preserves_account_scope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/custom-usage"))
+        .and(|request: &wiremock::Request| {
+            !request.headers.contains_key("x-openai-codex-luna-reserve")
+        })
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer provider-key",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "account_id": "acct-key",
+            "plan_type": "plus",
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 12, "limit_window_seconds": 300,
+                    "reset_after_seconds": 60, "reset_at": 2000000000}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client =
+        test_client(&server.uri(), PathStyle::CodexApi).with_auth_provider(std::sync::Arc::new(
+            codex_model_provider::BearerAuthProvider::new("provider-key".to_string()),
+        ));
+    let response = client
+        .get_rate_limits_at(&format!("{}/custom-usage", server.uri()))
+        .await
+        .unwrap();
+    assert_eq!(response.account_id.as_deref(), Some("acct-key"));
+    assert_eq!(response.rate_limits.len(), 1);
+}
+
 #[test]
 fn rate_limit_reset_contract_uses_expected_paths_and_payloads() {
     assert_eq!(

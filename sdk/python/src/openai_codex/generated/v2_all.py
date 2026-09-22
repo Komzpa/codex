@@ -5233,6 +5233,33 @@ class ThreadGoalGetParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalStage(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    deadline_at: Annotated[
+        int, Field(alias="deadlineAt", description="Unix seconds at which this deliverable is due.")
+    ]
+    delivered_artifact: Annotated[
+        str | None,
+        Field(
+            alias="deliveredArtifact", description="Reference to an actually delivered artifact."
+        ),
+    ] = None
+    delivered_at: Annotated[
+        int | None,
+        Field(
+            alias="deliveredAt",
+            description="Server-stamped Unix seconds when evidence was recorded.",
+        ),
+    ] = None
+    expected_result: Annotated[str, Field(alias="expectedResult")]
+    id: Annotated[
+        str, Field(description="Stable user-visible identity. Revisions retain a stage's id.")
+    ]
+    label: str
+
+
 class ThreadGoalStatus(Enum):
     active = "active"
     paused = "paused"
@@ -9565,51 +9592,16 @@ class ThreadForkParams(BaseModel):
     ] = None
 
 
-class ThreadGoal(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    created_at: Annotated[int, Field(alias="createdAt")]
-    objective: str
-    status: ThreadGoalStatus
-    thread_id: Annotated[str, Field(alias="threadId")]
-    time_used_seconds: Annotated[int, Field(alias="timeUsedSeconds")]
-    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
-    tokens_used: Annotated[int, Field(alias="tokensUsed")]
-    updated_at: Annotated[int, Field(alias="updatedAt")]
-
-
-class ThreadGoalGetResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    goal: ThreadGoal | None = None
-
-
 class ThreadGoalSetParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     objective: str | None = None
+    stages: list[ThreadGoalStage] | None = None
     status: ThreadGoalStatus | None = None
     thread_id: Annotated[str, Field(alias="threadId")]
+    timezone: str | None = None
     token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
-
-
-class ThreadGoalSetResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    goal: ThreadGoal
-
-
-class ThreadGoalUpdatedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    goal: ThreadGoal
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str | None, Field(alias="turnId")] = None
 
 
 class UserMessageThreadItem(BaseModel):
@@ -10667,6 +10659,16 @@ class GetWorkspaceMessagesResponse(BaseModel):
     ]
 
 
+class GoalQuotaSnapshot(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    captured_at: Annotated[int, Field(alias="capturedAt")]
+    limits: list[RateLimitSnapshot]
+    scope_id: Annotated[str, Field(alias="scopeId")]
+    source: str
+
+
 class HookCompletedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10886,23 +10888,6 @@ class ErrorServerNotification(BaseModel):
     ] = None
     method: Annotated[Literal["error"], Field(title="ErrorNotificationMethod")]
     params: ErrorNotification
-
-
-class ThreadGoalUpdatedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    emitted_at_ms: Annotated[
-        int | None,
-        Field(
-            alias="emittedAtMs",
-            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
-        ),
-    ] = None
-    method: Annotated[
-        Literal["thread/goal/updated"], Field(title="Thread/goal/updatedNotificationMethod")
-    ]
-    params: ThreadGoalUpdatedNotification
 
 
 class ThreadSettingsUpdatedServerNotification(BaseModel):
@@ -11128,6 +11113,49 @@ class SessionSource(RootModel[SessionSourceValue | CustomSessionSource | SubAgen
         populate_by_name=True,
     )
     root: SessionSourceValue | CustomSessionSource | SubAgentSessionSource
+
+
+class ThreadGoal(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    created_at: Annotated[int, Field(alias="createdAt")]
+    initial_quota_snapshots: Annotated[
+        list[GoalQuotaSnapshot], Field(alias="initialQuotaSnapshots")
+    ]
+    initial_token_budget: Annotated[int | None, Field(alias="initialTokenBudget")] = None
+    objective: str
+    stages: list[ThreadGoalStage]
+    status: ThreadGoalStatus
+    thread_id: Annotated[str, Field(alias="threadId")]
+    time_used_seconds: Annotated[int, Field(alias="timeUsedSeconds")]
+    timezone: str | None = None
+    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
+    tokens_used: Annotated[int, Field(alias="tokensUsed")]
+    updated_at: Annotated[int, Field(alias="updatedAt")]
+
+
+class ThreadGoalGetResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal | None = None
+
+
+class ThreadGoalSetResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal
+
+
+class ThreadGoalUpdatedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str | None, Field(alias="turnId")] = None
 
 
 class FunctionCallOutputThreadItem(BaseModel):
@@ -11662,6 +11690,23 @@ class ReviewStartResponse(BaseModel):
         ),
     ]
     turn: Turn
+
+
+class ThreadGoalUpdatedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/goal/updated"], Field(title="Thread/goal/updatedNotificationMethod")
+    ]
+    params: ThreadGoalUpdatedNotification
 
 
 class TurnStartedServerNotification(BaseModel):

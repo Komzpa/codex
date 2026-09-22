@@ -77,6 +77,9 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
                 "objective": "ship goal extension backend",
                 "status": "active",
                 "tokenBudget": 123,
+                "initialTokenBudget": 123,
+                "stages": [],
+                "initialQuotaSnapshots": [],
                 "tokensUsed": 0,
                 "timeUsedSeconds": 0,
                 "createdAt": result["goal"]["createdAt"],
@@ -84,6 +87,7 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
             },
             "remainingTokens": 123,
             "completionBudgetReport": serde_json::Value::Null,
+            "currentQuotaSnapshots": [],
         })
     );
 
@@ -114,6 +118,8 @@ async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()
             .set_thread_goal(
                 runtime.as_ref(),
                 GoalSetRequest {
+                    timezone: None,
+                    stages: None,
                     thread_id,
                     objective: GoalObjectiveUpdate::Set(current),
                     status: Some(ThreadGoalStatus::Active),
@@ -142,6 +148,8 @@ async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()
             .set_thread_goal(
                 runtime.as_ref(),
                 GoalSetRequest {
+                    timezone: None,
+                    stages: None,
                     thread_id,
                     objective: GoalObjectiveUpdate::Keep,
                     status: Some(status),
@@ -153,6 +161,88 @@ async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()
         outcome.apply_runtime_effects(&harness.goal_service).await;
         assert_eq!(harness.thread_context().await.len(), 0);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sampling_reminders_follow_delivery_and_ancestor_state() -> anyhow::Result<()> {
+    let state = test_runtime().await?;
+    let root_id = test_thread_id()?;
+    seed_thread_metadata(state.as_ref(), root_id).await?;
+    let root = GoalExtensionHarness::new(state.clone(), root_id).await?;
+    assert!(root.sampling_context().await.is_empty());
+    let tools = root.tools();
+    tool_by_name(&tools, "create_goal").handle(tool_call("create_goal", "create-staged", json!({
+        "objective": "Calibrate the telescope", "token_budget": 10000,
+        "stages": [
+            {"id": "draft", "label": "Preview", "expected_result": "reviewable preview", "deadline_at": 2000000000},
+            {"id": "final", "label": "Release", "expected_result": "final measurements", "deadline_at": 2000007200}
+        ]
+    }))).await?;
+    let original = state
+        .thread_goals()
+        .get_thread_goal(root_id)
+        .await?
+        .unwrap();
+    let context = root.sampling_context().await;
+    assert_eq!(context.len(), 1);
+    assert!(context[0].text().contains("Preview"));
+    assert!(context[0].text().contains("delegate bounded tasks cheaper"));
+    assert_eq!(root.sampling_context().await.len(), 1);
+    let child_id = ThreadId::new();
+    let grandchild_id = ThreadId::new();
+    seed_thread_metadata(state.as_ref(), child_id).await?;
+    seed_thread_metadata(state.as_ref(), grandchild_id).await?;
+    let child = root.spawn_child(child_id).await?;
+    let grandchild = child.spawn_child(grandchild_id).await?;
+    assert!(
+        grandchild.sampling_context().await[0]
+            .text()
+            .contains("Preview")
+    );
+    assert!(
+        !grandchild
+            .tools()
+            .iter()
+            .any(|tool| tool.tool_name().name == "update_goal")
+    );
+    tool_by_name(&tools, "update_goal")
+        .handle(tool_call(
+            "update_goal",
+            "deliver-preview",
+            json!({
+                "stage_id": "draft", "delivered_artifact": "/tmp/calibration.csv"
+            }),
+        ))
+        .await?;
+    let context = grandchild.sampling_context().await;
+    assert!(context[0].text().contains("Release"));
+    assert!(context[0].text().contains("/tmp/calibration.csv"));
+    let goal = state
+        .thread_goals()
+        .get_thread_goal(root_id)
+        .await?
+        .unwrap();
+    assert_eq!(goal.created_at, original.created_at);
+    assert_eq!(goal.status, codex_state::ThreadGoalStatus::Active);
+    assert_eq!(goal.initial_token_budget, original.initial_token_budget);
+    let output = root
+        .goal_service
+        .set_thread_goal(
+            state.as_ref(),
+            GoalSetRequest {
+                thread_id: root_id,
+                objective: GoalObjectiveUpdate::Keep,
+                status: Some(ThreadGoalStatus::Paused),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
+                timezone: None,
+                stages: None,
+            },
+        )
+        .await?;
+    output.apply_runtime_effects(&root.goal_service).await;
+    assert!(grandchild.sampling_context().await.is_empty());
     Ok(())
 }
 
@@ -1208,6 +1298,9 @@ async fn update_goal_can_stop_and_accounts_final_progress() -> anyhow::Result<()
                     "objective": "ship goal extension backend",
                     "status": expected_status,
                     "tokenBudget": token_budget,
+                    "initialTokenBudget": token_budget,
+                    "stages": [],
+                    "initialQuotaSnapshots": [],
                     "tokensUsed": 23,
                     "timeUsedSeconds": 0,
                     "createdAt": result["goal"]["createdAt"],
@@ -1215,6 +1308,7 @@ async fn update_goal_can_stop_and_accounts_final_progress() -> anyhow::Result<()
                 },
                 "remainingTokens": (token_budget - 23).max(0),
                 "completionBudgetReport": serde_json::Value::Null,
+                "currentQuotaSnapshots": [],
             })
         );
 
@@ -1395,6 +1489,8 @@ async fn goal_service_external_set_active_preserves_concurrent_usage() -> anyhow
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Set("new objective"),
                 status: Some(ThreadGoalStatus::Active),
@@ -1546,6 +1642,8 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
                 status: None,
@@ -1590,6 +1688,8 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Set("bounded goal"),
                 status: None,
@@ -1604,6 +1704,8 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Keep,
                 status: None,
@@ -1630,6 +1732,8 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Keep,
                 status: None,
@@ -1644,6 +1748,8 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
         .set_thread_goal(
             runtime.as_ref(),
             GoalSetRequest {
+                timezone: None,
+                stages: None,
                 thread_id,
                 objective: GoalObjectiveUpdate::Keep,
                 status: None,
@@ -1824,6 +1930,28 @@ impl GoalExtensionHarness {
             .iter()
             .flat_map(|contributor| contributor.tools(&self.session_store, &self.thread_store))
             .collect()
+    }
+
+    async fn sampling_context(&self) -> Vec<codex_extension_api::PromptFragment> {
+        let turn_store = ExtensionData::new("sampling-test");
+        let mut context = Vec::new();
+        for contributor in self.registry.context_contributors() {
+            context.extend(
+                contributor
+                    .contribute_sampling_context(
+                        codex_extension_api::TurnContextContributionInput {
+                            thread_id: ThreadId::from_string(self.thread_store.level_id()).unwrap(),
+                            turn_id: "sampling-test",
+                            session_store: &self.session_store,
+                            thread_store: &self.thread_store,
+                            turn_store: &turn_store,
+                            model_context_window: None,
+                        },
+                    )
+                    .await,
+            );
+        }
+        context
     }
 
     async fn thread_context(&self) -> Vec<codex_extension_api::PromptFragment> {

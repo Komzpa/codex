@@ -119,7 +119,14 @@ async fn mid_turn_compaction_rehydrates_current_goal(route: CompactionRoute) -> 
     let request = mcp
         .send_raw_request(
             "thread/goal/set",
-            Some(serde_json::json!({"threadId": thread.id, "objective": objective})),
+            Some(serde_json::json!({
+                "threadId": thread.id,
+                "objective": objective,
+                "stages": [
+                    {"id": "draft", "label": "Draft", "expectedResult": "draft artifact", "deadlineAt": 4_600},
+                    {"id": "final", "label": "Final", "expectedResult": "final artifact", "deadlineAt": 8_200}
+                ]
+            })),
         )
         .await?;
     let _: ThreadGoalSetResponse = mcp.read_response(request).await?;
@@ -131,6 +138,32 @@ async fn mid_turn_compaction_rehydrates_current_goal(route: CompactionRoute) -> 
     let requests = observed.requests();
     assert_eq!(requests.len(), 5);
     assert!(requests[0].body_contains_text(old_request));
+    for index in [1, 3] {
+        assert!(
+            requests[index].body_contains_text("Deliver usable work; reserve review time"),
+            "active regular request {index} must contain the current execution reminder"
+        );
+        assert!(
+            requests[index].body_contains_text("delegate bounded tasks cheaper"),
+            "request {index} reminder must retain the delegation imperative"
+        );
+    }
+    assert!(!requests[0].body_contains_text("Deliver usable work; reserve review time"));
+    assert!(!requests[4].body_contains_text("Deliver usable work; reserve review time"));
+    // Goal steering is a bounded per-request fragment.  A compaction/retry must
+    // rehydrate the current goal once, rather than replaying an ever-growing
+    // chain of reminders from prior requests.
+    for (index, request) in requests.iter().enumerate() {
+        let goal_mentions = request
+            .message_input_texts("developer")
+            .iter()
+            .filter(|text| text.contains(objective))
+            .count();
+        assert!(
+            goal_mentions <= 1,
+            "request {index} must contain at most one current-goal fragment"
+        );
+    }
     assert_eq!(
         requests[3]
             .message_input_texts("developer")

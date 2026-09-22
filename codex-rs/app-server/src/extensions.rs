@@ -599,6 +599,10 @@ mod tests {
                 goal: CoreThreadGoal {
                     thread_id,
                     objective: "wire extension events".to_string(),
+                    timezone: None,
+                    stages: Vec::new(),
+                    initial_quota_snapshots: Vec::new(),
+                    initial_token_budget: Some(123),
                     status: ThreadGoalStatus::Active,
                     token_budget: Some(123),
                     tokens_used: 45,

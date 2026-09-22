@@ -680,6 +680,7 @@ mod tests {
             name: "mock".into(),
             base_url: Some(base_url),
             model_catalog_url: None,
+            usage_url: None,
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,

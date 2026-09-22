@@ -8,6 +8,7 @@ use codex_extension_api::ToolName;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolSpec;
 use codex_protocol::ThreadId;
+use codex_protocol::goal::ThreadGoalStage;
 use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::validate_thread_goal_objective;
@@ -38,6 +39,7 @@ pub(crate) struct GoalToolExecutor {
     event_emitter: GoalEventEmitter,
     metrics: GoalMetrics,
     max_goal_token_budget: Option<i64>,
+    pub(crate) quota_provider: Option<Arc<codex_core::GoalQuotaProvider>>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,12 +54,18 @@ enum GoalToolKind {
 pub struct CreateGoalRequest {
     pub objective: String,
     pub token_budget: Option<i64>,
+    pub timezone: Option<String>,
+    pub stages: Option<Vec<ThreadGoalStage>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct UpdateGoalArgs {
-    status: ThreadGoalStatus,
+    status: Option<ThreadGoalStatus>,
+    timezone: Option<String>,
+    stages: Option<Vec<ThreadGoalStage>>,
+    stage_id: Option<String>,
+    delivered_artifact: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -66,6 +74,7 @@ struct GoalToolResponse {
     goal: Option<ThreadGoal>,
     remaining_tokens: Option<i64>,
     completion_budget_report: Option<String>,
+    current_quota_snapshots: Vec<codex_protocol::goal::GoalQuotaSnapshot>,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +102,7 @@ impl GoalToolExecutor {
             event_emitter,
             metrics,
             max_goal_token_budget: None,
+            quota_provider: None,
         }
     }
 
@@ -115,6 +125,7 @@ impl GoalToolExecutor {
             event_emitter,
             metrics,
             max_goal_token_budget,
+            quota_provider: None,
         }
     }
 
@@ -136,6 +147,7 @@ impl GoalToolExecutor {
             event_emitter,
             metrics,
             max_goal_token_budget: None,
+            quota_provider: None,
         }
     }
 }
@@ -194,7 +206,12 @@ impl GoalToolExecutor {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("failed to read goal: {err}"))
             })?;
-        goal_response(goal, CompletionBudgetReport::Omit)
+        goal_response(
+            goal,
+            CompletionBudgetReport::Omit,
+            self.quota_provider.as_deref(),
+        )
+        .await
     }
 
     async fn handle_create(
@@ -208,6 +225,9 @@ impl GoalToolExecutor {
         request.token_budget = request.token_budget.or(self.max_goal_token_budget);
         validate_goal_budget(request.token_budget, self.max_goal_token_budget)
             .map_err(FunctionCallError::RespondToModel)?;
+        if let Some(stages) = request.stages.as_ref() {
+            crate::api::validate_goal_stages(stages).map_err(FunctionCallError::RespondToModel)?;
+        }
 
         let goal = self
             .state_db
@@ -226,6 +246,45 @@ impl GoalToolExecutor {
                         .to_string(),
                 )
             })?;
+        let goal = if request.stages.is_some() || request.timezone.is_some() {
+            self.state_db
+                .thread_goals()
+                .update_goal_schedule(
+                    self.thread_id,
+                    codex_state::GoalScheduleUpdate {
+                        timezone: request
+                            .timezone
+                            .or_else(|| Some(crate::schedule::local_goal_timezone())),
+                        stages: request.stages.unwrap_or_default(),
+                        expected_goal_id: Some(goal.goal_id.clone()),
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("failed to schedule goal: {err}"))
+                })?
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "goal disappeared while scheduling".to_string(),
+                    )
+                })?
+        } else {
+            goal
+        };
+        let snapshots = if let Some(provider) = self.quota_provider.as_ref() {
+            provider.snapshot_many().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let goal = self
+            .state_db
+            .thread_goals()
+            .initialize_goal_baseline(self.thread_id, &goal.goal_id, &snapshots)
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("failed to capture goal baseline: {err}"))
+            })?
+            .unwrap_or(goal);
         fill_empty_thread_preview_if_possible(self.state_db.as_ref(), self.thread_id, &goal).await;
         let turn_id = self
             .accounting_state
@@ -237,7 +296,12 @@ impl GoalToolExecutor {
         );
         let goal = protocol_goal_from_state(goal);
         self.emit_goal_updated_from_tool_call(&invocation, turn_id, goal.clone());
-        goal_response(Some(goal), CompletionBudgetReport::Omit)
+        goal_response(
+            Some(goal),
+            CompletionBudgetReport::Omit,
+            self.quota_provider.as_deref(),
+        )
+        .await
     }
 
     async fn handle_update(
@@ -245,8 +309,92 @@ impl GoalToolExecutor {
         invocation: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: UpdateGoalArgs = parse_arguments(invocation.function_arguments()?)?;
+        let scheduling = args.stages.is_some() || args.timezone.is_some();
+        let delivery = args.stage_id.is_some() || args.delivered_artifact.is_some();
+        if usize::from(scheduling) + usize::from(delivery) + usize::from(args.status.is_some()) > 1
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "update_goal accepts one operation: status, schedule, or stage delivery"
+                    .to_string(),
+            ));
+        }
+        if delivery {
+            let (Some(stage_id), Some(artifact)) = (args.stage_id, args.delivered_artifact) else {
+                return Err(FunctionCallError::RespondToModel(
+                    "stage delivery requires both stage_id and delivered_artifact".to_string(),
+                ));
+            };
+            if stage_id.trim().is_empty() || artifact.trim().is_empty() || artifact.len() > 8192 {
+                return Err(FunctionCallError::RespondToModel(
+                    "stage delivery needs a nonempty stage_id and artifact reference (at most 8192 bytes)".to_string(),
+                ));
+            }
+            let goal = self
+                .state_db
+                .thread_goals()
+                .record_goal_stage_delivery(self.thread_id, &stage_id, &artifact)
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to record stage delivery: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "goal or stage not found, or changed concurrently; read get_goal"
+                            .to_string(),
+                    )
+                })?;
+            let goal = protocol_goal_from_state(goal);
+            self.emit_goal_updated_from_tool_call(&invocation, None, goal.clone());
+            return goal_response(
+                Some(goal),
+                CompletionBudgetReport::Omit,
+                self.quota_provider.as_deref(),
+            )
+            .await;
+        }
+        if args.status.is_none() && args.stages.is_some() {
+            let stages = args.stages.unwrap_or_default();
+            crate::api::validate_goal_stages(&stages).map_err(FunctionCallError::RespondToModel)?;
+            let goal = self
+                .state_db
+                .thread_goals()
+                .update_goal_schedule(
+                    self.thread_id,
+                    codex_state::GoalScheduleUpdate {
+                        timezone: args.timezone,
+                        stages,
+                        expected_goal_id: None,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to update goal schedule: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "cannot update goal schedule because this thread has no goal".to_string(),
+                    )
+                })?;
+            let goal = protocol_goal_from_state(goal);
+            self.emit_goal_updated_from_tool_call(&invocation, None, goal.clone());
+            return goal_response(
+                Some(goal),
+                CompletionBudgetReport::Omit,
+                self.quota_provider.as_deref(),
+            )
+            .await;
+        }
+        let status = args.status.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "update_goal requires status, stages, or stage delivery".to_string(),
+            )
+        })?;
         if !matches!(
-            args.status,
+            status,
             ThreadGoalStatus::Complete | ThreadGoalStatus::Blocked | ThreadGoalStatus::Paused
         ) {
             return Err(FunctionCallError::RespondToModel(
@@ -256,7 +404,7 @@ impl GoalToolExecutor {
         }
 
         self.account_active_goal_progress(
-            match args.status {
+            match status {
                 ThreadGoalStatus::Complete => codex_state::GoalAccountingMode::ActiveOrComplete,
                 ThreadGoalStatus::Blocked | ThreadGoalStatus::Paused => {
                     codex_state::GoalAccountingMode::ActiveOrStopped
@@ -279,7 +427,7 @@ impl GoalToolExecutor {
                 self.thread_id,
                 codex_state::GoalUpdate {
                     objective: None,
-                    status: Some(state_status_from_protocol(args.status)),
+                    status: Some(state_status_from_protocol(status)),
                     token_budget: None,
                     expected_goal_id: None,
                 },
@@ -305,12 +453,14 @@ impl GoalToolExecutor {
         self.emit_goal_updated_from_tool_call(&invocation, turn_id, goal.clone());
         goal_response(
             Some(goal),
-            if args.status == ThreadGoalStatus::Complete {
+            if status == ThreadGoalStatus::Complete {
                 CompletionBudgetReport::Include
             } else {
                 CompletionBudgetReport::Omit
             },
+            self.quota_provider.as_deref(),
         )
+        .await
     }
 
     fn emit_goal_updated_from_tool_call(
@@ -440,12 +590,17 @@ pub(crate) fn validate_goal_budget(
     Ok(())
 }
 
-fn goal_response(
+async fn goal_response(
     goal: Option<ThreadGoal>,
     completion_budget_report: CompletionBudgetReport,
+    quota_provider: Option<&codex_core::GoalQuotaProvider>,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-    let value = serde_json::to_value(GoalToolResponse::new(goal, completion_budget_report))
-        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    let mut response = GoalToolResponse::new(goal, completion_budget_report);
+    if let Some(provider) = quota_provider {
+        response.current_quota_snapshots = provider.snapshot_many().await.unwrap_or_default();
+    }
+    let value =
+        serde_json::to_value(response).map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
     Ok(Box::new(JsonToolOutput::new(value)))
 }
 
@@ -466,6 +621,7 @@ impl GoalToolResponse {
             goal,
             remaining_tokens,
             completion_budget_report,
+            current_quota_snapshots: Vec::new(),
         }
     }
 }
@@ -495,6 +651,10 @@ pub(crate) fn protocol_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadG
         time_used_seconds: goal.time_used_seconds,
         created_at: goal.created_at.timestamp(),
         updated_at: goal.updated_at.timestamp(),
+        timezone: goal.timezone,
+        stages: goal.stages,
+        initial_quota_snapshots: goal.initial_quota_snapshots,
+        initial_token_budget: goal.initial_token_budget,
     }
 }
 

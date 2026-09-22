@@ -1726,6 +1726,10 @@ async fn run_sampling_request(
         sess.services
             .executed_tool_calls
             .attach_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output);
+        prompt_input.extend(
+            sess.build_sampling_context_contribution_items(step_context.as_ref())
+                .await,
+        );
         let prompt = build_prompt(
             prompt_input,
             step_context.as_ref(),

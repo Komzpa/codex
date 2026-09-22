@@ -6,6 +6,7 @@ use std::sync::PoisonError;
 use std::sync::Weak;
 
 use codex_protocol::ThreadId;
+use codex_protocol::goal::ThreadGoalStage;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
@@ -48,13 +49,15 @@ pub enum GoalTokenBudgetUpdate {
     Set(Option<i64>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GoalSetRequest<'a> {
     pub thread_id: ThreadId,
     pub objective: GoalObjectiveUpdate<'a>,
     pub status: Option<ThreadGoalStatus>,
     pub token_budget: GoalTokenBudgetUpdate,
     pub max_goal_token_budget: Option<i64>,
+    pub timezone: Option<String>,
+    pub stages: Option<Vec<ThreadGoalStage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +144,31 @@ impl GoalService {
             .map_err(|err| GoalServiceError::Internal(format!("failed to read thread goal: {err}")))
     }
 
+    pub async fn record_stage_delivery(
+        &self,
+        state_db: &codex_state::StateRuntime,
+        thread_id: ThreadId,
+        stage_id: &str,
+        artifact: &str,
+    ) -> Result<ThreadGoal, GoalServiceError> {
+        if stage_id.trim().is_empty() || artifact.trim().is_empty() {
+            return Err(GoalServiceError::InvalidRequest(
+                "stage_id and artifact must not be empty".to_string(),
+            ));
+        }
+        state_db
+            .thread_goals()
+            .record_goal_stage_delivery(thread_id, stage_id, artifact)
+            .await
+            .map_err(|err| {
+                GoalServiceError::Internal(format!("failed to record stage delivery: {err}"))
+            })?
+            .map(protocol_goal_from_state)
+            .ok_or_else(|| {
+                GoalServiceError::InvalidRequest("goal or stage does not exist".to_string())
+            })
+    }
+
     pub async fn set_thread_goal(
         &self,
         state_db: &codex_state::StateRuntime,
@@ -152,6 +180,8 @@ impl GoalService {
             status,
             token_budget,
             max_goal_token_budget,
+            timezone,
+            stages,
         } = request;
         let status = status.map(state_status_from_protocol);
         let objective = match objective {
@@ -171,6 +201,9 @@ impl GoalService {
         if objective.is_some() || token_budget.is_some() {
             validate_goal_budget(token_budget.flatten(), max_goal_token_budget)
                 .map_err(GoalServiceError::InvalidRequest)?;
+        }
+        if let Some(stages) = stages.as_ref() {
+            validate_goal_stages(stages).map_err(GoalServiceError::InvalidRequest)?;
         }
 
         let runtime = self.runtime_for_thread(thread_id);
@@ -282,6 +315,51 @@ impl GoalService {
         if objective.is_some() {
             fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
         }
+        let goal = if stages.is_some() || timezone.is_some() {
+            state_db
+                .thread_goals()
+                .update_goal_schedule(
+                    thread_id,
+                    codex_state::GoalScheduleUpdate {
+                        timezone: timezone
+                            .or_else(|| goal.timezone.clone())
+                            .or_else(|| Some(crate::schedule::local_goal_timezone())),
+                        stages: stages.unwrap_or_else(|| goal.stages.clone()),
+                        expected_goal_id: Some(goal.goal_id.clone()),
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    GoalServiceError::Internal(format!("failed to update goal schedule: {err}"))
+                })?
+                .ok_or_else(|| {
+                    GoalServiceError::InvalidRequest(format!(
+                        "cannot update goal schedule for thread {thread_id}"
+                    ))
+                })?
+        } else {
+            goal
+        };
+        let goal = if previous_goal.is_none() {
+            let snapshots = if let Some(provider) = runtime
+                .as_ref()
+                .and_then(|runtime| runtime.quota_provider())
+            {
+                provider.snapshot_many().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            state_db
+                .thread_goals()
+                .initialize_goal_baseline(thread_id, &goal.goal_id, &snapshots)
+                .await
+                .map_err(|err| {
+                    GoalServiceError::Internal(format!("failed to capture goal baseline: {err}"))
+                })?
+                .unwrap_or(goal)
+        } else {
+            goal
+        };
         Ok(GoalSetOutcome {
             goal: protocol_goal_from_state(goal.clone()),
             state_goal: goal,
@@ -365,4 +443,25 @@ impl GoalService {
     fn runtimes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Weak<GoalRuntimeHandle>>> {
         self.runtimes.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+pub(crate) fn validate_goal_stages(stages: &[ThreadGoalStage]) -> Result<(), String> {
+    let mut ids = std::collections::HashSet::new();
+    let mut previous_deadline = None;
+    for stage in stages {
+        if stage.id.trim().is_empty()
+            || stage.label.trim().is_empty()
+            || stage.expected_result.trim().is_empty()
+        {
+            return Err("goal stages require nonempty id, label, and expected_result".to_string());
+        }
+        if !ids.insert(stage.id.as_str()) {
+            return Err("goal stage ids must be stable and unique".to_string());
+        }
+        if previous_deadline.is_some_and(|previous| stage.deadline_at < previous) {
+            return Err("goal stages must be ordered by deadline_at".to_string());
+        }
+        previous_deadline = Some(stage.deadline_at);
+    }
+    Ok(())
 }

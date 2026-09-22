@@ -10,6 +10,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use codex_app_server_client::AppServerPath;
+use codex_protocol::goal::ThreadGoalStage;
 use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::user_input::TextElement;
 use uuid::Uuid;
@@ -22,6 +23,9 @@ const GOAL_FILE_NAME: &str = "goal-objective.md";
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GoalDraft {
     pub(crate) objective: String,
+    pub(crate) schedule_editor_text: Option<String>,
+    pub(crate) timezone: Option<String>,
+    pub(crate) stages: Option<Vec<ThreadGoalStage>>,
     pub(crate) text_elements: Vec<TextElement>,
     pub(crate) pending_pastes: Vec<(String, String)>,
     pub(crate) local_images: Vec<LocalImageAttachment>,

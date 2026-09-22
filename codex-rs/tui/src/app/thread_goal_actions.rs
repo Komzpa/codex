@@ -9,6 +9,7 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_display::goal_status_label;
 use crate::goal_display::goal_usage_summary;
+use crate::goal_display::parse_goal_editor_text;
 use crate::goal_files;
 use crate::text_formatting::truncate_text;
 use codex_app_server_protocol::ThreadGoal;
@@ -136,6 +137,25 @@ impl App {
         draft: goal_files::GoalDraft,
         mode: ThreadGoalSetMode,
     ) {
+        let mut draft = draft;
+        if let Some(editor_text) = draft.schedule_editor_text.take() {
+            match parse_goal_editor_text(
+                &editor_text,
+                draft.timezone.clone(),
+                draft.stages.clone().unwrap_or_default(),
+            ) {
+                Ok((objective, timezone, stages)) => {
+                    draft.objective = objective;
+                    draft.timezone = timezone;
+                    draft.stages = Some(stages);
+                }
+                Err(err) => {
+                    self.chat_widget
+                        .add_error_message(format!("Invalid goal schedule: {err}"));
+                    return;
+                }
+            }
+        }
         let codex_home = app_server.codex_home_path(&self.config.codex_home);
         let mode = if matches!(mode, ThreadGoalSetMode::ConfirmIfExists) {
             let result = app_server.thread_goal_get(thread_id).await;
@@ -161,6 +181,9 @@ impl App {
         } else {
             mode
         };
+
+        let timezone = draft.timezone.clone();
+        let stages = draft.stages.clone();
 
         let (objective, output_dir) = match goal_files::materialize_goal_draft(
             app_server,
@@ -204,7 +227,14 @@ impl App {
         };
 
         let result = app_server
-            .thread_goal_set(thread_id, Some(objective), Some(status), token_budget)
+            .thread_goal_set(
+                thread_id,
+                Some(objective),
+                Some(status),
+                token_budget,
+                timezone,
+                stages,
+            )
             .await;
 
         match result {
@@ -242,6 +272,8 @@ impl App {
                 /*objective*/ None,
                 Some(status),
                 /*token_budget*/ None,
+                /*timezone*/ None,
+                /*stages*/ None,
             )
             .await;
         if self.current_displayed_thread_id() != Some(thread_id) {
@@ -463,6 +495,10 @@ mod tests {
             time_used_seconds: 0,
             created_at: 1_776_272_400,
             updated_at: 1_776_272_460,
+            timezone: None,
+            stages: Vec::new(),
+            initial_quota_snapshots: Vec::new(),
+            initial_token_budget: None,
         }
     }
 }

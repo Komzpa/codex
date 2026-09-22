@@ -174,6 +174,7 @@ fn model_provider_from_proto(
         name: provider.name,
         base_url: provider.base_url,
         model_catalog_url: provider.model_catalog_url.map(Into::into),
+        usage_url: provider.usage_url.map(Into::into),
         env_key: provider.env_key,
         env_key_instructions: provider.env_key_instructions,
         experimental_bearer_token: provider.experimental_bearer_token.map(Into::into),
@@ -207,6 +208,7 @@ fn model_provider_to_proto(
         name,
         base_url,
         model_catalog_url,
+        usage_url,
         env_key,
         env_key_instructions,
         experimental_bearer_token,
@@ -231,6 +233,7 @@ fn model_provider_to_proto(
         name,
         base_url,
         model_catalog_url: model_catalog_url.map(RedactedString::into_inner),
+        usage_url: usage_url.map(RedactedString::into_inner),
         env_key,
         env_key_instructions,
         experimental_bearer_token: experimental_bearer_token.map(RedactedString::into_inner),
@@ -473,6 +476,7 @@ mod tests {
                     proto::SessionThreadConfig {
                         model_provider: Some("local".to_string()),
                         model_providers: vec![proto::ModelProvider {
+                            usage_url: Some("https://example.test/usage".to_string()),
                             id: "local".to_string(),
                             name: "Local".to_string(),
                             base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
@@ -547,6 +551,7 @@ mod tests {
 
     fn expected_provider() -> ModelProviderInfo {
         ModelProviderInfo {
+            usage_url: Some("https://example.test/usage".to_string().into()),
             name: "Local".to_string(),
             base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
             model_catalog_url: Some("http://127.0.0.1:8061/api/codex/models".into()),

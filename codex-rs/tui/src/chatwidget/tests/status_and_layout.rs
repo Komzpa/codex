@@ -4516,6 +4516,10 @@ fn test_thread_goal(
         time_used_seconds: 30 * 60,
         created_at: 0,
         updated_at: 0,
+        timezone: None,
+        stages: Vec::new(),
+        initial_quota_snapshots: Vec::new(),
+        initial_token_budget: None,
     }
 }
 

@@ -8216,6 +8216,8 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             Some("Keep this goal".into()),
             Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
             /*token_budget*/ None,
+            /*timezone*/ None,
+            /*stages*/ None,
         )
         .await?
         .goal;

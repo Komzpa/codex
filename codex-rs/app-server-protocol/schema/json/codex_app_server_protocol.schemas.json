@@ -12646,6 +12646,33 @@
         },
         "type": "object"
       },
+      "GoalQuotaSnapshot": {
+        "properties": {
+          "capturedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "limits": {
+            "items": {
+              "$ref": "#/definitions/v2/RateLimitSnapshot"
+            },
+            "type": "array"
+          },
+          "scopeId": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "capturedAt",
+          "limits",
+          "scopeId",
+          "source"
+        ],
+        "type": "object"
+      },
       "GuardianApprovalReview": {
         "description": "[UNSTABLE] Temporary approval auto-review payload used by `item/autoApprovalReview/*` notifications. This shape is expected to change soon.",
         "properties": {
@@ -21253,8 +21280,27 @@
             "format": "int64",
             "type": "integer"
           },
+          "initialQuotaSnapshots": {
+            "items": {
+              "$ref": "#/definitions/v2/GoalQuotaSnapshot"
+            },
+            "type": "array"
+          },
+          "initialTokenBudget": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "objective": {
             "type": "string"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/definitions/v2/ThreadGoalStage"
+            },
+            "type": "array"
           },
           "status": {
             "$ref": "#/definitions/v2/ThreadGoalStatus"
@@ -21265,6 +21311,12 @@
           "timeUsedSeconds": {
             "format": "int64",
             "type": "integer"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "tokenBudget": {
             "format": "int64",
@@ -21284,7 +21336,9 @@
         },
         "required": [
           "createdAt",
+          "initialQuotaSnapshots",
           "objective",
+          "stages",
           "status",
           "threadId",
           "timeUsedSeconds",
@@ -21371,6 +21425,15 @@
               "null"
             ]
           },
+          "stages": {
+            "items": {
+              "$ref": "#/definitions/v2/ThreadGoalStage"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "status": {
             "anyOf": [
               {
@@ -21383,6 +21446,12 @@
           },
           "threadId": {
             "type": "string"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "tokenBudget": {
             "format": "int64",
@@ -21409,6 +21478,47 @@
           "goal"
         ],
         "title": "ThreadGoalSetResponse",
+        "type": "object"
+      },
+      "ThreadGoalStage": {
+        "properties": {
+          "deadlineAt": {
+            "description": "Unix seconds at which this deliverable is due.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "deliveredArtifact": {
+            "description": "Reference to an actually delivered artifact.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deliveredAt": {
+            "description": "Server-stamped Unix seconds when evidence was recorded.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expectedResult": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable user-visible identity. Revisions retain a stage's id.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deadlineAt",
+          "expectedResult",
+          "id",
+          "label"
+        ],
         "type": "object"
       },
       "ThreadGoalStatus": {

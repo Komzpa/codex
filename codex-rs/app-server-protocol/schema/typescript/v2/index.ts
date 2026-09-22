@@ -202,6 +202,7 @@ export type { GetAccountTokenUsageParams } from "./GetAccountTokenUsageParams";
 export type { GetAccountTokenUsageResponse } from "./GetAccountTokenUsageResponse";
 export type { GetWorkspaceMessagesResponse } from "./GetWorkspaceMessagesResponse";
 export type { GitInfo } from "./GitInfo";
+export type { GoalQuotaSnapshot } from "./GoalQuotaSnapshot";
 export type { GrantedPermissionProfile } from "./GrantedPermissionProfile";
 export type { GuardianApprovalReview } from "./GuardianApprovalReview";
 export type { GuardianApprovalReviewAction } from "./GuardianApprovalReviewAction";

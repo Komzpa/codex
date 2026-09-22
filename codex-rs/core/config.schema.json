@@ -2629,6 +2629,11 @@
           "description": "Whether this provider supports the Responses API WebSocket transport.",
           "type": "boolean"
         },
+        "usage_url": {
+          "default": null,
+          "description": "Optional authenticated endpoint returning provider quota information.",
+          "type": "string"
+        },
         "websocket_connect_timeout_ms": {
           "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",
           "format": "uint64",

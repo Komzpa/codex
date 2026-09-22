@@ -349,6 +349,10 @@ mod tests {
                 thread_id: metadata.id,
                 turn_id: None,
                 goal: ThreadGoal {
+                    timezone: None,
+                    stages: Vec::new(),
+                    initial_quota_snapshots: Vec::new(),
+                    initial_token_budget: None,
                     thread_id: metadata.id,
                     objective: "optimize the benchmark".to_string(),
                     status: ThreadGoalStatus::Active,

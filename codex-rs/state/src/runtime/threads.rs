@@ -6,6 +6,14 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 impl StateRuntime {
+    /// Resolve the durable spawn parent, including after parent runtimes unload.
+    pub async fn get_thread_parent_id(&self, id: ThreadId) -> anyhow::Result<Option<ThreadId>> {
+        Ok(self
+            .get_thread(id)
+            .await?
+            .and_then(|metadata| thread_spawn_parent_thread_id_from_source_str(&metadata.source)))
+    }
+
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let row = sqlx::query(
             r#"

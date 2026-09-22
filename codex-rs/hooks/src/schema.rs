@@ -362,6 +362,8 @@ pub(crate) struct PreCompactCommandInput {
     pub trigger: String,
     #[serde(flatten)]
     pub context_window: ContextWindowUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_context: Option<codex_protocol::goal_execution::GoalExecutionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -615,6 +617,8 @@ pub(crate) struct StopCommandInput {
     pub last_assistant_message: NullableString,
     #[serde(flatten)]
     pub context_window: ContextWindowUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_context: Option<codex_protocol::goal_execution::GoalExecutionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -636,6 +640,8 @@ pub(crate) struct SubagentStopCommandInput {
     pub agent_id: String,
     pub agent_type: String,
     pub last_assistant_message: NullableString,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_context: Option<codex_protocol::goal_execution::GoalExecutionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

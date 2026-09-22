@@ -1519,6 +1519,8 @@ impl AppServerSession {
         objective: Option<String>,
         status: Option<ThreadGoalStatus>,
         token_budget: Option<Option<i64>>,
+        timezone: Option<String>,
+        stages: Option<Vec<codex_protocol::goal::ThreadGoalStage>>,
     ) -> Result<ThreadGoalSetResponse> {
         let request_id = self.next_request_id();
         self.client
@@ -1529,6 +1531,8 @@ impl AppServerSession {
                     objective,
                     status,
                     token_budget,
+                    timezone,
+                    stages,
                 },
             })
             .await

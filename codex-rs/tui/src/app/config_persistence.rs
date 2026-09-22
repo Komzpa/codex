@@ -1411,7 +1411,7 @@ mod tests {
         app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
         let effort =
             app.on_apply_advanced_reasoning("saved-ultra-model", ReasoningEffortConfig::Ultra);
-        let fresh = app.fresh_session_config();
+        let fresh = app.config.clone();
         assert_eq!(effort, Some(ReasoningEffortConfig::Ultra));
         assert_eq!(
             (fresh.model, fresh.model_reasoning_effort),

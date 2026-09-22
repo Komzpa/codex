@@ -1606,6 +1606,11 @@ impl Session {
             let session_extension_data =
                 codex_extension_api::ExtensionData::new(session_id.to_string());
             session_extension_data.insert(analytics_events_client.clone());
+            let quota_provider = crate::GoalQuotaProvider::new_with_model_provider(
+                Arc::clone(&session_configuration.provider),
+                config.http_client_factory(),
+            );
+            session_extension_data.insert(quota_provider);
             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
             let extension_metrics =
                 extension_metrics::from_session_telemetry(session_telemetry.clone());

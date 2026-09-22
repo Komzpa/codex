@@ -23,7 +23,7 @@ pub fn create_get_goal_tool() -> ToolSpec {
 }
 
 pub fn create_create_goal_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let mut properties = BTreeMap::from([
         (
             "objective".to_string(),
             JsonSchema::string(Some(
@@ -39,12 +39,20 @@ pub fn create_create_goal_tool() -> ToolSpec {
             )),
         ),
     ]);
+    properties.insert(
+        "timezone".to_string(),
+        JsonSchema::string(Some(
+            "Optional IANA timezone for deadline display.".to_string(),
+        )),
+    );
+    properties.insert("stages".to_string(), stage_schema());
 
     ToolSpec::Function(ResponsesApiTool {
         name: CREATE_GOAL_TOOL_NAME.to_string(),
         description: format!(
             r#"Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.
-Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use {UPDATE_GOAL_TOOL_NAME} only for status."#
+Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use {UPDATE_GOAL_TOOL_NAME} for status or user-requested schedule changes.
+Use user-requested deadlines only. Clarify ambiguous times such as 'by morning'; do not invent a deadline."#
         ),
         strict: false,
         defer_loading: None,
@@ -58,20 +66,39 @@ Set token_budget only when an explicit token budget is requested. Fails if an un
 }
 
 pub fn create_update_goal_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
+    let mut properties = BTreeMap::from([(
         "status".to_string(),
         JsonSchema::string_enum(
             vec![json!("complete"), json!("blocked"), json!("paused")],
             Some(
-                "Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."
+                "Optional when revising a schedule or recording stage delivery. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."
                     .to_string(),
             ),
         ),
     )]);
+    properties.insert(
+        "timezone".to_string(),
+        JsonSchema::string(Some(
+            "Optional IANA timezone when revising the user-requested schedule.".to_string(),
+        )),
+    );
+    properties.insert("stages".to_string(), stage_schema());
+
+    properties.insert(
+        "stage_id".to_string(),
+        JsonSchema::string(Some(
+            "Stage being delivered; requires delivered_artifact. Does not complete the whole goal."
+                .to_string(),
+        )),
+    );
+    properties.insert("delivered_artifact".to_string(), JsonSchema::string(Some(
+        "Reference to an actually delivered, usable result. Runtime stamps delivery time. Do not mark a missing artifact delivered.".to_string(),
+    )));
 
     ToolSpec::Function(ResponsesApiTool {
         name: UPDATE_GOAL_TOOL_NAME.to_string(),
-        description: r#"Update the existing goal.
+        description: r#"Update the existing goal: supply either status, stages (with optional timezone), or stage_id plus delivered_artifact.
+Revise deadlines only when the user requests a schedule change. Never silently postpone an overdue stage. A delivered stage does not complete later stages.
 Set status to `paused` only at the user's explicit request to pause this goal, never on your own initiative. Ask if unclear; a later resume revokes that request. Report the returned status and stop goal work. Budget limits take precedence over pausing.
 Set status to `complete` only when the objective has actually been achieved and no required work remains.
 Set status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.
@@ -86,9 +113,25 @@ When marking a budgeted goal achieved with status `complete`, report the final t
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            /*required*/ Some(vec!["status".to_string()]),
+            /*required*/ Some(Vec::new()),
             Some(false.into()),
         ),
         output_schema: None,
     })
+}
+
+fn stage_schema() -> JsonSchema {
+    JsonSchema::array(
+        JsonSchema::object(
+            BTreeMap::from([
+                ("id".to_string(), JsonSchema::string(Some("Stable stage id; retain it when revising this stage.".to_string()))),
+                ("label".to_string(), JsonSchema::string(Some("Short milestone label.".to_string()))),
+                ("expected_result".to_string(), JsonSchema::string(Some("Expected deliverable or evidence.".to_string()))),
+                ("deadline_at".to_string(), JsonSchema::integer(Some("Unix seconds deadline.".to_string()))),
+            ]),
+            Some(vec!["id".to_string(), "label".to_string(), "expected_result".to_string(), "deadline_at".to_string()]),
+            Some(false.into()),
+        ),
+        Some("Optional ordered milestones. Only revise them when the user requests a schedule change; delivery evidence is server-owned.".to_string()),
+    )
 }

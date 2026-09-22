@@ -71,6 +71,30 @@ async fn goal_menu_budget_limited_snapshot() {
 }
 
 #[tokio::test]
+async fn goal_menu_schedule_snapshot() {
+    let (_chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    let mut goal = test_goal(thread_id, AppThreadGoalStatus::Active, Some(80_000));
+    goal.timezone = Some("Asia/Tbilisi".to_string());
+    goal.stages = vec![codex_protocol::goal::ThreadGoalStage {
+        id: "draft".to_string(),
+        label: "Draft result".to_string(),
+        expected_result: "A reviewable artifact".to_string(),
+        deadline_at: 1_790_776_800,
+        delivered_at: None,
+        delivered_artifact: None,
+    }];
+
+    assert_chatwidget_snapshot!(
+        "goal_menu_schedule",
+        lines_to_single_string(&super::super::goal_menu::goal_summary_lines_at(
+            &goal,
+            /*now_at*/ 1_790_776_800
+        ))
+    );
+}
+
+#[tokio::test]
 async fn resume_paused_goal_prompt_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let thread_id = ThreadId::new();
@@ -268,6 +292,10 @@ fn test_goal(
         time_used_seconds: 90,
         created_at: 1_776_272_400,
         updated_at: 1_776_272_460,
+        timezone: None,
+        stages: Vec::new(),
+        initial_quota_snapshots: Vec::new(),
+        initial_token_budget: None,
     }
 }
 

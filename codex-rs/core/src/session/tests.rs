@@ -9905,6 +9905,7 @@ async fn make_multi_agent_v2_usage_hint_test_session(
 struct PromptExtensionTestContributor;
 struct PromptExtensionTestState;
 struct TurnContextExtensionTestContributor;
+struct SamplingContextExtensionTestContributor;
 struct TurnContextExtensionTestState {
     expected_model_context_window: Option<i64>,
 }
@@ -9962,6 +9963,22 @@ impl codex_extension_api::ContextContributor for TurnContextExtensionTestContrib
             })
             .into_iter()
             .collect()
+        })
+    }
+}
+
+impl codex_extension_api::ContextContributor for SamplingContextExtensionTestContributor {
+    fn contribute_sampling_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<codex_extension_api::PromptFragment>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                "sampling context extension enabled",
+                codex_extension_api::ContentItemKind("test.sampling_context".to_string()),
+            )]
         })
     }
 }
@@ -10060,6 +10077,30 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
             .any(|text| *text == "turn context extension enabled"),
         "expected steady-state turn context extension developer text, got {developer_messages:?}"
     );
+}
+
+#[tokio::test]
+async fn sampling_context_fragments_are_recomputed_without_history_updates() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(SamplingContextExtensionTestContributor));
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let first = session
+        .build_sampling_context_contribution_items(&step_context)
+        .await;
+    let second = session
+        .build_sampling_context_contribution_items(&step_context)
+        .await;
+
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        developer_message_texts(&first),
+        vec![vec!["sampling context extension enabled"]]
+    );
+    assert!(raw_history_items(&session.clone_history().await).is_empty());
 }
 
 #[tokio::test]

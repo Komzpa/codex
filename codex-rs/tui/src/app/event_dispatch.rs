@@ -889,6 +889,8 @@ impl App {
                                 /*objective*/ None,
                                 Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
                                 /*token_budget*/ None,
+                                /*timezone*/ None,
+                                /*stages*/ None,
                             )
                             .await
                     {
