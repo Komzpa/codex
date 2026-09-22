@@ -95,7 +95,7 @@ impl Client {
         url: &str,
         supports_luna_reserve: bool,
     ) -> Result<RateLimitStatusWithResetCredits> {
-        let mut req = self.request(Method::GET, &url).headers(self.headers());
+        let mut req = self.request(Method::GET, url).headers(self.headers());
         if supports_luna_reserve {
             req = req.header("x-openai-codex-luna-reserve", HeaderValue::from_static("1"));
         }

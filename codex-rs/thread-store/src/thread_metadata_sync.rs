@@ -842,6 +842,10 @@ mod tests {
             thread_id,
             turn_id: None,
             goal: ThreadGoal {
+                initial_token_budget: None,
+                initial_quota_snapshots: Vec::new(),
+                timezone: None,
+                stages: Vec::new(),
                 thread_id,
                 objective: objective.to_string(),
                 status: ThreadGoalStatus::Active,

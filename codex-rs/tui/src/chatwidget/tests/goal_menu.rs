@@ -143,6 +143,10 @@ async fn goal_edit_prompt_submits_preserved_status_and_budget() {
             /*token_budget*/ Some(80_000),
         ),
     );
+    for _ in 0..3 {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+    }
+    chat.handle_key_event(KeyEvent::from(KeyCode::End));
     chat.handle_paste(" with clearer wording".to_string());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
@@ -158,7 +162,16 @@ async fn goal_edit_prompt_submits_preserved_status_and_budget() {
         }) => {
             assert_eq!(event_thread_id, thread_id);
             assert_eq!(
-                draft.objective,
+                crate::goal_display::parse_goal_editor_text(
+                    draft
+                        .schedule_editor_text
+                        .as_deref()
+                        .expect("schedule editor"),
+                    draft.timezone.clone(),
+                    draft.stages.clone().unwrap_or_default()
+                )
+                .expect("valid editor content")
+                .0,
                 "Keep improving the bare goal command until it feels calm and useful. with clearer wording"
             );
             assert_eq!(status, AppThreadGoalStatus::Paused);

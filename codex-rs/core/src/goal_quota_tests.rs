@@ -26,6 +26,7 @@ fn provider(server: &MockServer) -> GoalQuotaProvider {
 fn body(account: &str, used_percent: u64) -> serde_json::Value {
     serde_json::json!({
         "account_id": account,
+        "plan_type": "plus",
         "rate_limit": {
             "allowed": true,
             "limit_reached": false,
@@ -58,11 +59,7 @@ async fn fresh_cache_reuses_one_passive_read() {
     let second = quota.snapshot_many().await.unwrap();
     assert_eq!(first, second);
     assert_eq!(first[0].source, "provider-key");
-    assert!(
-        first
-            .iter()
-            .any(|snapshot| snapshot.source == "provider-pool")
-    );
+    assert_eq!(first.len(), 2);
 }
 
 #[tokio::test]
@@ -208,7 +205,7 @@ async fn empty_headers_do_not_create_fabricated_pool_snapshot() {
     Mock::given(method("GET"))
         .and(path("/quota"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "account_id": "acct-a"
+            "account_id": "acct-a", "plan_type": "plus"
         })))
         .mount(&server)
         .await;

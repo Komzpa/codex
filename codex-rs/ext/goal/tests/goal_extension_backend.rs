@@ -1940,7 +1940,8 @@ impl GoalExtensionHarness {
                 contributor
                     .contribute_sampling_context(
                         codex_extension_api::TurnContextContributionInput {
-                            thread_id: ThreadId::from_string(self.thread_store.level_id()).unwrap(),
+                            thread_id: ThreadId::from_string(self.thread_store.level_id())
+                                .expect("valid test thread id"),
                             turn_id: "sampling-test",
                             session_store: &self.session_store,
                             thread_store: &self.thread_store,
