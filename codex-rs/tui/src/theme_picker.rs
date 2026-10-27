@@ -199,10 +199,9 @@ fn render_preview(
         0
     };
 
-    let mut y = area.y.saturating_add(top_pad);
     let render_width = area.width.saturating_sub(left_pad);
     let style_context = current_diff_render_style_context();
-    for (idx, row) in preview_rows.iter().enumerate() {
+    for (y, (idx, row)) in (area.y.saturating_add(top_pad)..).zip(preview_rows.iter().enumerate()) {
         if y >= area.y + area.height {
             break;
         }
@@ -232,7 +231,6 @@ fn render_preview(
             Rect::new(area.x.saturating_add(left_pad), y, render_width, 1),
             buf,
         );
-        y += 1;
     }
 }
 
@@ -407,7 +405,7 @@ pub(crate) fn build_theme_picker_params(
         preserve_side_content_bg: true,
         on_selection_changed,
         on_cancel,
-        ..Default::default()
+        ..SelectionViewParams::picker()
     }
 }
 
@@ -415,7 +413,6 @@ pub(crate) fn build_theme_picker_params(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::style::Modifier;
 
     fn render_buffer(renderable: &dyn Renderable, width: u16, height: u16) -> Buffer {
         let area = Rect::new(0, 0, width, height);
@@ -440,17 +437,6 @@ mod tests {
                 line
             })
             .collect()
-    }
-
-    fn first_non_space_style_after_marker(buf: &Buffer, row: u16, width: u16) -> Option<Modifier> {
-        let marker_col = (0..width)
-            .find(|&col| buf[(col, row)].symbol() == "-" || buf[(col, row)].symbol() == "+")?;
-        for col in marker_col + 1..width {
-            if buf[(col, row)].symbol() != " " {
-                return Some(buf[(col, row)].style().add_modifier);
-            }
-        }
-        None
     }
 
     fn preview_line_number(line: &str) -> Option<usize> {
@@ -581,25 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn deleted_preview_code_uses_dim_overlay_like_real_diff_renderer() {
-        let width = 80;
-        let height = 6;
-        let buf = render_buffer(&ThemePreviewNarrowRenderable, width, height);
-        let lines = render_lines(&ThemePreviewNarrowRenderable, width, height);
-        let deleted_row = lines
-            .iter()
-            .enumerate()
-            .find_map(|(row, line)| (preview_line_marker(line) == Some('-')).then_some(row as u16))
-            .expect("expected a deleted preview row");
-        let modifiers = first_non_space_style_after_marker(&buf, deleted_row, width)
-            .expect("expected code text after diff marker");
-        assert!(
-            modifiers.contains(Modifier::DIM),
-            "expected deleted preview code to be dimmed"
-        );
-    }
-
-    #[test]
     fn subtitle_uses_tilde_path_when_codex_home_under_home_directory() {
         let home = dirs::home_dir().expect("home directory should be available");
         let codex_home = home.join(".codex");
@@ -657,3 +624,7 @@ mod tests {
         assert_eq!(selected_name, configured_or_default_theme);
     }
 }
+
+#[cfg(test)]
+#[path = "theme_picker_model_tests.rs"]
+mod model_tests;

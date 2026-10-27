@@ -75,6 +75,12 @@ pub struct ModelProvider {
     pub requires_openai_auth: bool,
     #[prost(bool, tag = "17")]
     pub supports_websockets: bool,
+    #[prost(bool, tag = "18")]
+    pub supports_standalone_web_search: bool,
+    #[prost(string, optional, tag = "19")]
+    pub model_catalog_url: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "20")]
+    pub usage_url: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StringMap {

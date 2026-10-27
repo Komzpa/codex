@@ -1,7 +1,10 @@
 use crate::harness::attributes_to_map;
 use crate::harness::build_metrics_with_defaults;
 use crate::harness::find_metric;
+use crate::harness::histogram_data;
 use crate::harness::latest_metrics;
+use codex_otel::PLUGIN_INSTALL_ELICITATION_SENT_METRIC;
+use codex_otel::PLUGIN_INSTALL_SUGGESTION_METRIC;
 use codex_otel::Result;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
@@ -35,9 +38,26 @@ fn manager_attaches_metadata_tags_to_metrics() -> Result<()> {
         /*inc*/ 1,
         &[("source", "tui")],
     );
+    for tokens in [32_000, 256_000] {
+        manager.histogram_with_boundaries(
+            "codex.request_tokens",
+            tokens,
+            &[16_000.0, 128_000.0, 512_000.0],
+            &[("source", "tui")],
+        );
+    }
     manager.shutdown_metrics()?;
 
     let resource_metrics = latest_metrics(&exporter);
+    assert_eq!(
+        histogram_data(&resource_metrics, "codex.request_tokens"),
+        (
+            vec![16_000.0, 128_000.0, 512_000.0],
+            vec![0, 1, 1, 0],
+            288_000.0,
+            2,
+        )
+    );
     let metric =
         find_metric(&resource_metrics, "codex.session_started").expect("counter metric missing");
     let attrs = match metric.data() {
@@ -157,6 +177,103 @@ fn manager_attaches_optional_service_name_tag() -> Result<()> {
     assert_eq!(
         attrs.get("service_name"),
         Some(&"my_app_server_client".to_string())
+    );
+
+    Ok(())
+}
+
+#[test]
+fn manager_records_plugin_install_suggestion_metric() -> Result<()> {
+    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
+    let manager = SessionTelemetry::new(
+        ThreadId::new(),
+        "gpt-5.1",
+        "gpt-5.1",
+        Some("account-id".to_string()),
+        /*account_email*/ None,
+        Some(TelemetryAuthMode::ApiKey),
+        "test_originator".to_string(),
+        /*log_user_prompts*/ false,
+        "tty".to_string(),
+        SessionSource::Cli,
+    )
+    .with_metrics_without_metadata_tags(metrics);
+
+    manager.record_plugin_install_suggestion(
+        "connector",
+        "connector_calendar",
+        "Google Calendar",
+        "accept",
+        /*user_confirmed*/ true,
+        /*completed*/ false,
+    );
+    manager.shutdown_metrics()?;
+
+    let resource_metrics = latest_metrics(&exporter);
+    let metric = find_metric(&resource_metrics, PLUGIN_INSTALL_SUGGESTION_METRIC)
+        .expect("plugin install suggestion metric missing");
+    let attrs = match metric.data() {
+        AggregatedMetrics::U64(data) => match data {
+            MetricData::Sum(sum) => {
+                let points: Vec<_> = sum.data_points().collect();
+                assert_eq!(points.len(), 1);
+                attributes_to_map(points[0].attributes())
+            }
+            _ => panic!("unexpected counter aggregation"),
+        },
+        _ => panic!("unexpected counter data type"),
+    };
+
+    assert_eq!(
+        attrs,
+        BTreeMap::from([
+            ("completed".to_string(), "false".to_string()),
+            ("response_action".to_string(), "accept".to_string()),
+            ("tool_type".to_string(), "connector".to_string()),
+        ])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn manager_records_plugin_install_elicitation_sent_metric() -> Result<()> {
+    let (metrics, exporter) = build_metrics_with_defaults(&[])?;
+    let manager = SessionTelemetry::new(
+        ThreadId::new(),
+        "gpt-5.1",
+        "gpt-5.1",
+        Some("account-id".to_string()),
+        /*account_email*/ None,
+        Some(TelemetryAuthMode::ApiKey),
+        "test_originator".to_string(),
+        /*log_user_prompts*/ false,
+        "tty".to_string(),
+        SessionSource::Cli,
+    )
+    .with_metrics_without_metadata_tags(metrics);
+
+    manager.record_plugin_install_elicitation_sent("plugin", "slack@openai-curated", "Slack");
+    manager.shutdown_metrics()?;
+
+    let resource_metrics = latest_metrics(&exporter);
+    let metric = find_metric(&resource_metrics, PLUGIN_INSTALL_ELICITATION_SENT_METRIC)
+        .expect("plugin install elicitation sent metric missing");
+    let attrs = match metric.data() {
+        AggregatedMetrics::U64(data) => match data {
+            MetricData::Sum(sum) => {
+                let points: Vec<_> = sum.data_points().collect();
+                assert_eq!(points.len(), 1);
+                attributes_to_map(points[0].attributes())
+            }
+            _ => panic!("unexpected counter aggregation"),
+        },
+        _ => panic!("unexpected counter data type"),
+    };
+
+    assert_eq!(
+        attrs,
+        BTreeMap::from([("tool_type".to_string(), "plugin".to_string())])
     );
 
     Ok(())

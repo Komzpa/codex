@@ -1,20 +1,38 @@
-use super::merge_requirements_with_remote_sandbox_config;
-use crate::config_requirements::ConfigRequirementsToml;
-use crate::config_requirements::ConfigRequirementsWithSources;
+//! Loads administrator configuration only from forced macOS preferences.
+//!
+//! Ordinary user defaults must never become trusted managed configuration layers.
+//! Forced values must be strings containing base64-encoded TOML.
+
+use crate::RequirementsLayerEntry;
 use crate::config_requirements::RequirementSource;
+use crate::config_toml::ConfigToml;
+use crate::diagnostics::ConfigDiagnosticSource;
+use crate::diagnostics::config_error_from_toml_for_source;
+use crate::diagnostics::io_error_from_config_error;
+use crate::strict_config::config_error_from_ignored_toml_value_fields_for_source_name;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use codex_utils_absolute_path::AbsolutePathBufGuard;
+use core_foundation::base::Boolean;
+use core_foundation::base::CFType;
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation::string::CFStringRef;
 use std::ffi::c_void;
 use std::io;
+use std::path::Path;
 use tokio::task;
 use toml::Value as TomlValue;
 
 const MANAGED_PREFERENCES_APPLICATION_ID: &str = "com.openai.codex";
 const MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
 const MANAGED_PREFERENCES_REQUIREMENTS_KEY: &str = "requirements_toml_base64";
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> *mut c_void;
+    fn CFPreferencesAppValueIsForced(key: CFStringRef, application_id: CFStringRef) -> Boolean;
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ManagedAdminConfigLayer {
@@ -29,19 +47,29 @@ pub(super) fn managed_preferences_requirements_source() -> RequirementSource {
     }
 }
 
+pub(super) fn has_managed_preferences() -> io::Result<bool> {
+    Ok(
+        load_managed_preference(MANAGED_PREFERENCES_CONFIG_KEY)?.is_some()
+            || load_managed_preference(MANAGED_PREFERENCES_REQUIREMENTS_KEY)?.is_some(),
+    )
+}
+
 pub(crate) async fn load_managed_admin_config_layer(
     override_base64: Option<&str>,
+    strict_config: bool,
+    base_dir: &Path,
 ) -> io::Result<Option<ManagedAdminConfigLayer>> {
     if let Some(encoded) = override_base64 {
         let trimmed = encoded.trim();
         return if trimmed.is_empty() {
             Ok(None)
         } else {
-            parse_managed_config_base64(trimmed).map(Some)
+            parse_managed_config_base64(trimmed, strict_config, base_dir).map(Some)
         };
     }
 
-    match task::spawn_blocking(load_managed_admin_config).await {
+    let base_dir = base_dir.to_path_buf();
+    match task::spawn_blocking(move || load_managed_admin_config(strict_config, &base_dir)).await {
         Ok(result) => result,
         Err(join_err) => {
             if join_err.is_cancelled() {
@@ -54,43 +82,38 @@ pub(crate) async fn load_managed_admin_config_layer(
     }
 }
 
-fn load_managed_admin_config() -> io::Result<Option<ManagedAdminConfigLayer>> {
+fn load_managed_admin_config(
+    strict_config: bool,
+    base_dir: &Path,
+) -> io::Result<Option<ManagedAdminConfigLayer>> {
     load_managed_preference(MANAGED_PREFERENCES_CONFIG_KEY)?
         .as_deref()
         .map(str::trim)
-        .map(parse_managed_config_base64)
+        .map(|encoded| parse_managed_config_base64(encoded, strict_config, base_dir))
         .transpose()
 }
 
-pub(crate) async fn load_managed_admin_requirements_toml(
-    target: &mut ConfigRequirementsWithSources,
+pub(crate) async fn load_managed_admin_requirements_layer(
     override_base64: Option<&str>,
-) -> io::Result<()> {
+) -> io::Result<Option<RequirementsLayerEntry>> {
     if let Some(encoded) = override_base64 {
         let trimmed = encoded.trim();
         if trimmed.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
-        merge_requirements_with_remote_sandbox_config(
-            target,
-            managed_preferences_requirements_source(),
-            parse_managed_requirements_base64(trimmed)?,
-        );
-        return Ok(());
+        return parse_managed_requirements_base64(trimmed).map(|contents| {
+            Some(RequirementsLayerEntry::from_toml(
+                managed_preferences_requirements_source(),
+                contents,
+            ))
+        });
     }
 
     match task::spawn_blocking(load_managed_admin_requirements).await {
-        Ok(result) => {
-            if let Some(requirements) = result? {
-                merge_requirements_with_remote_sandbox_config(
-                    target,
-                    managed_preferences_requirements_source(),
-                    requirements,
-                );
-            }
-            Ok(())
-        }
+        Ok(result) => Ok(result?.map(|contents| {
+            RequirementsLayerEntry::from_toml(managed_preferences_requirements_source(), contents)
+        })),
         Err(join_err) => {
             if join_err.is_cancelled() {
                 tracing::error!("Managed requirements load task was cancelled");
@@ -102,7 +125,7 @@ pub(crate) async fn load_managed_admin_requirements_toml(
     }
 }
 
-fn load_managed_admin_requirements() -> io::Result<Option<ConfigRequirementsToml>> {
+fn load_managed_admin_requirements() -> io::Result<Option<String>> {
     load_managed_preference(MANAGED_PREFERENCES_REQUIREMENTS_KEY)?
         .as_deref()
         .map(str::trim)
@@ -111,57 +134,147 @@ fn load_managed_admin_requirements() -> io::Result<Option<ConfigRequirementsToml
 }
 
 fn load_managed_preference(key_name: &str) -> io::Result<Option<String>> {
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> *mut c_void;
+    let key = CFString::new(key_name);
+    let application = CFString::new(MANAGED_PREFERENCES_APPLICATION_ID);
+    load_managed_preference_with(
+        key_name,
+        || preference_is_forced(&key, &application),
+        || copy_preference_value(&key, &application),
+    )
+}
+
+fn preference_is_forced(key: &CFString, application: &CFString) -> bool {
+    unsafe {
+        CFPreferencesAppValueIsForced(key.as_concrete_TypeRef(), application.as_concrete_TypeRef())
+            != 0
+    }
+}
+
+fn copy_preference_value(key: &CFString, application: &CFString) -> Option<CFType> {
+    let value_ref = unsafe {
+        CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), application.as_concrete_TypeRef())
+    };
+    if value_ref.is_null() {
+        return None;
     }
 
-    let value_ref = unsafe {
-        CFPreferencesCopyAppValue(
-            CFString::new(key_name).as_concrete_TypeRef(),
-            CFString::new(MANAGED_PREFERENCES_APPLICATION_ID).as_concrete_TypeRef(),
-        )
-    };
+    // CopyAppValue returns an owned property-list value, not necessarily a string.
+    Some(unsafe { CFType::wrap_under_create_rule(value_ref) })
+}
 
-    if value_ref.is_null() {
+fn load_managed_preference_with(
+    key_name: &str,
+    mut is_forced: impl FnMut() -> bool,
+    copy_value: impl FnOnce() -> Option<CFType>,
+) -> io::Result<Option<String>> {
+    // CopyAppValue also searches user-writable domains. Only forced values may
+    // supply administrator configuration or override lower requirements layers.
+    if !is_forced() {
         tracing::debug!(
-            "Managed preferences for {MANAGED_PREFERENCES_APPLICATION_ID} key {key_name} not found",
+            "No forced managed preference for {MANAGED_PREFERENCES_APPLICATION_ID} key {key_name}"
         );
         return Ok(None);
     }
 
-    let value = unsafe { CFString::wrap_under_create_rule(value_ref as _) }.to_string();
-    Ok(Some(value))
+    let Some(value) = copy_value() else {
+        tracing::debug!(
+            "Managed preferences for {MANAGED_PREFERENCES_APPLICATION_ID} key {key_name} not found"
+        );
+        return Ok(None);
+    };
+
+    // Reject a user-default fallback if the preference stopped being forced
+    // during the read. These separate calls do not form an atomic snapshot.
+    if !is_forced() {
+        tracing::debug!(
+            "Managed preference {MANAGED_PREFERENCES_APPLICATION_ID}:{key_name} is no longer forced after reading"
+        );
+        return Ok(None);
+    }
+
+    let value = value.downcast::<CFString>().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Managed preference {MANAGED_PREFERENCES_APPLICATION_ID}:{key_name} must be a string"
+            ),
+        )
+    })?;
+    Ok(Some(value.to_string()))
 }
 
-fn parse_managed_config_base64(encoded: &str) -> io::Result<ManagedAdminConfigLayer> {
+fn parse_managed_config_base64(
+    encoded: &str,
+    strict_config: bool,
+    base_dir: &Path,
+) -> io::Result<ManagedAdminConfigLayer> {
     let raw_toml = decode_managed_preferences_base64(encoded)?;
-    match toml::from_str::<TomlValue>(&raw_toml) {
-        Ok(TomlValue::Table(parsed)) => Ok(ManagedAdminConfigLayer {
+    let source_name =
+        format!("{MANAGED_PREFERENCES_APPLICATION_ID}:{MANAGED_PREFERENCES_CONFIG_KEY}");
+    let parsed = toml::from_str::<TomlValue>(&raw_toml).map_err(|err| {
+        tracing::error!("Failed to parse managed config TOML: {err}");
+        if strict_config {
+            let config_error = config_error_from_toml_for_source(
+                ConfigDiagnosticSource::DisplayName(&source_name),
+                &raw_toml,
+                err.clone(),
+            );
+            io_error_from_config_error(io::ErrorKind::InvalidData, config_error, Some(err))
+        } else {
+            io::Error::new(io::ErrorKind::InvalidData, err)
+        }
+    })?;
+
+    validate_managed_config_toml_strictly_if_requested(
+        strict_config,
+        &source_name,
+        &raw_toml,
+        &parsed,
+        base_dir,
+    )?;
+    match parsed {
+        TomlValue::Table(parsed) => Ok(ManagedAdminConfigLayer {
             config: TomlValue::Table(parsed),
             raw_toml,
         }),
-        Ok(other) => {
+        other => {
             tracing::error!("Managed config TOML must have a table at the root, found {other:?}",);
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed config root must be a table",
             ))
         }
-        Err(err) => {
-            tracing::error!("Failed to parse managed config TOML: {err}");
-            Err(io::Error::new(io::ErrorKind::InvalidData, err))
-        }
     }
 }
 
-fn parse_managed_requirements_base64(encoded: &str) -> io::Result<ConfigRequirementsToml> {
-    toml::from_str::<ConfigRequirementsToml>(&decode_managed_preferences_base64(encoded)?).map_err(
-        |err| {
-            tracing::error!("Failed to parse managed requirements TOML: {err}");
-            io::Error::new(io::ErrorKind::InvalidData, err)
-        },
-    )
+fn validate_managed_config_toml_strictly_if_requested(
+    strict_config: bool,
+    source_name: &str,
+    raw_toml: &str,
+    parsed: &TomlValue,
+    base_dir: &Path,
+) -> io::Result<()> {
+    if !strict_config {
+        return Ok(());
+    }
+
+    let _guard = AbsolutePathBufGuard::new(base_dir);
+    if let Some(config_error) = config_error_from_ignored_toml_value_fields_for_source_name::<
+        ConfigToml,
+    >(source_name, raw_toml, parsed.clone())
+    {
+        Err(io_error_from_config_error(
+            io::ErrorKind::InvalidData,
+            config_error,
+            /*source*/ None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_managed_requirements_base64(encoded: &str) -> io::Result<String> {
+    decode_managed_preferences_base64(encoded)
 }
 
 fn decode_managed_preferences_base64(encoded: &str) -> io::Result<String> {
@@ -174,3 +287,7 @@ fn decode_managed_preferences_base64(encoded: &str) -> io::Result<String> {
         io::Error::new(io::ErrorKind::InvalidData, err)
     })
 }
+
+#[cfg(test)]
+#[path = "macos_tests.rs"]
+mod tests;

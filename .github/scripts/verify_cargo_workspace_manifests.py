@@ -25,7 +25,10 @@ TOP_LEVEL_NAME_EXCEPTIONS = {
 UTILITY_NAME_EXCEPTIONS = {
     "path-utils": "codex-utils-path",
 }
-MANIFEST_FEATURE_EXCEPTIONS = {}
+MANIFEST_FEATURE_EXCEPTIONS = {
+    "codex-rs/code-mode/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
+    "codex-rs/v8-poc/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
+}
 OPTIONAL_DEPENDENCY_EXCEPTIONS = set()
 INTERNAL_DEPENDENCY_FEATURE_EXCEPTIONS = {}
 
@@ -164,7 +167,9 @@ def manifest_errors(
                         "create crate features"
                     )
 
-            if not is_internal_dependency(path, dependency_name, dependency, internal_package_names):
+            if not is_internal_dependency(
+                path, dependency_name, dependency, internal_package_names
+            ):
                 continue
 
             dependency_features = dependency.get("features")
@@ -351,7 +356,9 @@ def add_unused_exception_errors(
         )
 
 
-def add_failure(failures_by_path: dict[str, list[str]], path_key: str, error: str) -> None:
+def add_failure(
+    failures_by_path: dict[str, list[str]], path_key: str, error: str
+) -> None:
     failures_by_path.setdefault(path_key, []).append(error)
 
 

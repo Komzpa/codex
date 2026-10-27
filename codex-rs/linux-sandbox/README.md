@@ -12,10 +12,10 @@ outside the current working directory whenever it is available. If `bwrap` is
 present but too old to support
 `--argv0`, the helper keeps using system bubblewrap and switches to a
 no-`--argv0` compatibility path for the inner re-exec. If `bwrap` is missing,
-the helper falls back to the vendored bubblewrap path compiled into this
-binary.
+the helper falls back to the bundled `codex-resources/bwrap` binary shipped
+with Codex.
 Codex also surfaces a startup warning when `bwrap` is missing so users know it
-is falling back to the vendored helper. Codex surfaces the same startup warning
+is falling back to the bundled helper. Codex surfaces the same startup warning
 path when bubblewrap cannot create user namespaces. WSL2 follows the normal
 Linux bubblewrap path. WSL1 is not supported for bubblewrap sandboxing because
 it cannot create the required user namespaces, so Codex rejects sandboxed shell
@@ -28,8 +28,8 @@ commands that would enter the bubblewrap path.
   helper uses it.
 - If `bwrap` is present but too old to support `--argv0`, the helper uses a
   no-`--argv0` compatibility path for the inner re-exec.
-- If `bwrap` is missing, the helper falls back to the vendored bubblewrap
-  path.
+- If `bwrap` is missing, the helper falls back to the bundled
+  `codex-resources/bwrap` path.
 - If `bwrap` is missing, Codex also surfaces a startup warning instead of
   printing directly from the sandbox helper.
 - If bubblewrap cannot create user namespaces, Codex surfaces a startup warning
@@ -37,12 +37,9 @@ commands that would enter the bubblewrap path.
 - WSL2 uses the normal Linux bubblewrap path.
 - WSL1 is not supported for bubblewrap sandboxing; Codex rejects sandboxed
   shell commands that would require the bubblewrap path before invoking `bwrap`.
-- Legacy Landlock + mount protections remain available as an explicit legacy
-  fallback path.
-- Set `features.use_legacy_landlock = true` (or CLI `-c use_legacy_landlock=true`)
-  to force the legacy Landlock fallback.
-- The legacy Landlock fallback is used only when the split filesystem policy is
-  sandbox-equivalent to the legacy model after `cwd` resolution.
+- Filesystem-restricted execution requires bubblewrap. The legacy Landlock
+  option is rejected for these policies because it cannot isolate app-server
+  Unix sockets. Disable `features.use_legacy_landlock` when upgrading.
 - Split-only filesystem policies that do not round-trip through the legacy
   `SandboxPolicy` model stay on bubblewrap so nested read-only or denied
   carveouts are preserved.
@@ -74,7 +71,7 @@ commands that would enter the bubblewrap path.
   [permissions.workspace.filesystem]
   glob_scan_max_depth = 2
 
-  [permissions.workspace.filesystem.":project_roots"]
+  [permissions.workspace.filesystem.":workspace_roots"]
   "**/*.env" = "none"
   ```
 
@@ -94,4 +91,4 @@ commands that would enter the bubblewrap path.
   you can skip this in restrictive container environments with `--no-proc`.
 
 **Notes**
-- The CLI surface still uses legacy names like `codex debug landlock`.
+- The CLI surface is `codex sandbox`; the host OS selects the sandbox backend.

@@ -8,12 +8,17 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Block;
+use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use ratatui::widgets::Wrap;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
-use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::bottom_pane::popup_consts::picker_hint_line_for_keymap;
 use crate::key_hint;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
 use crate::render::Insets;
 use crate::render::RectExt as _;
 use crate::render::renderable::ColumnRenderable;
@@ -22,11 +27,11 @@ use crate::style::user_message_style;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
+use super::picker_rows::measure_rows_height;
+use super::picker_rows::render_rows;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
-use super::selection_popup_common::measure_rows_height;
-use super::selection_popup_common::render_rows;
 
 const MEMORIES_DOC_URL: &str = "https://developers.openai.com/codex/memories";
 
@@ -62,6 +67,7 @@ pub(crate) struct MemoriesSettingsView {
     complete: bool,
     app_event_tx: AppEventSender,
     docs_link: Line<'static>,
+    keymap: ListKeymap,
 }
 
 impl MemoriesSettingsView {
@@ -69,6 +75,7 @@ impl MemoriesSettingsView {
         use_memories: bool,
         generate_memories: bool,
         app_event_tx: AppEventSender,
+        keymap: ListKeymap,
     ) -> Self {
         let mut view = Self {
             items: vec![
@@ -96,8 +103,11 @@ impl MemoriesSettingsView {
             app_event_tx,
             docs_link: Line::from(vec![
                 "Learn more: ".dim(),
-                MEMORIES_DOC_URL.cyan().underlined(),
+                MEMORIES_DOC_URL
+                    .fg(crate::style::accent_color())
+                    .underlined(),
             ]),
+            keymap,
         };
         view.initialize_selection();
         view
@@ -109,20 +119,29 @@ impl MemoriesSettingsView {
 
     fn settings_header(&self) -> ColumnRenderable<'_> {
         let mut header = ColumnRenderable::new();
-        header.push(Line::from("Memories".bold()));
-        header.push(Line::from(
-            "Choose how Codex uses and creates memories. Changes are saved to config.toml".dim(),
-        ));
+        header.push(Paragraph::new(Line::from("Memories".bold())).wrap(Wrap { trim: false }));
+        header.push(
+            Paragraph::new(Line::from(
+                "Choose how Codex uses and creates memories. Changes are saved to config.toml"
+                    .dim(),
+            ))
+            .wrap(Wrap { trim: false }),
+        );
         header
     }
 
     fn reset_confirmation_header(&self) -> ColumnRenderable<'_> {
         let mut header = ColumnRenderable::new();
-        header.push(Line::from("Reset all memories?".bold()));
-        header.push(Line::from(
-            "This clears local memory files and rollout summaries for the current Codex home."
-                .dim(),
-        ));
+        header.push(
+            Paragraph::new(Line::from("Reset all memories?".bold())).wrap(Wrap { trim: false }),
+        );
+        header.push(
+            Paragraph::new(Line::from(
+                "This clears local memory files and rollout summaries for the current Codex home."
+                    .dim(),
+            ))
+            .wrap(Wrap { trim: false }),
+        );
         header
     }
 
@@ -148,6 +167,8 @@ impl MemoriesSettingsView {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, name)| GenericDisplayRow {
+                    selection_style: Some(super::picker_style::selection_style()),
+                    wrap_indent: Some(2),
                     name: if state.selected_idx == Some(idx) {
                         format!("› {name}")
                     } else {
@@ -188,6 +209,12 @@ impl MemoriesSettingsView {
                     } => (format!("{prefix} {name}"), description),
                 };
                 GenericDisplayRow {
+                    selection_style: Some(super::picker_style::selection_style()),
+                    wrap_indent: Some(if matches!(item, MemoriesMenuItem::Setting { .. }) {
+                        6
+                    } else {
+                        2
+                    }),
                     name,
                     description: Some((*description).to_string()),
                     ..Default::default()
@@ -216,6 +243,30 @@ impl MemoriesSettingsView {
         state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
     }
 
+    fn page_up(&mut self) {
+        let len = self.visible_len();
+        let visible = MAX_POPUP_ROWS.min(len);
+        self.active_state_mut().page_up_clamped(len, visible);
+    }
+
+    fn page_down(&mut self) {
+        let len = self.visible_len();
+        let visible = MAX_POPUP_ROWS.min(len);
+        self.active_state_mut().page_down_clamped(len, visible);
+    }
+
+    fn jump_top(&mut self) {
+        let len = self.visible_len();
+        let visible = MAX_POPUP_ROWS.min(len);
+        self.active_state_mut().jump_top(len, visible);
+    }
+
+    fn jump_bottom(&mut self) {
+        let len = self.visible_len();
+        let visible = MAX_POPUP_ROWS.min(len);
+        self.active_state_mut().jump_bottom(len, visible);
+    }
+
     fn toggle_selected(&mut self) {
         if self.reset_confirmation.is_some() {
             return;
@@ -228,10 +279,6 @@ impl MemoriesSettingsView {
         if let Some(MemoriesMenuItem::Setting { enabled, .. }) = self.items.get_mut(selected_idx) {
             *enabled = !*enabled;
         }
-    }
-
-    fn rows_width(total_width: u16) -> u16 {
-        total_width.saturating_sub(2)
     }
 
     fn current_setting(&self, setting: MemoriesSetting) -> bool {
@@ -261,66 +308,33 @@ impl MemoriesSettingsView {
 
     fn footer_hint(&self) -> Line<'static> {
         if self.reset_confirmation.is_some() {
-            standard_popup_hint_line()
+            picker_hint_line_for_keymap(&self.keymap)
         } else {
-            memories_settings_hint_line()
+            memories_settings_hint_line(&self.keymap)
         }
     }
 }
 
 impl BottomPaneView for MemoriesSettingsView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
-            KeyEvent {
-                code: KeyCode::Up, ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('\u{0010}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('\u{000e}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.move_down(),
-            KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.move_down(),
+            _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
+            _ if self.keymap.move_down.is_pressed(key_event) => self.move_down(),
+            _ if self.keymap.page_up.is_pressed(key_event) => self.page_up(),
+            _ if self.keymap.page_down.is_pressed(key_event) => self.page_down(),
+            _ if self.keymap.jump_top.is_pressed(key_event) => self.jump_top(),
+            _ if self.keymap.jump_bottom.is_pressed(key_event) => self.jump_bottom(),
             KeyEvent {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.toggle_selected(),
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.save(),
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => self.cancel(),
+            _ if self.keymap.accept.is_pressed(key_event) => self.save(),
+            _ if self.keymap.cancel.is_pressed(key_event) => self.cancel(),
             _ => {}
         }
     }
@@ -379,8 +393,16 @@ impl Renderable for MemoriesSettingsView {
             return;
         }
 
-        let [content_area, footer_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+        let hint = self.footer_hint();
+        let hint_lines = super::selection_popup_common::wrap_styled_line(
+            &hint,
+            area.width.saturating_sub(/*rhs*/ 2),
+        );
+        let [content_area, footer_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(hint_lines.len() as u16),
+        ])
+        .areas(area);
 
         Block::default()
             .style(user_message_style())
@@ -393,31 +415,26 @@ impl Renderable for MemoriesSettingsView {
         };
         let header_height = header.desired_height(content_area.width.saturating_sub(4));
         let rows = self.build_rows();
-        let rows_width = Self::rows_width(content_area.width);
         let rows_height = measure_rows_height(
             &rows,
             self.active_state(),
             MAX_POPUP_ROWS,
-            rows_width.saturating_add(1),
+            content_area.width,
         );
-        let [header_area, _, list_area, _, docs_area] = Layout::vertical([
-            Constraint::Max(header_height),
-            Constraint::Max(1),
-            Constraint::Length(rows_height),
-            Constraint::Max(1),
-            Constraint::Length(1),
-        ])
-        .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
+        let docs_height = if self.reset_confirmation.is_some() {
+            0
+        } else {
+            2
+        };
+        let [body_area, docs_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(docs_height)])
+                .areas(content_area);
+        let [header_area, _, render_area] =
+            super::picker_rows::layout(body_area, header_height, /*search*/ 0, rows_height);
 
         header.render(header_area, buf);
 
-        if list_area.height > 0 {
-            let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
-                y: list_area.y,
-                width: rows_width.max(1),
-                height: list_area.height,
-            };
+        if render_area.height > 0 {
             render_rows(
                 render_area,
                 buf,
@@ -428,7 +445,11 @@ impl Renderable for MemoriesSettingsView {
             );
         }
         if self.reset_confirmation.is_none() {
+            let docs_area = docs_area.inset(Insets::tlbr(
+                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 2,
+            ));
             self.docs_link.clone().render(docs_area, buf);
+            crate::terminal_hyperlinks::mark_url_hyperlink(buf, docs_area, MEMORIES_DOC_URL);
         }
 
         let hint_area = Rect {
@@ -437,7 +458,7 @@ impl Renderable for MemoriesSettingsView {
             width: footer_area.width.saturating_sub(2),
             height: footer_area.height,
         };
-        self.footer_hint().render(hint_area, buf);
+        Paragraph::new(hint_lines).dim().render(hint_area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -447,13 +468,7 @@ impl Renderable for MemoriesSettingsView {
             self.settings_header()
         };
         let rows = self.build_rows();
-        let rows_width = Self::rows_width(width);
-        let rows_height = measure_rows_height(
-            &rows,
-            self.active_state(),
-            MAX_POPUP_ROWS,
-            rows_width.saturating_add(1),
-        );
+        let rows_height = measure_rows_height(&rows, self.active_state(), MAX_POPUP_ROWS, width);
 
         let docs_height = if self.reset_confirmation.is_some() {
             0
@@ -462,16 +477,31 @@ impl Renderable for MemoriesSettingsView {
         };
         let mut height = header.desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 4 + docs_height);
-        height.saturating_add(1)
+        height.saturating_add(
+            super::selection_popup_common::wrap_styled_line(
+                &self.footer_hint(),
+                width.saturating_sub(/*rhs*/ 2),
+            )
+            .len() as u16,
+        )
     }
 }
 
-fn memories_settings_hint_line() -> Line<'static> {
-    Line::from(vec![
-        "Press ".into(),
-        key_hint::plain(KeyCode::Char(' ')).into(),
-        " to toggle; ".into(),
-        key_hint::plain(KeyCode::Enter).into(),
-        " to save or select".into(),
-    ])
+fn memories_settings_hint_line(keymap: &ListKeymap) -> Line<'static> {
+    let mut spans = vec![key_hint::plain(KeyCode::Char(' ')).into(), " toggle".into()];
+    if let Some(accept) = keymap.primary_hint(ListAction::Accept) {
+        spans.push(" · ".into());
+        spans.extend(accept.spans());
+        spans.push(" save/select".into());
+    }
+    if let Some(cancel) = keymap.primary_hint(ListAction::Cancel) {
+        spans.push(" · ".into());
+        spans.extend(cancel.spans());
+        spans.push(" cancel".into());
+    }
+    Line::from(spans)
 }
+
+#[cfg(test)]
+#[path = "memories_settings_view_tests.rs"]
+mod tests;

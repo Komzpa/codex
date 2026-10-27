@@ -2,14 +2,18 @@ use crate::TransportError;
 use crate::error::ApiError;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
+use crate::rate_limits::parse_rate_limit_reached_type;
 use base64::Engine;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
+use codex_protocol::protocol::MisalignmentErrorDetails;
 use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,20 +23,47 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
-        ApiError::Stream(msg) => CodexErr::Stream(msg, None),
+        ApiError::Retryable { message, delay } => {
+            let error = CodexErr::Stream(message);
+            match delay {
+                Some(delay) => error.with_retry_delay(delay),
+                None => error,
+            }
+        }
+        ApiError::RateLimitExceeded { message, delay } => {
+            let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded(message));
+            match delay {
+                Some(delay) => error.with_retry_delay(delay),
+                None => error,
+            }
+        }
+        ApiError::Stream(msg) => CodexErr::Stream(msg),
         ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
-        ApiError::Api { status, message } => CodexErr::UnexpectedStatus(UnexpectedResponseError {
-            status,
-            body: message,
-            url: None,
-            cf_ray: None,
-            request_id: None,
-            identity_authorization_error: None,
-            identity_error_code: None,
-        }),
+        ApiError::Api { status, message } => {
+            let user_message = api_error_user_message(status, &message);
+            CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                status,
+                body: message,
+                user_message,
+                url: None,
+                cf_ray: None,
+                request_id: None,
+                identity_authorization_error: None,
+                identity_error_code: None,
+            })
+        }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
-        ApiError::CyberPolicy { message } => CodexErr::CyberPolicy { message },
+        ApiError::CyberPolicy { message } => {
+            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+        }
+        ApiError::BioPolicy { message } => CodexErr::new(CodexErrorDetails::BioPolicy { message }),
+        ApiError::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        } => CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        }),
         ApiError::Transport(transport) => match transport {
             TransportError::Http {
                 status,
@@ -44,30 +75,93 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && matches!(
-                        value
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(serde_json::Value::as_str),
-                        Some("server_is_overloaded" | "slow_down")
-                    )
+                    && value
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("server_draining")
                 {
-                    return CodexErr::ServerOverloaded;
+                    let message = value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Server is draining")
+                        .to_string();
+                    let delay =
+                        extract_header(headers.as_ref(), http::header::RETRY_AFTER.as_str())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(std::time::Duration::from_secs);
+                    let error = CodexErr::new(CodexErrorDetails::ServerDraining(message));
+                    return match delay {
+                        Some(delay) => error.with_retry_delay(delay),
+                        None => error,
+                    };
+                }
+
+                if status == http::StatusCode::SERVICE_UNAVAILABLE
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
+                    && let Some(error) = value.get("error")
+                {
+                    match error.get("code").and_then(Value::as_str) {
+                        Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
+                        Some("slow_down") => {
+                            return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
+                                error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if (status == http::StatusCode::BAD_REQUEST
+                    || status == http::StatusCode::FORBIDDEN)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && error.get("code").and_then(Value::as_str)
+                        == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE.to_string()
+                        });
+                    return CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+                        message,
+                        misalignment: error.get("misalignment").cloned().and_then(|details| {
+                            serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
+                        }),
+                    });
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
                         && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
+                        && let Some(code @ (CYBER_POLICY_ERROR_CODE | BIO_POLICY_ERROR_CODE)) =
+                            error.get("code").and_then(Value::as_str)
                     {
+                        let fallback_message = if code == BIO_POLICY_ERROR_CODE {
+                            BIO_POLICY_FALLBACK_MESSAGE
+                        } else {
+                            CYBER_POLICY_FALLBACK_MESSAGE
+                        };
                         let message = error
                             .get("message")
                             .and_then(Value::as_str)
                             .filter(|message| !message.trim().is_empty())
                             .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::CyberPolicy { message }
+                            .unwrap_or_else(|| fallback_message.to_string());
+                        if code == BIO_POLICY_ERROR_CODE {
+                            CodexErr::new(CodexErrorDetails::BioPolicy { message })
+                        } else {
+                            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+                        }
                     } else if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
@@ -81,10 +175,18 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
                             let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
-                            let rate_limits = headers.as_ref().and_then(|map| {
-                                parse_rate_limit_for_limit(map, limit_id.as_deref())
-                            });
                             let promo_message = headers.as_ref().and_then(parse_promo_message);
+                            let rate_limit_reached_type =
+                                headers.as_ref().and_then(parse_rate_limit_reached_type);
+                            let rate_limits = headers
+                                .as_ref()
+                                .and_then(|map| {
+                                    parse_rate_limit_for_limit(map, limit_id.as_deref())
+                                })
+                                .map(|mut snapshot| {
+                                    snapshot.rate_limit_reached_type = rate_limit_reached_type;
+                                    snapshot
+                                });
                             let resets_at = err
                                 .error
                                 .resets_at
@@ -94,9 +196,23 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                                 resets_at,
                                 rate_limits: rate_limits.map(Box::new),
                                 promo_message,
+                                rate_limit_reached_type,
                             });
                         } else if err.error.error_type.as_deref() == Some("usage_not_included") {
                             return CodexErr::UsageNotIncluded;
+                        } else if err.error.error_type.as_deref() == Some("insufficient_quota")
+                            || matches!(
+                                err.error.code.as_deref(),
+                                Some(
+                                    "insufficient_quota"
+                                        | "credit_balance_exhausted"
+                                        | "organization_spend_limit_exceeded"
+                                        | "project_spend_limit_exceeded"
+                                        | "organization_usage_limit_exceeded"
+                                )
+                            )
+                        {
+                            return CodexErr::QuotaExceeded;
                         }
                     }
 
@@ -107,6 +223,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 } else {
                     CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
+                        user_message: api_error_user_message(status, &body_text),
                         body: body_text,
                         url,
                         cf_ray: extract_header(headers.as_ref(), CF_RAY_HEADER),
@@ -123,12 +240,16 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 request_id: None,
             }),
-            TransportError::Timeout => CodexErr::Timeout,
-            TransportError::Network(msg) | TransportError::Build(msg) => {
-                CodexErr::Stream(msg, None)
+            TransportError::Timeout => CodexErr::RequestTimeout,
+            TransportError::Connection(source) => {
+                CodexErr::ConnectionFailed(ConnectionFailedError { source })
+            }
+            TransportError::Network(msg) | TransportError::Build(msg) => CodexErr::Stream(msg),
+            error @ TransportError::ResponseTooLarge { .. } => {
+                CodexErr::InvalidRequest(error.to_string())
             }
         },
-        ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
+        ApiError::RateLimit(msg) => CodexErr::Stream(msg),
     }
 }
 
@@ -141,6 +262,13 @@ const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
+const BIO_POLICY_ERROR_CODE: &str = "bio_policy";
+const BIO_POLICY_FALLBACK_MESSAGE: &str = "This content was flagged for possible biological risk.";
+const MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE: &str = "misalignment_policy_violation";
+const MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE: &str =
+    "This request was blocked due to a misalignment policy violation.";
+const CLOUDFLARE_BLOCKED_MESSAGE: &str =
+    "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -148,6 +276,17 @@ mod tests;
 
 fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String> {
     extract_request_id(headers).or_else(|| extract_header(headers, CF_RAY_HEADER))
+}
+
+fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String> {
+    if status == http::StatusCode::FORBIDDEN
+        && body.contains("Cloudflare")
+        && body.contains("blocked")
+    {
+        Some(format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status})"))
+    } else {
+        None
+    }
 }
 
 fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String> {
@@ -183,6 +322,7 @@ struct UsageErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct UsageErrorBody {
+    code: Option<String>,
     #[serde(rename = "type")]
     error_type: Option<String>,
     plan_type: Option<PlanType>,

@@ -4,14 +4,12 @@ use std::collections::HashMap;
 
 struct FakeEnvironment {
     vars: HashMap<String, String>,
-    tmux_client_info: TmuxClientInfo,
 }
 
 impl FakeEnvironment {
     fn new() -> Self {
         Self {
             vars: HashMap::new(),
-            tmux_client_info: TmuxClientInfo::default(),
         }
     }
 
@@ -19,23 +17,11 @@ impl FakeEnvironment {
         self.vars.insert(key.to_string(), value.to_string());
         self
     }
-
-    fn with_tmux_client_info(mut self, termtype: Option<&str>, termname: Option<&str>) -> Self {
-        self.tmux_client_info = TmuxClientInfo {
-            termtype: termtype.map(ToString::to_string),
-            termname: termname.map(ToString::to_string),
-        };
-        self
-    }
 }
 
 impl Environment for FakeEnvironment {
     fn var(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
-    }
-
-    fn tmux_client_info(&self) -> TmuxClientInfo {
-        self.tmux_client_info.clone()
     }
 }
 
@@ -129,7 +115,7 @@ fn terminal_info_reports_is_zellij() {
         /*term_program*/ None,
         /*version*/ None,
         /*term*/ None,
-        Some(Multiplexer::Zellij {}),
+        Some(Multiplexer::Zellij { version: None }),
     );
     assert!(zellij.is_zellij());
 
@@ -226,6 +212,25 @@ fn detects_ghostty() {
         "Ghostty",
         "ghostty_term_program_user_agent"
     );
+
+    let env = FakeEnvironment::new().with_var("TERM", "xterm-ghostty");
+    let terminal = detect_terminal_info_from_env(&env);
+    assert_eq!(
+        terminal,
+        terminal_info(
+            TerminalName::Ghostty,
+            /*term_program*/ None,
+            /*version*/ None,
+            Some("xterm-ghostty"),
+            /*multiplexer*/ None
+        ),
+        "ghostty_term_info"
+    );
+    assert_eq!(
+        terminal.user_agent_token(),
+        "xterm-ghostty",
+        "ghostty_term_user_agent"
+    );
 }
 
 #[test]
@@ -281,22 +286,24 @@ fn detects_tmux_multiplexer() {
     let env = FakeEnvironment::new()
         .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
         .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(Some("xterm-256color"), Some("screen-256color"));
+        .with_var("TERM_PROGRAM_VERSION", "3.5a");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
         terminal_info(
             TerminalName::Unknown,
-            Some("xterm-256color"),
+            /*term_program*/ None,
             /*version*/ None,
-            Some("screen-256color"),
-            Some(Multiplexer::Tmux { version: None }),
+            /*term*/ None,
+            Some(Multiplexer::Tmux {
+                version: Some("3.5a".to_string())
+            }),
         ),
         "tmux_multiplexer_info"
     );
     assert_eq!(
         terminal.user_agent_token(),
-        "xterm-256color",
+        "unknown",
         "tmux_multiplexer_user_agent"
     );
 }
@@ -312,43 +319,15 @@ fn detects_zellij_multiplexer() {
             term_program: None,
             version: None,
             term: None,
-            multiplexer: Some(Multiplexer::Zellij {}),
+            multiplexer: Some(Multiplexer::Zellij { version: None }),
         },
         "zellij_multiplexer"
     );
 }
 
 #[test]
-fn detects_tmux_client_termtype() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(Some("WezTerm"), /*termname*/ None);
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::WezTerm,
-            Some("WezTerm"),
-            /*version*/ None,
-            /*term*/ None,
-            Some(Multiplexer::Tmux { version: None }),
-        ),
-        "tmux_client_termtype_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "WezTerm",
-        "tmux_client_termtype_user_agent"
-    );
-}
-
-#[test]
-fn detects_tmux_client_termname() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(/*termtype*/ None, Some("xterm-256color"));
+fn detects_zellij_multiplexer_version() {
+    let env = FakeEnvironment::new().with_var("ZELLIJ_VERSION", "0.43.1");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
@@ -356,43 +335,12 @@ fn detects_tmux_client_termname() {
             TerminalName::Unknown,
             /*term_program*/ None,
             /*version*/ None,
-            Some("xterm-256color"),
-            Some(Multiplexer::Tmux { version: None })
-        ),
-        "tmux_client_termname_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "xterm-256color",
-        "tmux_client_termname_user_agent"
-    );
-}
-
-#[test]
-fn detects_tmux_term_program_uses_client_termtype() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_var("TERM_PROGRAM_VERSION", "3.6a")
-        .with_tmux_client_info(Some("ghostty 1.2.3"), Some("xterm-ghostty"));
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::Ghostty,
-            Some("ghostty"),
-            Some("1.2.3"),
-            Some("xterm-ghostty"),
-            Some(Multiplexer::Tmux {
-                version: Some("3.6a".to_string()),
+            /*term*/ None,
+            Some(Multiplexer::Zellij {
+                version: Some("0.43.1".to_string()),
             }),
         ),
-        "tmux_term_program_client_termtype_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "ghostty/1.2.3",
-        "tmux_term_program_client_termtype_user_agent"
+        "zellij_multiplexer_version"
     );
 }
 
@@ -878,4 +826,51 @@ fn detects_term_fallbacks() {
         "unknown_info"
     );
     assert_eq!(terminal.user_agent_token(), "unknown", "unknown_user_agent");
+}
+
+#[test]
+fn tmux_preserves_safe_underlying_terminal_identifiers() {
+    for (variable, value, name, version) in [
+        (
+            "WEZTERM_VERSION",
+            "2024.2",
+            TerminalName::WezTerm,
+            Some("2024.2"),
+        ),
+        ("ITERM_SESSION_ID", "w0t1p0", TerminalName::Iterm2, None),
+        ("KITTY_WINDOW_ID", "1", TerminalName::Kitty, None),
+        ("WT_SESSION", "session", TerminalName::WindowsTerminal, None),
+        (
+            "ALACRITTY_SOCKET",
+            "/tmp/alacritty",
+            TerminalName::Alacritty,
+            None,
+        ),
+        (
+            "GHOSTTY_RESOURCES_DIR",
+            "/Applications/Ghostty.app/Contents/Resources/ghostty",
+            TerminalName::Ghostty,
+            None,
+        ),
+    ] {
+        let env = FakeEnvironment::new()
+            .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
+            .with_var("TERM_PROGRAM", "tmux")
+            .with_var("TERM_PROGRAM_VERSION", "3.5a")
+            .with_var("TERM", "screen-256color")
+            .with_var(variable, value);
+        assert_eq!(
+            detect_terminal_info_from_env(&env),
+            terminal_info(
+                name,
+                /*term_program*/ None,
+                version,
+                /*term*/ None,
+                Some(Multiplexer::Tmux {
+                    version: Some("3.5a".to_string())
+                }),
+            ),
+            "{variable}"
+        );
+    }
 }

@@ -17,7 +17,7 @@ if [[ -n "${APT_INSTALL_ARGS:-}" ]]; then
 fi
 
 sudo apt-get update "${apt_update_args[@]}"
-sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils
+sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils perl make
 
 case "${TARGET}" in
   x86_64-unknown-linux-musl)
@@ -46,6 +46,8 @@ else
   echo "musl gcc not found after install; arch=${arch}" >&2
   exit 1
 fi
+
+OPENSSL_CC="${musl_linker}" bash "$(dirname "${BASH_SOURCE[0]}")/install-musl-openssl.sh"
 
 zig_target="${TARGET/-unknown-linux-musl/-linux-musl}"
 runner_temp="${RUNNER_TEMP:-/tmp}"
@@ -150,7 +152,9 @@ for arg in "\$@"; do
   args+=("\${arg}")
 done
 
-exec "${zig_bin}" cc -target "${zig_target}" "\${args[@]}"
+# Zig enables UBSan for debug C builds by default. Rust links these objects
+# without Zig's sanitizer runtime, so keep native dependencies uninstrumented.
+exec "${zig_bin}" cc -target "${zig_target}" "\${args[@]}" -fno-sanitize=undefined
 EOF
   cat >"${cxx}" <<EOF
 #!/usr/bin/env bash
@@ -207,7 +211,9 @@ for arg in "\$@"; do
   args+=("\${arg}")
 done
 
-exec "${zig_bin}" c++ -target "${zig_target}" "\${args[@]}"
+# Zig enables UBSan for debug C++ builds by default. Rust links these objects
+# without Zig's sanitizer runtime, so keep native dependencies uninstrumented.
+exec "${zig_bin}" c++ -target "${zig_target}" "\${args[@]}" -fno-sanitize=undefined
 EOF
   chmod +x "${cc}" "${cxx}"
 
@@ -270,6 +276,11 @@ echo "PKG_CONFIG_PATH=${pkg_config_path}" >> "$GITHUB_ENV"
 pkg_config_path_var="PKG_CONFIG_PATH_${TARGET}"
 pkg_config_path_var="${pkg_config_path_var//-/_}"
 echo "${pkg_config_path_var}=${libcap_pkgconfig_dir}" >> "$GITHUB_ENV"
+pkg_config_libdir_var="PKG_CONFIG_LIBDIR_${TARGET}"
+pkg_config_libdir_var="${pkg_config_libdir_var//-/_}"
+# Do not let musl cross-builds resolve native libraries from the host glibc
+# pkg-config directories. libcap is the only target package provided here.
+echo "${pkg_config_libdir_var}=${libcap_pkgconfig_dir}" >> "$GITHUB_ENV"
 
 if [[ -n "${sysroot}" && "${sysroot}" != "/" ]]; then
   echo "PKG_CONFIG_SYSROOT_DIR=${sysroot}" >> "$GITHUB_ENV"

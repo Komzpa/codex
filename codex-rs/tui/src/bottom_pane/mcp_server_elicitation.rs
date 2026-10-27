@@ -12,6 +12,15 @@ use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY as APPROVAL_META_KIND_KEY;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL as APPROVAL_META_KIND_MCP_TOOL_CALL;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION as APPROVAL_META_KIND_TOOL_SUGGESTION;
+use codex_protocol::mcp_approval_meta::PERSIST_ALWAYS as APPROVAL_PERSIST_ALWAYS_VALUE;
+use codex_protocol::mcp_approval_meta::PERSIST_KEY as APPROVAL_PERSIST_KEY;
+use codex_protocol::mcp_approval_meta::PERSIST_SESSION as APPROVAL_PERSIST_SESSION_VALUE;
+use codex_protocol::mcp_approval_meta::TOOL_NAME_KEY;
+use codex_protocol::mcp_approval_meta::TOOL_PARAMS_DISPLAY_KEY as APPROVAL_TOOL_PARAMS_DISPLAY_KEY;
+use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as APPROVAL_TOOL_PARAMS_KEY;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -40,6 +49,12 @@ use crate::bottom_pane::selection_popup_common::menu_surface_inset;
 use crate::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use crate::bottom_pane::selection_popup_common::render_menu_surface;
 use crate::bottom_pane::selection_popup_common::render_rows;
+use crate::footer_hint::shortcut;
+use crate::key_hint::ShortcutHint;
+use crate::keymap::KeymapContext;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
+use crate::keymap::RuntimeKeymap;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::format_json_compact;
 use crate::text_formatting::truncate_text;
@@ -55,19 +70,10 @@ const APPROVAL_ACCEPT_SESSION_VALUE: &str = "accept_session";
 const APPROVAL_ACCEPT_ALWAYS_VALUE: &str = "accept_always";
 const APPROVAL_DECLINE_VALUE: &str = "decline";
 const APPROVAL_CANCEL_VALUE: &str = "cancel";
-const APPROVAL_META_KIND_KEY: &str = "codex_approval_kind";
-const APPROVAL_META_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
-const APPROVAL_META_KIND_TOOL_SUGGESTION: &str = "tool_suggestion";
-const APPROVAL_PERSIST_KEY: &str = "persist";
-const APPROVAL_PERSIST_SESSION_VALUE: &str = "session";
-const APPROVAL_PERSIST_ALWAYS_VALUE: &str = "always";
-const APPROVAL_TOOL_PARAMS_KEY: &str = "tool_params";
-const APPROVAL_TOOL_PARAMS_DISPLAY_KEY: &str = "tool_params_display";
 const APPROVAL_TOOL_PARAM_DISPLAY_LIMIT: usize = 3;
 const APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES: usize = 60;
 const TOOL_TYPE_KEY: &str = "tool_type";
 const TOOL_ID_KEY: &str = "tool_id";
-const TOOL_NAME_KEY: &str = "tool_name";
 const TOOL_SUGGEST_SUGGEST_TYPE_KEY: &str = "suggest_type";
 const TOOL_SUGGEST_REASON_KEY: &str = "suggest_reason";
 const TOOL_SUGGEST_INSTALL_URL_KEY: &str = "install_url";
@@ -179,33 +185,11 @@ struct McpServerElicitationAnswerState {
     answer_committed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FooterTip {
-    text: String,
-    highlight: bool,
-}
-
-impl FooterTip {
-    fn new(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            highlight: false,
-        }
-    }
-
-    fn highlighted(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            highlight: true,
-        }
-    }
-}
-
 impl McpServerElicitationFormRequest {
     pub(crate) fn from_app_server_request(
         thread_id: ThreadId,
         request_id: AppServerRequestId,
-        request: McpServerElicitationRequestParams,
+        request: &McpServerElicitationRequestParams,
     ) -> Option<Self> {
         let McpServerElicitationRequestParams {
             server_name,
@@ -224,10 +208,10 @@ impl McpServerElicitationFormRequest {
         let requested_schema = serde_json::to_value(requested_schema).ok()?;
         Self::from_parts(
             thread_id,
-            server_name,
+            server_name.clone(),
             request_id,
-            meta,
-            message,
+            meta.as_ref(),
+            message.clone(),
             requested_schema,
         )
     }
@@ -236,13 +220,12 @@ impl McpServerElicitationFormRequest {
         thread_id: ThreadId,
         server_name: String,
         request_id: AppServerRequestId,
-        meta: Option<Value>,
+        meta: Option<&Value>,
         message: String,
         requested_schema: Value,
     ) -> Option<Self> {
-        let tool_suggestion = parse_tool_suggestion_request(meta.as_ref());
+        let tool_suggestion = parse_tool_suggestion_request(meta);
         let is_tool_approval = meta
-            .as_ref()
             .and_then(Value::as_object)
             .and_then(|meta| meta.get(APPROVAL_META_KIND_KEY))
             .and_then(Value::as_str)
@@ -257,7 +240,7 @@ impl McpServerElicitationFormRequest {
         let is_message_only_schema = requested_schema.is_null() || is_empty_object_schema;
         let is_tool_approval_action = is_tool_approval && is_message_only_schema;
         let approval_display_params = if is_tool_approval_action {
-            parse_tool_approval_display_params(meta.as_ref())
+            parse_tool_approval_display_params(meta)
         } else {
             Vec::new()
         };
@@ -275,7 +258,7 @@ impl McpServerElicitationFormRequest {
                 description: Some(allow_description.to_string()),
                 value: Value::String(APPROVAL_ACCEPT_ONCE_VALUE.to_string()),
             }];
-            if approval_supports_persist_mode(meta.as_ref(), APPROVAL_PERSIST_SESSION_VALUE) {
+            if approval_supports_persist_mode(meta, APPROVAL_PERSIST_SESSION_VALUE) {
                 let description = if is_tool_approval_action {
                     "Run the tool and remember this choice for this session."
                 } else {
@@ -287,7 +270,7 @@ impl McpServerElicitationFormRequest {
                     value: Value::String(APPROVAL_ACCEPT_SESSION_VALUE.to_string()),
                 });
             }
-            if approval_supports_persist_mode(meta.as_ref(), APPROVAL_PERSIST_ALWAYS_VALUE) {
+            if approval_supports_persist_mode(meta, APPROVAL_PERSIST_ALWAYS_VALUE) {
                 let description = if is_tool_approval_action {
                     "Run the tool and remember this choice for future tool calls."
                 } else {
@@ -711,9 +694,12 @@ pub(crate) struct McpServerElicitationOverlay {
     current_idx: usize,
     done: bool,
     validation_error: Option<String>,
+    list_keymap: ListKeymap,
+    composer_submit_hint: Option<ShortcutHint>,
 }
 
 impl McpServerElicitationOverlay {
+    #[cfg(test)]
     pub(crate) fn new(
         request: McpServerElicitationFormRequest,
         app_event_tx: AppEventSender,
@@ -721,6 +707,25 @@ impl McpServerElicitationOverlay {
         enhanced_keys_supported: bool,
         disable_paste_burst: bool,
     ) -> Self {
+        Self::new_with_keymap(
+            request,
+            app_event_tx,
+            has_input_focus,
+            enhanced_keys_supported,
+            disable_paste_burst,
+            RuntimeKeymap::defaults(),
+        )
+    }
+
+    pub(crate) fn new_with_keymap(
+        request: McpServerElicitationFormRequest,
+        app_event_tx: AppEventSender,
+        has_input_focus: bool,
+        enhanced_keys_supported: bool,
+        disable_paste_burst: bool,
+        keymap: RuntimeKeymap,
+    ) -> Self {
+        let composer_submit_hint = keymap.primary_hint(KeymapContext::Composer, "submit");
         let mut composer = ChatComposer::new_with_config(
             has_input_focus,
             app_event_tx.clone(),
@@ -729,6 +734,7 @@ impl McpServerElicitationOverlay {
             disable_paste_burst,
             ChatComposerConfig::plain_text(),
         );
+        composer.set_keymap_bindings(&keymap);
         composer.set_footer_hint_override(Some(Vec::new()));
         let mut overlay = Self {
             app_event_tx,
@@ -739,6 +745,8 @@ impl McpServerElicitationOverlay {
             current_idx: 0,
             done: false,
             validation_error: None,
+            list_keymap: keymap.list,
+            composer_submit_hint,
         };
         overlay.reset_for_request();
         overlay.restore_current_draft();
@@ -913,6 +921,7 @@ impl McpServerElicitationOverlay {
                 let prefix_label = format!("{prefix} {number}. ");
                 let wrap_indent = UnicodeWidthStr::width(prefix_label.as_str());
                 GenericDisplayRow {
+                    selection_style: Some(crate::bottom_pane::selection_style()),
                     name: format!("{prefix_label}{}", option.label),
                     description: option.description.clone(),
                     wrap_indent: Some(wrap_indent),
@@ -959,39 +968,44 @@ impl McpServerElicitationOverlay {
         sections.join("\n\n")
     }
 
-    fn footer_tips(&self) -> Vec<FooterTip> {
+    fn footer_tips(&self) -> Vec<Line<'static>> {
         let mut tips = Vec::new();
         let is_last_field = self.current_index().saturating_add(1) >= self.field_count();
-        if self.current_field_is_select() {
-            if self.field_count() == 1 {
-                tips.push(FooterTip::highlighted("enter to submit"));
-            } else if is_last_field {
-                tips.push(FooterTip::highlighted("enter to submit all"));
-            } else {
-                tips.push(FooterTip::new("enter to submit answer"));
-            }
-        } else if self.field_count() == 1 {
-            tips.push(FooterTip::highlighted("enter to submit"));
-        } else if is_last_field {
-            tips.push(FooterTip::highlighted("enter to submit all"));
+        let submit_hint = if self.current_field_is_select() {
+            self.list_keymap.primary_hint(ListAction::Accept)
         } else {
-            tips.push(FooterTip::new("enter to submit answer"));
+            self.composer_submit_hint
+        };
+        if let Some(submit_hint) = submit_hint.map(ShortcutHint::display_label) {
+            if self.field_count() == 1 {
+                tips.push(shortcut(&submit_hint, "to submit"));
+            } else if is_last_field {
+                tips.push(shortcut(&submit_hint, "to submit all"));
+            } else {
+                tips.push(shortcut(&submit_hint, "to submit answer"));
+            }
         }
         if self.field_count() > 1 {
             if self.current_field_is_select() {
-                tips.push(FooterTip::new("←/→ to navigate fields"));
+                tips.push(shortcut("←/→", "to navigate fields"));
             } else {
-                tips.push(FooterTip::new("ctrl + p / ctrl + n change field"));
+                tips.push(shortcut("ctrl+p / ctrl+n", "change field"));
             }
         }
-        tips.push(FooterTip::new("esc to cancel"));
+        tips.push(shortcut("esc", "to cancel"));
         tips
     }
 
-    fn footer_tip_lines(&self, width: u16) -> Vec<Vec<FooterTip>> {
+    fn footer_tip_lines(&self, width: u16) -> Vec<Vec<Line<'static>>> {
         let mut tips = Vec::new();
         if let Some(error) = self.validation_error.as_ref() {
-            tips.push(FooterTip::highlighted(error.clone()));
+            tips.push(Line::from(
+                error
+                    .clone()
+                    .fg(crate::style::accent_color())
+                    .bold()
+                    .not_dim(),
+            ));
         }
         tips.extend(self.footer_tips());
         wrap_footer_tips(width, tips)
@@ -1272,7 +1286,7 @@ impl McpServerElicitationOverlay {
             let line = if answered {
                 Line::from(line.clone())
             } else {
-                Line::from(line.clone()).cyan()
+                Line::from(line.clone()).fg(crate::style::accent_color())
             };
             Paragraph::new(line).render(
                 Rect {
@@ -1320,7 +1334,7 @@ impl McpServerElicitationOverlay {
         let option_tip = if options_hidden {
             let selected = self.selected_option_index().unwrap_or(0).saturating_add(1);
             let total = self.options_len();
-            Some(FooterTip::new(format!("option {selected}/{total}")))
+            Some(Line::from(format!("option {selected}/{total}").dim()))
         } else {
             None
         };
@@ -1342,11 +1356,7 @@ impl McpServerElicitationOverlay {
                 if tip_idx > 0 {
                     spans.push(FOOTER_SEPARATOR.into());
                 }
-                if tip.highlight {
-                    spans.push(tip.text.cyan().bold().not_dim());
-                } else {
-                    spans.push(tip.text.into());
-                }
+                spans.extend(tip.spans);
             }
             let line = Line::from(spans).dim();
             Paragraph::new(line).render(
@@ -1483,6 +1493,18 @@ impl Renderable for McpServerElicitationOverlay {
 }
 
 impl BottomPaneView for McpServerElicitationOverlay {
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        self.composer.footer_flash_delay()
+    }
+
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        if self.current_field_is_select() {
+            crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+        } else {
+            self.composer.keymap_contexts()
+        }
+    }
+
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
@@ -1492,7 +1514,10 @@ impl BottomPaneView for McpServerElicitationOverlay {
             return;
         }
 
-        if matches!(key_event.code, KeyCode::Esc) {
+        if matches!(key_event.code, KeyCode::Esc)
+            || self.current_field_is_select()
+                && self.list_keymap.action_for(key_event) == Some(ListAction::Cancel)
+        {
             self.dispatch_cancel();
             self.done = true;
             return;
@@ -1529,7 +1554,18 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::NONE,
                 ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
             } if self.current_field_is_select() => {
+                self.move_field(/*next*/ false);
+                return;
+            }
+            _ if self.current_field_is_select()
+                && self.list_keymap.action_for(key_event) == Some(ListAction::MoveLeft) =>
+            {
                 self.move_field(/*next*/ false);
                 return;
             }
@@ -1537,7 +1573,18 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::Right,
                 modifiers: KeyModifiers::NONE,
                 ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
             } if self.current_field_is_select() => {
+                self.move_field(/*next*/ true);
+                return;
+            }
+            _ if self.current_field_is_select()
+                && self.list_keymap.action_for(key_event) == Some(ListAction::MoveRight) =>
+            {
                 self.move_field(/*next*/ true);
                 return;
             }
@@ -1547,28 +1594,28 @@ impl BottomPaneView for McpServerElicitationOverlay {
         if self.current_field_is_select() {
             self.validation_error = None;
             let options_len = self.options_len();
-            match key_event.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+            match (self.list_keymap.action_for(key_event), key_event.code) {
+                (Some(ListAction::MoveUp), _) | (_, KeyCode::Up | KeyCode::Char('k')) => {
                     if let Some(answer) = self.current_answer_mut() {
                         answer.selection.move_up_wrap(options_len);
                         answer.answer_committed = false;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                (Some(ListAction::MoveDown), _) | (_, KeyCode::Down | KeyCode::Char('j')) => {
                     if let Some(answer) = self.current_answer_mut() {
                         answer.selection.move_down_wrap(options_len);
                         answer.answer_committed = false;
                     }
                 }
-                KeyCode::Backspace | KeyCode::Delete => self.clear_selection(),
-                KeyCode::Char(' ') => self.select_current_option(/*committed*/ true),
-                KeyCode::Enter => {
+                (_, KeyCode::Backspace | KeyCode::Delete) => self.clear_selection(),
+                (_, KeyCode::Char(' ')) => self.select_current_option(/*committed*/ true),
+                (Some(ListAction::Accept), _) | (_, KeyCode::Enter) => {
                     if self.selected_option_index().is_some() {
                         self.select_current_option(/*committed*/ true);
                     }
                     self.go_next_or_submit();
                 }
-                KeyCode::Char(ch) => {
+                (_, KeyCode::Char(ch)) => {
                     if let Some(option_idx) = self.option_index_for_digit(ch) {
                         if let Some(answer) = self.current_answer_mut() {
                             answer.selection.selected_idx = Some(option_idx);
@@ -1648,45 +1695,13 @@ impl BottomPaneView for McpServerElicitationOverlay {
     }
 }
 
-fn wrap_footer_tips(width: u16, tips: Vec<FooterTip>) -> Vec<Vec<FooterTip>> {
-    let max_width = width.max(1) as usize;
-    let separator_width = UnicodeWidthStr::width(FOOTER_SEPARATOR);
-    if tips.is_empty() {
-        return vec![Vec::new()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-    let mut used = 0usize;
-
-    for tip in tips {
-        let tip_width = UnicodeWidthStr::width(tip.text.as_str()).min(max_width);
-        let extra = if current.is_empty() {
-            tip_width
-        } else {
-            separator_width.saturating_add(tip_width)
-        };
-        if !current.is_empty() && used.saturating_add(extra) > max_width {
-            lines.push(current);
-            current = Vec::new();
-            used = 0;
-        }
-        if current.is_empty() {
-            used = tip_width;
-        } else {
-            used = used
-                .saturating_add(separator_width)
-                .saturating_add(tip_width);
-        }
-        current.push(tip);
-    }
-
-    if current.is_empty() {
-        lines.push(Vec::new());
-    } else {
-        lines.push(current);
-    }
-    lines
+fn wrap_footer_tips(width: u16, tips: Vec<Line<'static>>) -> Vec<Vec<Line<'static>>> {
+    crate::footer_hint::wrap_hint_rows(
+        tips,
+        width,
+        UnicodeWidthStr::width(FOOTER_SEPARATOR),
+        Line::width,
+    )
 }
 
 #[cfg(test)]
@@ -1694,6 +1709,9 @@ mod tests {
     use super::*;
     use crate::app_event::AppEvent;
     use crate::render::renderable::Renderable;
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::unbounded_channel;
@@ -1732,7 +1750,7 @@ mod tests {
         McpServerElicitationFormRequest::from_app_server_request(
             thread_id,
             request_id("request-1"),
-            request,
+            &request,
         )
     }
 
@@ -2156,6 +2174,138 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_list_keys_move_between_select_fields() {
+        let (tx, _rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Choose values",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "first": {
+                            "type": "boolean",
+                            "title": "First",
+                        },
+                        "second": {
+                            "type": "boolean",
+                            "title": "Second",
+                        }
+                    },
+                    "required": ["first", "second"],
+                }),
+                /*meta*/ None,
+            ),
+        )
+        .expect("expected supported form");
+        let mut overlay = McpServerElicitationOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+
+        assert_eq!(overlay.current_idx, 0);
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.current_idx, 1);
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.current_idx, 0);
+        overlay.list_keymap.accept.clear();
+        assert!(
+            overlay
+                .footer_tips()
+                .iter()
+                .all(|tip| !tip.to_string().contains("submit"))
+        );
+    }
+
+    #[test]
+    fn switching_fields_clears_length_validation_flash() {
+        let (tx, _rx) = test_sender();
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Two fields",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                    "required": ["a", "b"],
+                }),
+                /*meta*/ None,
+            ),
+        )
+        .expect("supported form");
+        let mut overlay = McpServerElicitationOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ true,
+        );
+        overlay.handle_paste("x".repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS + 1));
+        overlay.handle_key_event(KeyCode::Enter.into());
+        assert!(overlay.next_frame_delay().is_some());
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.next_frame_delay(), None);
+        assert!(overlay.composer.current_text().is_empty());
+    }
+
+    #[test]
+    fn text_fields_inherit_composer_chord_context_and_submit_binding() {
+        let (tx, _rx) = test_sender();
+        let thread_id = ThreadId::default();
+        let request = from_form_request(
+            thread_id,
+            form_request(
+                "Enter a name",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "title": "Name",
+                        }
+                    },
+                    "required": ["name"],
+                }),
+                /*meta*/ None,
+            ),
+        )
+        .expect("supported text field");
+        let mut config = TuiKeymap::default();
+        config.composer.submit = Some(KeybindingsSpec::One(KeybindingSpec(
+            "ctrl-x enter".to_string(),
+        )));
+        let keymap = RuntimeKeymap::from_config(&config).expect("valid MCP composer chord");
+        let mut overlay = McpServerElicitationOverlay::new_with_keymap(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ true, keymap,
+        );
+
+        let snapshot = render_snapshot(
+            &overlay,
+            Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 10,
+            ),
+        )
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+        insta::assert_snapshot!(
+            "mcp_server_elicitation_text_configured_key_chords",
+            snapshot
+        );
+        assert!(
+            overlay
+                .keymap_contexts()
+                .contains(crate::keymap::KeymapContext::Composer)
+        );
+        overlay.composer_submit_hint = None;
+        assert!(
+            overlay
+                .footer_tips()
+                .iter()
+                .all(|tip| !tip.to_string().contains("submit"))
+        );
+    }
+
+    #[test]
     fn empty_tool_approval_schema_session_choice_sets_persist_meta() {
         let (tx, mut rx) = test_sender();
         let thread_id = ThreadId::default();
@@ -2414,7 +2564,7 @@ mod tests {
             McpServerElicitationFormRequest::from_app_server_request(
                 thread_id,
                 request_id("request-2"),
-                McpServerElicitationRequestParams {
+                &McpServerElicitationRequestParams {
                     thread_id: "thread-1".to_string(),
                     turn_id: Some("turn-2".to_string()),
                     server_name: "server-1".to_string(),

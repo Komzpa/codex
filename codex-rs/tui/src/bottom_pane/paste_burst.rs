@@ -1,7 +1,7 @@
 //! Paste-burst detection for terminals without bracketed paste.
 //!
 //! On some platforms (notably Windows), pastes often arrive as a rapid stream of
-//! `KeyCode::Char` and `KeyCode::Enter` key events rather than as a single "paste" event.
+//! `KeyCode::Char`, `KeyCode::Enter`, and `KeyCode::Tab` key events rather than as a single "paste" event.
 //! In that mode, the composer needs to:
 //!
 //! - Prevent transient UI side effects (e.g. toggles bound to `?`) from triggering on pasted text.
@@ -9,32 +9,37 @@
 //! - Avoid flicker caused by inserting a typed prefix and then immediately reclassifying it as
 //!   paste once enough chars have arrived.
 //!
-//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only "plain"
-//! character events (no Ctrl/Alt) and uses its decisions to either:
+//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only
+//! text-producing character events (plain, Shift, or Windows AltGr) and uses the full buffering
+//! decisions to either:
 //!
 //! - briefly hold a first ASCII char (flicker suppression),
 //! - buffer a burst as a single pasted string, or
 //! - let input flow through as normal typing.
-//!
-//! For the higher-level view of how `PasteBurst` integrates with `ChatComposer`, see
-//! `docs/tui-chat-composer.md`.
 //!
 //! # Call Pattern
 //!
 //! `PasteBurst` is a pure state machine: it never mutates the textarea directly. The caller feeds
 //! it events and then applies the chosen action:
 //!
-//! - For each plain `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
+//! - For each text-producing `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
 //!   [`PasteBurst::on_plain_char_no_hold`] (non-ASCII/IME).
 //! - If the decision indicates buffering, the caller appends to `PasteBurst.buffer` via
 //!   [`PasteBurst::append_char_to_buffer`].
+//! - On Enter or Tab, [`PasteBurst::append_control_char_if_active`] promotes a held first character
+//!   into the active buffer before appending the newline or tab and refreshing the idle timeout.
 //! - On a UI tick, call [`PasteBurst::flush_if_due`]. If it returns [`FlushResult::Typed`], insert
 //!   that char as normal typing. If it returns [`FlushResult::Paste`], treat the returned string as
 //!   an explicit paste.
-//! - Before applying non-char input (arrow keys, Ctrl/Alt modifiers, etc.), use
+//! - Before applying non-text input (arrow keys; Ctrl/Alt shortcuts other than Windows AltGr;
+//!   or Super, Hyper, and Meta modifiers), use
 //!   [`PasteBurst::flush_before_modified_input`] to avoid leaving buffered text "stuck", and then
 //!   [`PasteBurst::clear_window_after_non_char`] so subsequent typing does not get grouped into a
 //!   previous burst.
+//! - Direct-insert callers can skip buffering, use
+//!   [`PasteBurst::direct_insert_newline_should_insert`] in their Enter handler, and call
+//!   [`PasteBurst::extend_window`] when Enter or [`PasteBurst::on_plain_char_no_hold`] reports a
+//!   burst-like stream.
 //!
 //! # State Variables
 //!
@@ -44,8 +49,8 @@
 //! - `buffer`: accumulated burst text that will eventually flush as a single `Paste(String)`.
 //!   A non-empty buffer is treated as "in burst context" even if `active` has been cleared.
 //! - `pending_first_char`: a single held ASCII char used for flicker suppression. The caller must
-//!   not render this char until it either becomes part of a burst (`BeginBufferFromPending`) or
-//!   flushes as a normal typed char (`FlushResult::Typed`).
+//!   not render this char until it joins a burst through `BeginBufferFromPending` or
+//!   `append_control_char_if_active`, or flushes as a normal typed char (`FlushResult::Typed`).
 //! - `last_plain_char_time`/`consecutive_plain_char_burst`: the timing/count heuristic for
 //!   "paste-like" streams.
 //! - `burst_window_until`: the Enter suppression window ("Enter inserts newline") that outlives the
@@ -109,10 +114,10 @@
 //! - [`PasteBurst::on_plain_char_no_hold`] never holds (used for IME/non-ASCII paths), since
 //!   holding a non-ASCII character can feel like dropped input.
 //!
-//! # Contract With `ChatComposer`
+//! # Contract With Callers
 //!
-//! `PasteBurst` does not mutate the UI text buffer on its own. The caller (`ChatComposer`) must
-//! interpret decisions and apply the corresponding UI edits:
+//! `PasteBurst` does not mutate the UI text buffer on its own. Callers must interpret decisions
+//! and apply the corresponding UI edits. `ChatComposer` uses the full buffering contract:
 //!
 //! - For each plain ASCII `KeyCode::Char`, call [`PasteBurst::on_plain_char`].
 //!   - [`CharDecision::RetainFirstChar`]: do **not** insert the char into the textarea yet.
@@ -141,7 +146,8 @@
 //!   - [`FlushResult::Typed`]: insert that single char as normal typing.
 //!   - [`FlushResult::Paste`]: treat the returned string as an explicit paste.
 //!
-//! - When a non-plain key is pressed (Ctrl/Alt-modified input, arrows, etc.), callers should use
+//! - When non-text input is pressed (Ctrl/Alt shortcuts other than Windows AltGr; Super, Hyper,
+//!   and Meta modifiers; arrows; etc.), callers should use
 //!   [`PasteBurst::clear_window_after_non_char`] to prevent the next keystroke from being
 //!   incorrectly grouped into a previous burst.
 
@@ -154,12 +160,7 @@ const PASTE_BURST_MIN_CHARS: u16 = 3;
 const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 
 // Maximum delay between consecutive chars to be considered part of a paste burst.
-// Windows terminals (especially VS Code integrated terminal) deliver paste events
-// more slowly than native terminals, so we use a higher threshold there.
-#[cfg(not(windows))]
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
-#[cfg(windows)]
-const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(30);
 
 // Idle timeout before flushing buffered paste content.
 // Slower paste bursts have been observed in Windows environments.
@@ -168,7 +169,7 @@ const PASTE_BURST_ACTIVE_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 #[cfg(windows)]
 const PASTE_BURST_ACTIVE_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PasteBurst {
     last_plain_char_time: Option<Instant>,
     consecutive_plain_char_burst: u16,
@@ -320,14 +321,19 @@ impl PasteBurst {
         }
     }
 
-    /// While bursting: accumulate a newline into the buffer instead of
-    /// submitting the textarea.
+    /// Accumulate a newline or tab into the burst instead of invoking a shortcut.
+    /// A held first character is promoted into the buffer before the control character.
     ///
-    /// Returns true if a newline was appended (we are in a burst context),
+    /// Returns true if the character was appended (we are in a burst context),
     /// false otherwise.
-    pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
+    pub fn append_control_char_if_active(&mut self, ch: char, now: Instant) -> bool {
         if self.is_active() {
-            self.buffer.push('\n');
+            if let Some((held, _)) = self.pending_first_char.take() {
+                self.buffer.push(held);
+            }
+            self.active = true;
+            self.buffer.push(ch);
+            self.last_plain_char_time = Some(now);
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true
         } else {
@@ -339,6 +345,14 @@ impl PasteBurst {
     pub fn newline_should_insert_instead_of_submit(&self, now: Instant) -> bool {
         let in_burst_window = self.burst_window_until.is_some_and(|until| now <= until);
         self.is_active() || in_burst_window
+    }
+
+    /// Decide if Enter should insert a newline for callers that insert chars immediately.
+    pub fn direct_insert_newline_should_insert(&self, now: Instant) -> bool {
+        self.newline_should_insert_instead_of_submit(now)
+            || self
+                .last_plain_char_time
+                .is_some_and(|t| now.duration_since(t) <= PASTE_BURST_CHAR_INTERVAL)
     }
 
     /// Keep the burst window alive.

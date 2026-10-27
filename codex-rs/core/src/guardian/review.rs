@@ -1,596 +1,177 @@
-use std::sync::Arc;
+//! Supplies host review preparation and context-dependent configuration.
+//! Guardian's extension owns routing, execution, reporting and denial accounting.
 
+#[path = "review_request.rs"]
+mod request;
+
+use crate::context::GuardianContextMode;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_analytics::GuardianReviewAnalyticsResult;
-use codex_analytics::GuardianReviewDecision;
-use codex_analytics::GuardianReviewFailureReason;
-use codex_analytics::GuardianReviewTerminalStatus;
-use codex_analytics::GuardianReviewTrackContext;
-use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::protocol::AskForApproval;
+use codex_core_plugins::PluginCommandAttribution;
+use codex_features::Feature;
+use codex_guardian_reviewer::GuardianReviewError;
+use codex_guardian_reviewer::GuardianReviewOutcome;
+#[cfg(test)]
+use codex_guardian_reviewer::GuardianReviewSessionLimits;
+use codex_guardian_reviewer::ReviewModel;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::GuardianAssessmentDecisionSource;
-use codex_protocol::protocol::GuardianAssessmentEvent;
-use codex_protocol::protocol::GuardianAssessmentStatus;
-use codex_protocol::protocol::GuardianRiskLevel;
-use codex_protocol::protocol::GuardianUserAuthorization;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::protocol::WarningEvent;
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::GuardianNodeReplPolicy;
+use crate::context::GuardianReviewEvidence;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
 
+use super::ApprovalRequestReasons;
+#[cfg(test)]
 use super::GUARDIAN_REVIEW_TIMEOUT;
 use super::GUARDIAN_REVIEWER_NAME;
 use super::GuardianApprovalRequest;
-use super::GuardianAssessment;
 use super::GuardianAssessmentOutcome;
-use super::GuardianRejection;
-use super::GuardianRejectionCircuitBreakerAction;
+use super::GuardianReviewContext;
+use super::approval_request::format_guardian_action_pretty;
 use super::approval_request::guardian_assessment_action;
 use super::approval_request::guardian_request_target_item_id;
 use super::approval_request::guardian_request_turn_id;
 use super::approval_request::guardian_reviewed_action;
-use super::prompt::guardian_output_schema;
-use super::prompt::parse_guardian_assessment;
-use super::review_session::GuardianReviewSessionOutcome;
 use super::review_session::GuardianReviewSessionParams;
 use super::review_session::build_guardian_review_session_config;
+use codex_guardian_reviewer::guardian_output_schema;
 
-const GUARDIAN_REJECTION_INSTRUCTIONS: &str = concat!(
-    "The agent must not attempt to achieve the same outcome via workaround, ",
-    "indirect execution, or policy circumvention. ",
-    "Proceed only with a materially safer alternative, ",
-    "or if the user explicitly approves the action after being informed of the risk. ",
-    "Otherwise, stop and request user input.",
-);
+const GUARDIAN_PLUGIN_ATTRIBUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
-    "The automatic permission approval review did not finish before its deadline. ",
-    "Do not assume the action is unsafe based on the timeout alone. ",
-    "You may retry once, or ask the user for guidance or explicit approval.",
-);
+async fn plugin_attribution_for_guardian_request(
+    context: &GuardianReviewContext,
+    request: &GuardianApprovalRequest,
+) -> Option<PluginCommandAttribution> {
+    let turn = context.turn();
+    match request {
+        GuardianApprovalRequest::ExecCommand {
+            environment_id,
+            command,
+            cwd,
+            ..
+        } => {
+            let turn_environment =
+                context
+                    .environments()
+                    .turn_environments()
+                    .find(|environment| {
+                        environment.selection.environment_id.as_str() == environment_id
+                    })?;
+            if turn_environment.environment.is_remote() {
+                let file_system = turn_environment.environment.get_filesystem();
+                turn.plugin_attribution_for_executor_command(command, cwd, file_system.as_ref())
+                    .await
+            } else {
+                cwd.to_abs_path()
+                    .ok()
+                    .and_then(|cwd| turn.plugin_attribution_for_command(command, &cwd))
+            }
+        }
+        #[cfg(unix)]
+        GuardianApprovalRequest::Execve {
+            program, argv, cwd, ..
+        } => {
+            let command = if argv.is_empty() {
+                vec![program.clone()]
+            } else {
+                std::iter::once(program.clone())
+                    .chain(argv.iter().skip(1).cloned())
+                    .collect()
+            };
+            turn.plugin_attribution_for_command(&command, cwd)
+        }
+        _ => None,
+    }
+}
 
 pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub(crate) async fn guardian_rejection_message(session: &Session, review_id: &str) -> String {
-    let rejection = session
-        .services
-        .guardian_rejections
-        .lock()
-        .await
-        .remove(review_id)
-        .filter(|rejection| !rejection.rationale.trim().is_empty())
-        .unwrap_or_else(|| GuardianRejection {
-            rationale: "Auto-reviewer denied the action without a specific rationale.".to_string(),
-            source: GuardianAssessmentDecisionSource::Agent,
-        });
-    match rejection.source {
-        GuardianAssessmentDecisionSource::Agent => format!(
-            "This action was rejected due to unacceptable risk.\nReason: {}\n{}",
-            rejection.rationale.trim(),
-            GUARDIAN_REJECTION_INSTRUCTIONS
-        ),
+pub(crate) use codex_guardian_reviewer::routes_approval_policy_to_guardian;
+
+pub(crate) fn is_basic_session_source(session_source: &SessionSource) -> bool {
+    match session_source {
+        SessionSource::SubAgent(SubAgentSource::Other(label)) => label == GUARDIAN_REVIEWER_NAME,
+        SessionSource::Internal(InternalSessionSource::Guardian) => true,
+        _ => false,
     }
 }
 
-pub(crate) fn guardian_timeout_message() -> String {
-    GUARDIAN_TIMEOUT_INSTRUCTIONS.to_string()
+#[derive(Clone)]
+pub(crate) struct GuardianReviewOptions {
+    /// Requires Guardian rather than a manual approval; cached evidence may still satisfy it.
+    pub(crate) require_guardian: bool,
+    pub(crate) plugin_attribution_override: Option<PluginCommandAttribution>,
+    pub(crate) approval_request_source: GuardianApprovalRequestSource,
+    pub(crate) external_cancel: Option<CancellationToken>,
+    /// Escalate from extension fast approval to the synchronous Guardian reviewer.
+    pub(crate) require_synchronous_review: bool,
 }
 
-#[derive(Debug)]
-pub(super) enum GuardianReviewOutcome {
-    Completed(GuardianAssessment),
-    Error(GuardianReviewError),
+pub(super) struct GuardianReviewSessionConfig {
+    pub(super) spawn_config: crate::config::Config,
+    pub(super) node_repl_policy: GuardianNodeReplPolicy,
+    pub(super) compaction_model_hash: Option<String>,
+    review_model: ReviewModel,
 }
 
-#[derive(Debug)]
-pub(super) enum GuardianReviewError {
-    PromptBuild { message: String },
-    Session { message: String },
-    Parse { message: String },
-    Timeout,
-    Cancelled,
-}
-
-impl GuardianReviewError {
-    fn prompt_build(err: anyhow::Error) -> Self {
-        Self::PromptBuild {
-            message: err.to_string(),
-        }
-    }
-
-    fn session(err: anyhow::Error) -> Self {
-        Self::Session {
-            message: err.to_string(),
-        }
-    }
-
-    fn parse(err: anyhow::Error) -> Self {
-        Self::Parse {
-            message: err.to_string(),
-        }
-    }
-
-    fn failure_reason(&self) -> GuardianReviewFailureReason {
-        match self {
-            Self::PromptBuild { .. } => GuardianReviewFailureReason::PromptBuildError,
-            Self::Session { .. } => GuardianReviewFailureReason::SessionError,
-            Self::Parse { .. } => GuardianReviewFailureReason::ParseError,
-            Self::Timeout => GuardianReviewFailureReason::Timeout,
-            Self::Cancelled => GuardianReviewFailureReason::Cancelled,
-        }
-    }
-}
-
-fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str {
-    match level {
-        GuardianRiskLevel::Low => "low",
-        GuardianRiskLevel::Medium => "medium",
-        GuardianRiskLevel::High => "high",
-        GuardianRiskLevel::Critical => "critical",
-    }
-}
-
-/// Whether this turn should route allowed approval prompts through the guardian
-/// reviewer instead of surfacing them to the user. ARC may still block actions
-/// earlier in the flow.
-pub(crate) fn routes_approval_to_guardian(turn: &TurnContext) -> bool {
-    matches!(
-        turn.approval_policy.value(),
-        AskForApproval::OnRequest | AskForApproval::Granular(_)
-    ) && turn.config.approvals_reviewer == ApprovalsReviewer::AutoReview
-}
-
-pub(crate) fn is_guardian_reviewer_source(
-    session_source: &codex_protocol::protocol::SessionSource,
-) -> bool {
-    matches!(
-        session_source,
-        codex_protocol::protocol::SessionSource::SubAgent(SubAgentSource::Other(name))
-            if name == GUARDIAN_REVIEWER_NAME
-    )
-}
-
-fn track_guardian_review(
+pub(super) async fn guardian_review_session_config(
     session: &Session,
-    tracking: &GuardianReviewTrackContext,
-    result: GuardianReviewAnalyticsResult,
-) {
-    session
-        .services
-        .analytics_events_client
-        .track_guardian_review(tracking, result);
-}
-
-async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str) {
-    session
-        .services
-        .guardian_rejection_circuit_breaker
-        .lock()
-        .await
-        .record_non_denial(turn_id);
-}
-
-async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>, turn_id: &str) {
-    let action = session
-        .services
-        .guardian_rejection_circuit_breaker
-        .lock()
-        .await
-        .record_denial(turn_id);
-    let GuardianRejectionCircuitBreakerAction::InterruptTurn {
-        consecutive_denials,
-        total_denials,
-    } = action
-    else {
-        return;
+    context: &GuardianReviewContext,
+) -> anyhow::Result<GuardianReviewSessionConfig> {
+    let turn = context.turn();
+    let network_proxy = session.services.network_proxy.load_full();
+    let live_network_config = match network_proxy.as_ref() {
+        Some(network_proxy) => Some(network_proxy.proxy().current_cfg().await?),
+        None => None,
     };
-
-    if session.turn_context_for_sub_id(turn_id).await.is_none() {
-        return;
-    }
-
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianWarning(WarningEvent {
-                message: format!(
-                    "Automatic approval review rejected too many approval requests for this turn ({consecutive_denials} consecutive, {total_denials} total); interrupting the turn."
-                ),
-            }),
-        )
-        .await;
-
-    let runtime_handle = session.services.runtime_handle.clone();
-    let session = Arc::clone(session);
-    let turn_id = turn_id.to_string();
-    let _abort_task = runtime_handle.spawn(async move {
-        session
-            .abort_turn_if_active(&turn_id, TurnAbortReason::Interrupted)
-            .await;
-    });
-}
-
-#[cfg(test)]
-pub(crate) async fn record_guardian_denial_for_test(
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    turn_id: &str,
-) {
-    record_guardian_denial(session, turn, turn_id).await;
-}
-
-/// This function always fails closed: timeouts, review-session failures, and
-/// parse failures all block execution, but timeouts are still surfaced to the
-/// caller as distinct from explicit guardian denials.
-async fn run_guardian_review(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    review_id: String,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-    approval_request_source: GuardianApprovalRequestSource,
-    external_cancel: Option<CancellationToken>,
-) -> ReviewDecision {
-    let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
-    let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
-    let action_summary = guardian_assessment_action(&request);
-    let review_tracking = GuardianReviewTrackContext::new(
-        session.conversation_id.to_string(),
-        assessment_turn_id.clone(),
-        review_id.clone(),
-        target_item_id.clone(),
-        approval_request_source,
-        guardian_reviewed_action(&request),
-        GUARDIAN_REVIEW_TIMEOUT.as_millis() as u64,
-    );
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                id: review_id.clone(),
-                target_item_id: target_item_id.clone(),
-                turn_id: assessment_turn_id.clone(),
-                status: GuardianAssessmentStatus::InProgress,
-                risk_level: None,
-                user_authorization: None,
-                rationale: None,
-                decision_source: None,
-                action: action_summary.clone(),
-            }),
-        )
-        .await;
-
-    if external_cancel
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        track_guardian_review(
-            session.as_ref(),
-            &review_tracking,
-            GuardianReviewAnalyticsResult {
-                decision: GuardianReviewDecision::Aborted,
-                terminal_status: GuardianReviewTerminalStatus::Aborted,
-                failure_reason: Some(GuardianReviewFailureReason::Cancelled),
-                ..GuardianReviewAnalyticsResult::without_session()
-            },
-        );
-        session
-            .send_event(
-                turn.as_ref(),
-                EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                    id: review_id,
-                    target_item_id,
-                    turn_id: assessment_turn_id.clone(),
-                    status: GuardianAssessmentStatus::Aborted,
-                    risk_level: None,
-                    user_authorization: None,
-                    rationale: None,
-                    decision_source: Some(GuardianAssessmentDecisionSource::Agent),
-                    action: action_summary,
-                }),
-            )
-            .await;
-        record_guardian_non_denial(&session, &assessment_turn_id).await;
-        return ReviewDecision::Abort;
-    }
-
-    let schema = guardian_output_schema();
-    let terminal_action = action_summary.clone();
-    let (outcome, analytics_result) = Box::pin(run_guardian_review_session(
-        session.clone(),
-        turn.clone(),
-        request,
-        retry_reason.clone(),
-        schema,
-        external_cancel,
-    ))
-    .await;
-
-    let (assessment, count_denial_for_circuit_breaker) = match outcome {
-        GuardianReviewOutcome::Completed(assessment) => {
-            let approved = matches!(assessment.outcome, GuardianAssessmentOutcome::Allow);
-            track_guardian_review(
-                session.as_ref(),
-                &review_tracking,
-                GuardianReviewAnalyticsResult {
-                    decision: if approved {
-                        GuardianReviewDecision::Approved
-                    } else {
-                        GuardianReviewDecision::Denied
-                    },
-                    terminal_status: if approved {
-                        GuardianReviewTerminalStatus::Approved
-                    } else {
-                        GuardianReviewTerminalStatus::Denied
-                    },
-                    failure_reason: None,
-                    risk_level: Some(assessment.risk_level),
-                    user_authorization: Some(assessment.user_authorization),
-                    outcome: Some(assessment.outcome),
-                    ..analytics_result
-                },
-            );
-            let count_denial_for_circuit_breaker =
-                matches!(assessment.outcome, GuardianAssessmentOutcome::Deny);
-            (assessment, count_denial_for_circuit_breaker)
-        }
-        GuardianReviewOutcome::Error(error) => match error {
-            GuardianReviewError::Timeout => {
-                let rationale =
-                    "Automatic approval review timed out while evaluating the requested approval."
-                        .to_string();
-                track_guardian_review(
-                    session.as_ref(),
-                    &review_tracking,
-                    GuardianReviewAnalyticsResult {
-                        decision: GuardianReviewDecision::Denied,
-                        terminal_status: GuardianReviewTerminalStatus::TimedOut,
-                        failure_reason: Some(error.failure_reason()),
-                        ..analytics_result
-                    },
-                );
-                session
-                    .send_event(
-                        turn.as_ref(),
-                        EventMsg::GuardianWarning(WarningEvent {
-                            message: rationale.clone(),
-                        }),
-                    )
-                    .await;
-                session
-                    .send_event(
-                        turn.as_ref(),
-                        EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                            id: review_id,
-                            target_item_id,
-                            turn_id: assessment_turn_id.clone(),
-                            status: GuardianAssessmentStatus::TimedOut,
-                            risk_level: None,
-                            user_authorization: None,
-                            rationale: Some(rationale),
-                            decision_source: Some(GuardianAssessmentDecisionSource::Agent),
-                            action: terminal_action,
-                        }),
-                    )
-                    .await;
-                record_guardian_non_denial(&session, &assessment_turn_id).await;
-                return ReviewDecision::TimedOut;
-            }
-            GuardianReviewError::Cancelled => {
-                track_guardian_review(
-                    session.as_ref(),
-                    &review_tracking,
-                    GuardianReviewAnalyticsResult {
-                        decision: GuardianReviewDecision::Aborted,
-                        terminal_status: GuardianReviewTerminalStatus::Aborted,
-                        failure_reason: Some(error.failure_reason()),
-                        ..analytics_result
-                    },
-                );
-                session
-                    .send_event(
-                        turn.as_ref(),
-                        EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                            id: review_id,
-                            target_item_id,
-                            turn_id: assessment_turn_id.clone(),
-                            status: GuardianAssessmentStatus::Aborted,
-                            risk_level: None,
-                            user_authorization: None,
-                            rationale: None,
-                            decision_source: Some(GuardianAssessmentDecisionSource::Agent),
-                            action: action_summary,
-                        }),
-                    )
-                    .await;
-                record_guardian_non_denial(&session, &assessment_turn_id).await;
-                return ReviewDecision::Abort;
-            }
-            GuardianReviewError::PromptBuild { .. }
-            | GuardianReviewError::Session { .. }
-            | GuardianReviewError::Parse { .. } => {
-                let message = match &error {
-                    GuardianReviewError::PromptBuild { message }
-                    | GuardianReviewError::Session { message }
-                    | GuardianReviewError::Parse { message } => message,
-                    GuardianReviewError::Timeout | GuardianReviewError::Cancelled => {
-                        "guardian review failed"
-                    }
-                };
-                let rationale = format!("Automatic approval review failed: {message}");
-                track_guardian_review(
-                    session.as_ref(),
-                    &review_tracking,
-                    GuardianReviewAnalyticsResult {
-                        decision: GuardianReviewDecision::Denied,
-                        terminal_status: GuardianReviewTerminalStatus::FailedClosed,
-                        failure_reason: Some(error.failure_reason()),
-                        ..analytics_result
-                    },
-                );
-                (
-                    GuardianAssessment {
-                        risk_level: GuardianRiskLevel::High,
-                        user_authorization: GuardianUserAuthorization::Unknown,
-                        outcome: GuardianAssessmentOutcome::Deny,
-                        rationale,
-                    },
-                    false,
+    let (review_model, guardian_model_info) =
+        super::reviewer_config::resolve_review_model(session, context).await;
+    let reviewer_config = session
+        .services
+        .thread_extension_data
+        .get::<codex_guardian_reviewer::ReviewerConfig<crate::config::Config>>()
+        .ok_or_else(|| anyhow::anyhow!("Guardian reviewer configuration is not installed"))?;
+    let model_messages = ResolvedModelMessages::from_model(&guardian_model_info);
+    let mut spawn_config = build_guardian_review_session_config(
+        (reviewer_config.0)(turn.config.as_ref())?,
+        live_network_config,
+        review_model.model.as_str(),
+        review_model.reasoning_effort.clone(),
+        context.reasoning_summary,
+        context.personality,
+        model_messages,
+    )?;
+    if context.model_info.computer_use_review_required() {
+        spawn_config
+            .features
+            .enable(Feature::RetainClientDeveloperMessages)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "guardian review session could not preserve REPL developer policy: {error}"
                 )
-            }
-        },
-    };
-
-    let approved = match assessment.outcome {
-        GuardianAssessmentOutcome::Allow => true,
-        GuardianAssessmentOutcome::Deny => false,
-    };
-    let verdict = if approved { "approved" } else { "denied" };
-    let user_authorization = match assessment.user_authorization {
-        GuardianUserAuthorization::Unknown => "unknown",
-        GuardianUserAuthorization::Low => "low",
-        GuardianUserAuthorization::Medium => "medium",
-        GuardianUserAuthorization::High => "high",
-    };
-    let warning = format!(
-        "Automatic approval review {verdict} (risk: {}, authorization: {user_authorization}): {}",
-        guardian_risk_level_str(assessment.risk_level),
-        assessment.rationale
-    );
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianWarning(WarningEvent { message: warning }),
-        )
-        .await;
-    let status = if approved {
-        GuardianAssessmentStatus::Approved
-    } else {
-        GuardianAssessmentStatus::Denied
-    };
-    {
-        let mut rationales = session.services.guardian_rejections.lock().await;
-        if approved {
-            rationales.remove(&review_id);
-        } else {
-            let rejection = GuardianRejection {
-                rationale: assessment.rationale.clone(),
-                source: GuardianAssessmentDecisionSource::Agent,
-            };
-            rationales.insert(review_id.clone(), rejection);
-        }
+            })?;
     }
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianAssessment(GuardianAssessmentEvent {
-                id: review_id,
-                target_item_id,
-                turn_id: assessment_turn_id.clone(),
-                status,
-                risk_level: Some(assessment.risk_level),
-                user_authorization: Some(assessment.user_authorization),
-                rationale: Some(assessment.rationale.clone()),
-                decision_source: Some(GuardianAssessmentDecisionSource::Agent),
-                action: terminal_action,
-            }),
-        )
-        .await;
-
-    if count_denial_for_circuit_breaker {
-        record_guardian_denial(&session, &turn, &assessment_turn_id).await;
-    } else {
-        record_guardian_non_denial(&session, &assessment_turn_id).await;
+    if review_model.model != context.model_info.slug {
+        spawn_config.model_context_window = None;
+        spawn_config.model_auto_compact_token_limit = None;
     }
-
-    if approved {
-        ReviewDecision::Approved
-    } else {
-        ReviewDecision::Denied
-    }
-}
-
-/// Public entrypoint for approval requests that should be reviewed by guardian.
-pub(crate) async fn review_approval_request(
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    review_id: String,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-) -> ReviewDecision {
-    // Box the delegated review future so callers do not inline the entire
-    // guardian session state machine into their own async stack.
-    Box::pin(run_guardian_review(
-        Arc::clone(session),
-        Arc::clone(turn),
-        review_id,
-        request,
-        retry_reason,
-        GuardianApprovalRequestSource::MainTurn,
-        /*external_cancel*/ None,
-    ))
-    .await
-}
-
-pub(crate) async fn review_approval_request_with_cancel(
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    review_id: String,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-    approval_request_source: GuardianApprovalRequestSource,
-    cancel_token: CancellationToken,
-) -> ReviewDecision {
-    run_guardian_review(
-        Arc::clone(session),
-        Arc::clone(turn),
-        review_id,
-        request,
-        retry_reason,
-        approval_request_source,
-        Some(cancel_token),
-    )
-    .await
-}
-
-pub(crate) fn spawn_approval_request_review(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    review_id: String,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-    approval_request_source: GuardianApprovalRequestSource,
-    cancel_token: CancellationToken,
-) -> oneshot::Receiver<ReviewDecision> {
-    let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = tx.send(ReviewDecision::Denied);
-            return;
-        };
-        let decision = runtime.block_on(review_approval_request_with_cancel(
-            &session,
-            &turn,
-            review_id,
-            request,
-            retry_reason,
-            approval_request_source,
-            cancel_token,
-        ));
-        let _ = tx.send(decision);
-    });
-    rx
+    Ok(GuardianReviewSessionConfig {
+        spawn_config,
+        compaction_model_hash: guardian_model_info.comp_hash.clone(),
+        node_repl_policy: GuardianNodeReplPolicy::from_messages(model_messages),
+        review_model,
+    })
 }
 
 /// Runs the guardian in a locked-down reusable review session.
@@ -607,72 +188,25 @@ pub(crate) fn spawn_approval_request_review(
 /// context. It may still reuse the parent's managed-network allowlist for
 /// read-only checks, but it intentionally runs without inherited exec-policy
 /// rules.
-pub(super) async fn run_guardian_review_session(
+async fn run_guardian_review_session_before_deadline(
     session: Arc<Session>,
-    turn: Arc<TurnContext>,
+    context: GuardianReviewContext,
     request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
+    reasons: ApprovalRequestReasons,
     schema: serde_json::Value,
     external_cancel: Option<CancellationToken>,
+    deadline: Instant,
 ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
-    let live_network_config = match session.services.network_proxy.as_ref() {
-        Some(network_proxy) => match network_proxy.proxy().current_cfg().await {
-            Ok(config) => Some(config),
-            Err(err) => {
-                return (
-                    GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
-                    GuardianReviewAnalyticsResult::without_session(),
-                );
-            }
-        },
-        None => None,
-    };
-    let available_models = session
-        .services
-        .models_manager
-        .list_models(codex_models_manager::manager::RefreshStrategy::Offline)
-        .await;
-    let preferred_reasoning_effort = |supports_low: bool, fallback| {
-        if supports_low {
-            Some(codex_protocol::openai_models::ReasoningEffort::Low)
-        } else {
-            fallback
-        }
-    };
-    let preferred_model = available_models
-        .iter()
-        .find(|preset| preset.model == super::GUARDIAN_PREFERRED_MODEL);
-    let (guardian_model, guardian_reasoning_effort) = if let Some(preset) = preferred_model {
-        let reasoning_effort = preferred_reasoning_effort(
-            preset
-                .supported_reasoning_efforts
-                .iter()
-                .any(|effort| effort.effort == codex_protocol::openai_models::ReasoningEffort::Low),
-            Some(preset.default_reasoning_effort),
+    let Some(pool) = session.guardian_review_session() else {
+        return (
+            GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(anyhow::anyhow!(
+                "Guardian extension is not installed for this thread"
+            ))),
+            GuardianReviewAnalyticsResult::without_session(),
         );
-        (
-            super::GUARDIAN_PREFERRED_MODEL.to_string(),
-            reasoning_effort,
-        )
-    } else {
-        let reasoning_effort = preferred_reasoning_effort(
-            turn.model_info
-                .supported_reasoning_levels
-                .iter()
-                .any(|preset| preset.effort == codex_protocol::openai_models::ReasoningEffort::Low),
-            turn.reasoning_effort
-                .or(turn.model_info.default_reasoning_level),
-        );
-        (turn.model_info.slug.clone(), reasoning_effort)
     };
-    let guardian_config = build_guardian_review_session_config(
-        turn.config.as_ref(),
-        live_network_config.clone(),
-        guardian_model.as_str(),
-        guardian_reasoning_effort,
-    );
-    let guardian_config = match guardian_config {
-        Ok(config) => config,
+    let session_config = match guardian_review_session_config(session.as_ref(), &context).await {
+        Ok(session_config) => session_config,
         Err(err) => {
             return (
                 GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
@@ -680,93 +214,77 @@ pub(super) async fn run_guardian_review_session(
             );
         }
     };
-
-    let (session_outcome, session_analytics_result) = Box::pin(
-        session
-            .guardian_review_session
-            .run_review(GuardianReviewSessionParams {
+    let (session_outcome, session_analytics_result) =
+        Box::pin(super::review_session::run_guardian_review_session(
+            pool,
+            GuardianReviewSessionParams {
                 parent_session: Arc::clone(&session),
-                parent_turn: turn.clone(),
-                spawn_config: guardian_config,
+                parent_context: context.clone(),
+                parent_history: session.clone_history().await,
+                spawn_config: session_config.spawn_config,
+                node_repl_policy: session_config.node_repl_policy,
                 request,
-                retry_reason,
+                reasons,
                 schema,
-                model: guardian_model,
-                reasoning_effort: guardian_reasoning_effort,
-                reasoning_summary: turn.reasoning_summary,
-                personality: turn.personality,
+                review_model: session_config.review_model,
+                compaction_model_hash: session_config.compaction_model_hash,
+                reasoning_summary: context.reasoning_summary,
+                personality: context.personality,
                 external_cancel,
-            }),
-    )
-    .await;
+                deadline,
+            },
+        ))
+        .await;
 
-    match session_outcome {
-        GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) => match last_agent_message
-        {
-            Some(last_agent_message) => {
-                match parse_guardian_assessment(Some(&last_agent_message)) {
-                    Ok(assessment) => (
-                        GuardianReviewOutcome::Completed(assessment),
-                        session_analytics_result,
-                    ),
-                    Err(err) => (
-                        GuardianReviewOutcome::Error(GuardianReviewError::parse(err)),
-                        session_analytics_result,
-                    ),
-                }
-            }
-            None => (
-                GuardianReviewOutcome::Error(GuardianReviewError::session(anyhow::anyhow!(
-                    "guardian review completed without an assessment payload"
-                ))),
-                session_analytics_result,
-            ),
-        },
-        GuardianReviewSessionOutcome::Completed(Err(err)) => (
-            GuardianReviewOutcome::Error(GuardianReviewError::session(err)),
-            session_analytics_result,
-        ),
-        GuardianReviewSessionOutcome::PromptBuildFailed(err) => (
-            GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
-            session_analytics_result,
-        ),
-        GuardianReviewSessionOutcome::SessionFailed(err) => (
-            GuardianReviewOutcome::Error(GuardianReviewError::session(err)),
-            session_analytics_result,
-        ),
-        GuardianReviewSessionOutcome::TimedOut => (
-            GuardianReviewOutcome::Error(GuardianReviewError::Timeout),
-            session_analytics_result,
-        ),
-        GuardianReviewSessionOutcome::Aborted => (
-            GuardianReviewOutcome::Error(GuardianReviewError::Cancelled),
-            session_analytics_result,
-        ),
-    }
+    (session_outcome.into(), session_analytics_result)
 }
 
 #[cfg(test)]
-mod review_tests {
-    use super::*;
+pub(super) async fn run_guardian_review_session_with_retry(
+    session: Arc<Session>,
+    context: impl Into<GuardianReviewContext>,
+    request: GuardianApprovalRequest,
+    reasons: ApprovalRequestReasons,
+    schema: serde_json::Value,
+    external_cancel: Option<CancellationToken>,
+    max_attempts: i64,
+) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
+    run_guardian_review_session_with_retry_before_deadline(
+        session,
+        context,
+        request,
+        reasons,
+        schema,
+        external_cancel,
+        GuardianReviewSessionLimits {
+            max_attempts,
+            deadline: Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
+        },
+    )
+    .await
+}
 
-    #[test]
-    fn guardian_review_error_reason_distinguishes_error_kinds() {
-        let parse_error = GuardianReviewError::parse(anyhow::anyhow!("bad guardian JSON"));
-        let prompt_error = GuardianReviewError::prompt_build(anyhow::anyhow!("bad prompt/config"));
-        let session_error =
-            GuardianReviewError::session(anyhow::anyhow!("guardian runtime failed"));
-
-        assert!(matches!(
-            parse_error.failure_reason(),
-            GuardianReviewFailureReason::ParseError
-        ));
-        assert!(matches!(
-            prompt_error.failure_reason(),
-            GuardianReviewFailureReason::PromptBuildError
-        ));
-        assert!(matches!(
-            session_error.failure_reason(),
-            GuardianReviewFailureReason::SessionError
-        ));
-    }
+#[cfg(test)]
+async fn run_guardian_review_session_with_retry_before_deadline(
+    session: Arc<Session>,
+    context: impl Into<GuardianReviewContext>,
+    request: GuardianApprovalRequest,
+    reasons: ApprovalRequestReasons,
+    schema: serde_json::Value,
+    external_cancel: Option<CancellationToken>,
+    limits: GuardianReviewSessionLimits,
+) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
+    let context = context.into();
+    codex_guardian_reviewer::run_with_retry(limits, external_cancel.as_ref(), |deadline| {
+        run_guardian_review_session_before_deadline(
+            Arc::clone(&session),
+            context.clone(),
+            request.clone(),
+            reasons.clone(),
+            schema.clone(),
+            external_cancel.clone(),
+            deadline,
+        )
+    })
+    .await
 }

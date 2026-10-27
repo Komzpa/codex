@@ -5,6 +5,10 @@
 - an HTTP proxy (default `127.0.0.1:3128`)
 - a SOCKS5 proxy (default `127.0.0.1:8081`, enabled by default)
 
+On Windows, managed HTTP listeners prefer ports `3128-3159`, and SOCKS5 listeners prefer ports
+`8081-8112`. An explicitly configured port is attempted first. If every preferred port is occupied,
+the proxy preserves its existing ephemeral loopback fallback.
+
 It enforces an allow/deny policy and a "limited" mode intended for read-only network access.
 
 ## Quickstart
@@ -33,14 +37,18 @@ allow_upstream_proxy = true
 # If you want to expose these listeners beyond localhost, you must opt in explicitly.
 dangerously_allow_non_loopback_proxy = false
 mode = "full" # default when unset; use "limited" for read-only mode
-# When true, HTTPS CONNECT can be terminated so limited-mode method policy still applies.
-mitm = false
-# CA cert/key are managed internally under $CODEX_HOME/proxy/ (ca.pem + ca.key).
+# HTTPS MITM is enabled automatically when `mode = "limited"` or when MITM hooks are configured.
+# The CA private key remains in proxy memory. When MITM is active, spawned commands receive CA
+# bundle env vars pointing at immutable public files under $CODEX_HOME/proxy/ so common HTTPS
+# clients trust the managed CA.
 
 # If false, local/private networking is rejected. Explicit allowlisting of local IP literals
 # (or `localhost`) is required to permit them.
 # Hostnames that resolve to local/private IPs are still blocked even if allowlisted.
-allow_local_binding = false
+# Clients that always bypass proxies for loopback, such as Go's `net/http`, remain blocked by
+# the operating-system sandbox when local binding is disabled.
+# Omitted: true for MXC, false elsewhere. MXC rejects an effective false.
+# allow_local_binding = false
 
 # DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any
 # absolute socket path from `x-unix-socket`.
@@ -57,6 +65,17 @@ dangerously_allow_all_unix_sockets = false
 "::1" = "allow"
 "evil.example" = "deny"
 
+# MITM hooks match HTTPS requests after CONNECT is terminated.
+[permissions.workspace.network.mitm.hooks.github_write]
+host = "api.github.com"
+methods = ["POST", "PUT"]
+path_prefixes = ["/repos/openai/"]
+action = ["strip_auth"]
+
+# Named actions can be shared across hooks and overridden by higher-precedence config layers.
+[permissions.workspace.network.mitm.actions.strip_auth]
+strip_request_headers = ["authorization"]
+
 # macOS-only: allows proxying to a unix socket when request includes `x-unix-socket: /path`.
 [permissions.workspace.network.unix_sockets]
 "/tmp/example.sock" = "allow"
@@ -64,8 +83,33 @@ dangerously_allow_all_unix_sockets = false
 
 ### 2) Run the proxy
 
+The proxy can also run without a full Codex permissions profile. Put the network policy in a
+standalone JSON file:
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "proxy_url": "http://127.0.0.1:3128",
+    "enable_socks5": false,
+    "enable_socks5_udp": false,
+    "allow_upstream_proxy": false,
+    "allow_local_binding": false,
+    "mode": "full",
+    "mitm": false,
+    "domains": {
+      "api.example.com": "allow"
+    }
+  }
+}
+```
+
+HTTPS MITM is enabled automatically for limited mode or configured `mitm_hooks`. Set `mitm` to
+`true` to enable it explicitly. The proxy requires `network.enabled = true` and rejects unknown
+fields, including fields nested inside MITM hooks.
+
 ```bash
-cargo run -p codex-network-proxy --
+cargo run -p codex-network-proxy -- --config /path/to/network-proxy.json
 ```
 
 ### 3) Point a client at it
@@ -95,9 +139,9 @@ When a request is blocked, the proxy responds with `403` and includes:
   - `blocked-by-method-policy`
   - `blocked-by-policy`
 
-In "limited" mode, only `GET`, `HEAD`, and `OPTIONS` are allowed. HTTPS `CONNECT` requests require
-MITM to enforce limited-mode method policy; otherwise they are blocked. SOCKS5 remains blocked in
-limited mode.
+In "limited" mode, only `GET`, `HEAD`, and `OPTIONS` are allowed. HTTPS `CONNECT` requests and
+HTTPS SOCKS5 TCP targets on `:443` require MITM to enforce limited-mode method policy; otherwise
+they are blocked. SOCKS5 UDP and non-HTTPS SOCKS5 TCP remain blocked in limited mode.
 
 Websocket clients typically tunnel `wss://` through HTTPS `CONNECT`; those CONNECT targets still go
 through the same host allowlist/denylist checks.
@@ -196,6 +240,9 @@ what it can reasonably guarantee.
 
 - Allowlist-first policy: if `domains` has no `allow` entries, requests are blocked until an allowlist is configured.
 - Domain patterns: exact hosts are supported, `*.example.com` matches subdomains only, and `**.example.com` matches the apex plus subdomains; the global `*` wildcard is only accepted when explicitly enabled for allowlist compilation and is otherwise rejected.
+- Within a domain pattern, `?` matches exactly one character, including a dot. For example,
+  `api?.example.com` matches `api1.example.com`, but not `api.example.com` or `api12.example.com`.
+  It can be combined with `*`, `*.`, and `**.` in both allow and deny entries.
 - Deny wins: `domains` entries marked `deny` always override the allowlist.
 - Local/private network protection: when `allow_local_binding = false`, the proxy blocks loopback
   and common private/link-local ranges. Explicit allowlisting of local IP literals (or `localhost`)
@@ -203,7 +250,8 @@ what it can reasonably guarantee.
   allowlisted (best-effort DNS lookup).
 - Limited mode enforcement:
   - only `GET`, `HEAD`, and `OPTIONS` are allowed
-  - HTTPS `CONNECT` remains a tunnel; limited-mode method enforcement does not apply to HTTPS
+  - HTTPS `CONNECT` requests and HTTPS SOCKS5 TCP targets on `:443` require MITM so the proxy can
+    enforce limited-mode method policy; SOCKS5 UDP and non-HTTPS SOCKS5 TCP remain blocked
 - Listener safety defaults:
   - the HTTP proxy listener clamps non-loopback binds unless explicitly enabled via
     `dangerously_allow_non_loopback_proxy`

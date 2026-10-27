@@ -9,28 +9,31 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Block;
+use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use ratatui::widgets::Wrap;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
-use crate::render::Insets;
-use crate::render::RectExt as _;
+use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
+use crate::key_hint::is_plain_text_key_event;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::skills_helpers::match_skill;
-use crate::skills_helpers::truncate_skill_name;
 use crate::style::user_message_style;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
+use super::picker_rows::render_rows_single_line;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
-use super::selection_popup_common::render_rows_single_line;
 
 const SEARCH_PLACEHOLDER: &str = "Type to search skills";
-const SEARCH_PROMPT_PREFIX: &str = "> ";
 
 pub(crate) struct SkillsToggleItem {
     pub name: String,
@@ -49,15 +52,25 @@ pub(crate) struct SkillsToggleView {
     footer_hint: Line<'static>,
     search_query: String,
     filtered_indices: Vec<usize>,
+    keymap: ListKeymap,
 }
 
 impl SkillsToggleView {
-    pub(crate) fn new(items: Vec<SkillsToggleItem>, app_event_tx: AppEventSender) -> Self {
+    pub(crate) fn new(
+        items: Vec<SkillsToggleItem>,
+        app_event_tx: AppEventSender,
+        keymap: ListKeymap,
+    ) -> Self {
         let mut header = ColumnRenderable::new();
-        header.push(Line::from("Enable/Disable Skills".bold()));
-        header.push(Line::from(
-            "Turn skills on or off. Your changes are saved automatically.".dim(),
-        ));
+        header.push(
+            Paragraph::new(Line::from("Enable/Disable Skills".bold())).wrap(Wrap { trim: false }),
+        );
+        header.push(
+            Paragraph::new(Line::from(
+                "Turn skills on or off. Your changes are saved automatically.".dim(),
+            ))
+            .wrap(Wrap { trim: false }),
+        );
 
         let mut view = Self {
             items,
@@ -65,9 +78,10 @@ impl SkillsToggleView {
             complete: false,
             app_event_tx,
             header: Box::new(header),
-            footer_hint: skills_toggle_hint_line(),
+            footer_hint: skills_toggle_hint_line(&keymap),
             search_query: String::new(),
             filtered_indices: Vec::new(),
+            keymap,
         };
         view.apply_filter();
         view
@@ -135,9 +149,10 @@ impl SkillsToggleView {
                     let is_selected = self.state.selected_idx == Some(visible_idx);
                     let prefix = if is_selected { '›' } else { ' ' };
                     let marker = if item.enabled { 'x' } else { ' ' };
-                    let item_name = truncate_skill_name(&item.name);
+                    let item_name = &item.name;
                     let name = format!("{prefix} [{marker}] {item_name}");
                     GenericDisplayRow {
+                        selection_style: Some(super::picker_style::selection_style()),
                         name,
                         description: Some(item.description.clone()),
                         ..Default::default()
@@ -159,6 +174,30 @@ impl SkillsToggleView {
         self.state.move_down_wrap(len);
         let visible = Self::max_visible_rows(len);
         self.state.ensure_visible(len, visible);
+    }
+
+    fn page_up(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.page_up_clamped(len, visible);
+    }
+
+    fn page_down(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.page_down_clamped(len, visible);
+    }
+
+    fn jump_top(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.jump_top(len, visible);
+    }
+
+    fn jump_bottom(&mut self) {
+        let len = self.visible_len();
+        let visible = Self::max_visible_rows(len);
+        self.state.jump_bottom(len, visible);
     }
 
     fn toggle_selected(&mut self) {
@@ -189,45 +228,40 @@ impl SkillsToggleView {
             .list_skills(Vec::new(), /*force_reload*/ true);
     }
 
-    fn rows_width(total_width: u16) -> u16 {
-        total_width.saturating_sub(2)
-    }
-
     fn rows_height(&self, rows: &[GenericDisplayRow]) -> u16 {
-        rows.len().clamp(1, MAX_POPUP_ROWS).try_into().unwrap_or(1)
+        (rows.len().clamp(/*min*/ 1, MAX_POPUP_ROWS) as u16).saturating_add(/*rhs*/ 2)
     }
 }
 
 impl BottomPaneView for SkillsToggleView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        // Printable characters always feed search. Movement aliases such as
+        // plain j/k only apply through non-text events or modified bindings.
+        let allow_plain_char_navigation = !is_plain_text_key_event(key_event);
+
         match key_event {
-            KeyEvent {
-                code: KeyCode::Up, ..
+            _ if allow_plain_char_navigation && self.keymap.move_up.is_pressed(key_event) => {
+                self.move_up()
             }
-            | KeyEvent {
-                code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.move_down.is_pressed(key_event) => {
+                self.move_down()
             }
-            | KeyEvent {
-                code: KeyCode::Char('\u{0010}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^P */ => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.page_up.is_pressed(key_event) => {
+                self.page_up()
             }
-            | KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
+            _ if allow_plain_char_navigation && self.keymap.page_down.is_pressed(key_event) => {
+                self.page_down()
             }
-            | KeyEvent {
-                code: KeyCode::Char('\u{000e}'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } /* ^N */ => self.move_down(),
+            _ if allow_plain_char_navigation && self.keymap.jump_top.is_pressed(key_event) => {
+                self.jump_top()
+            }
+            _ if allow_plain_char_navigation && self.keymap.jump_bottom.is_pressed(key_event) => {
+                self.jump_bottom()
+            }
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -239,15 +273,9 @@ impl BottomPaneView for SkillsToggleView {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
             } => self.toggle_selected(),
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
+            _ if self.keymap.accept.is_pressed(key_event) => self.toggle_selected(),
+            _ if self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
             KeyEvent {
@@ -282,7 +310,13 @@ impl Renderable for SkillsToggleView {
         let mut height = self.header.desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 3);
         height = height.saturating_add(2);
-        height.saturating_add(1)
+        height.saturating_add(
+            super::selection_popup_common::wrap_styled_line(
+                &self.footer_hint,
+                width.saturating_sub(/*rhs*/ 2),
+            )
+            .len() as u16,
+        )
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -290,9 +324,15 @@ impl Renderable for SkillsToggleView {
             return;
         }
 
-        // Reserve the footer line for the key-hint row.
-        let [content_area, footer_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+        let hint_lines = super::selection_popup_common::wrap_styled_line(
+            &self.footer_hint,
+            area.width.saturating_sub(/*rhs*/ 2),
+        );
+        let [content_area, footer_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(hint_lines.len() as u16),
+        ])
+        .areas(area);
 
         Block::default()
             .style(user_message_style())
@@ -302,33 +342,13 @@ impl Renderable for SkillsToggleView {
             .header
             .desired_height(content_area.width.saturating_sub(4));
         let rows = self.build_rows();
-        let rows_width = Self::rows_width(content_area.width);
         let rows_height = self.rows_height(&rows);
-        let [header_area, _, search_area, list_area] = Layout::vertical([
-            Constraint::Max(header_height),
-            Constraint::Max(1),
-            Constraint::Length(2),
-            Constraint::Length(rows_height),
-        ])
-        .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
+        let [header_area, search_area, render_area] =
+            super::picker_rows::layout(content_area, header_height, /*search*/ 1, rows_height);
 
         self.header.render(header_area, buf);
 
-        // Render the search prompt as two lines to mimic the composer.
-        if search_area.height >= 2 {
-            let [placeholder_area, input_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(search_area);
-            Line::from(SEARCH_PLACEHOLDER.dim()).render(placeholder_area, buf);
-            let line = if self.search_query.is_empty() {
-                Line::from(vec![SEARCH_PROMPT_PREFIX.dim()])
-            } else {
-                Line::from(vec![
-                    SEARCH_PROMPT_PREFIX.dim(),
-                    self.search_query.clone().into(),
-                ])
-            };
-            line.render(input_area, buf);
-        } else if search_area.height > 0 {
+        if search_area.height > 0 {
             let query_span = if self.search_query.is_empty() {
                 SEARCH_PLACEHOLDER.dim()
             } else {
@@ -337,13 +357,7 @@ impl Renderable for SkillsToggleView {
             Line::from(query_span).render(search_area, buf);
         }
 
-        if list_area.height > 0 {
-            let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
-                y: list_area.y,
-                width: rows_width.max(1),
-                height: list_area.height,
-            };
+        if render_area.height > 0 {
             render_rows_single_line(
                 render_area,
                 buf,
@@ -360,20 +374,30 @@ impl Renderable for SkillsToggleView {
             width: footer_area.width.saturating_sub(2),
             height: footer_area.height,
         };
-        self.footer_hint.clone().dim().render(hint_area, buf);
+        Paragraph::new(hint_lines).dim().render(hint_area, buf);
     }
 }
 
-fn skills_toggle_hint_line() -> Line<'static> {
-    Line::from(vec![
-        "Press ".into(),
-        key_hint::plain(KeyCode::Char(' ')).into(),
-        " or ".into(),
-        key_hint::plain(KeyCode::Enter).into(),
-        " to toggle; ".into(),
-        key_hint::plain(KeyCode::Esc).into(),
-        " to close".into(),
-    ])
+fn skills_toggle_hint_line(keymap: &ListKeymap) -> Line<'static> {
+    let space = key_hint::plain(KeyCode::Char(' '));
+    let accept = keymap
+        .primary_hint(ListAction::Accept)
+        .filter(|binding| *binding != ShortcutHint::Single(space));
+    let cancel = keymap.primary_hint(ListAction::Cancel);
+
+    let mut toggle = space.display_label();
+    if let Some(accept) = accept {
+        toggle.push('/');
+        toggle.push_str(&accept.display_label());
+    }
+    let mut spans = key_hint::key_label_spans(&toggle);
+    spans.push(" toggle".dim());
+    if let Some(cancel) = cancel {
+        spans.push(" · ".dim());
+        spans.extend(cancel.spans());
+        spans.push(" close".dim());
+    }
+    spans.into()
 }
 
 #[cfg(test)]
@@ -383,6 +407,7 @@ mod tests {
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
     use insta::assert_snapshot;
+    use pretty_assertions::assert_eq;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -409,6 +434,25 @@ mod tests {
         lines.join("\n")
     }
 
+    fn long_name_items() -> Vec<SkillsToggleItem> {
+        vec![
+            SkillsToggleItem {
+                name: "superpowers-systematic-debugging (polish)".to_string(),
+                skill_name: "polish:superpowers-systematic-debugging".to_string(),
+                description: "Find root causes before fixing bugs".to_string(),
+                enabled: true,
+                path: test_path_buf("/tmp/skills/systematic-debugging/SKILL.md").abs(),
+            },
+            SkillsToggleItem {
+                name: "superpowers-verification-before-completion (polish)".to_string(),
+                skill_name: "polish:superpowers-verification-before-completion".to_string(),
+                description: "Verify completion before claiming success".to_string(),
+                enabled: false,
+                path: test_path_buf("/tmp/skills/verification-before-completion/SKILL.md").abs(),
+            },
+        ]
+    }
+
     #[test]
     fn renders_basic_popup() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
@@ -429,7 +473,104 @@ mod tests {
                 path: test_path_buf("/tmp/skills/changelog_writer.toml").abs(),
             },
         ];
-        let view = SkillsToggleView::new(items, tx);
+        let view = SkillsToggleView::new(items, tx, crate::keymap::RuntimeKeymap::defaults().list);
         assert_snapshot!("skills_toggle_basic", render_lines(&view, /*width*/ 72));
+    }
+
+    #[test]
+    fn build_rows_preserves_full_skill_display_names() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = SkillsToggleView::new(
+            long_name_items(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        let row_names = view
+            .build_rows()
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            row_names,
+            vec![
+                "› [x] superpowers-systematic-debugging (polish)",
+                "  [ ] superpowers-verification-before-completion (polish)",
+            ]
+        );
+    }
+
+    #[test]
+    fn filtering_long_skill_names_preserves_the_matching_row() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = SkillsToggleView::new(
+            long_name_items(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+        view.search_query = "completion".to_string();
+        view.apply_filter();
+
+        let row_names = view
+            .build_rows()
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            row_names,
+            vec!["› [ ] superpowers-verification-before-completion (polish)"]
+        );
+    }
+
+    #[test]
+    fn renders_long_names_using_available_width() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = SkillsToggleView::new(
+            long_name_items(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        assert_snapshot!(
+            "skills_toggle_long_names_use_available_width",
+            render_lines(&view, /*width*/ 96)
+        );
+    }
+
+    #[test]
+    fn renders_long_names_at_narrow_width() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = SkillsToggleView::new(
+            long_name_items(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        assert_snapshot!(
+            "skills_toggle_long_names_at_narrow_width",
+            render_lines(&view, /*width*/ 48)
+        );
+    }
+
+    #[test]
+    fn footer_hint_uses_list_keymap_accept_and_cancel() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut keymap = crate::keymap::RuntimeKeymap::defaults().list;
+        keymap.accept = vec![key_hint::ctrl(KeyCode::Char('t'))];
+        keymap.cancel = vec![key_hint::ctrl(KeyCode::Char('x'))];
+        let view = SkillsToggleView::new(Vec::new(), tx, keymap);
+        let rendered = render_lines(&view, /*width*/ 72);
+
+        assert!(rendered.contains("ctrl+t"));
+        assert!(rendered.contains("ctrl+x"));
+        assert!(!rendered.contains("enter"));
+        assert!(!rendered.contains("esc"));
     }
 }

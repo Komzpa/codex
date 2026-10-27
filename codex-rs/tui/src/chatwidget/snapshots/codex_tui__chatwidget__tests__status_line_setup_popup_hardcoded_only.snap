@@ -6,15 +6,15 @@ expression: status_line_popup_snapshot(&mut chat)
   Select which items to display in the status line.
 
   Type to search
-  >
+
 › [x] Use theme colors      Apply colors from the active /theme
   ───────────────────────
   [x] project-name          Project name (omitted when unavailable)
   [x] git-branch            Current Git branch (omitted when unavailable)
-  [x] thread-title          Current thread title (omitted when unavailable)
+  [x] thread-title          Current thread title, or thread identifier when unnamed
   [ ] model                 Current model name
   [ ] model-with-reasoning  Current model name with reasoning level
-  [ ] current-dir           Current working directory
-
+  [ ] reasoning             Current reasoning level
+↓
   my-project · feat/awesome-feature · thread title
-  Use ↑↓ to navigate, ←→ to move, space to select, enter to confirm, esc to cancel.
+  space toggle · ←/→ reorder · enter save · esc cancel

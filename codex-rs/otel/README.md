@@ -39,15 +39,37 @@ let settings = OtelSettings {
         tls: None,
     },
     metrics_exporter: OtelExporter::None,
+    span_attributes: std::collections::BTreeMap::new(),
+    tracestate: std::collections::BTreeMap::new(),
 };
 
-if let Some(provider) = OtelProvider::from(&settings)? {
+if let Some(provider) = OtelProvider::try_new(&settings)? {
     let registry = tracing_subscriber::registry()
         .with(provider.logger_layer())
         .with(provider.tracing_layer());
     registry.init();
 }
 ```
+
+Configured span attributes and W3C tracestate member fields are applied to
+exported trace spans and propagated trace context:
+
+```toml
+[otel.span_attributes]
+"example.trace_attr" = "enabled"
+
+[otel.tracestate.example]
+alpha = "one"
+beta = "two"
+```
+
+Configured tracestate members and encoded values must be valid W3C tracestate.
+Each nested table is encoded as semicolon-separated `key:value` fields inside
+that member. If propagated trace context already has the named member, Codex
+upserts configured fields and preserves other fields in that member. This
+config shape does not support setting opaque tracestate member values. Invalid
+trace metadata entries are ignored during config load and reported as startup
+warnings.
 
 ## SessionTelemetry (events)
 
@@ -121,6 +143,26 @@ let metrics = MetricsClient::new(MetricsConfig::in_memory(
 metrics.counter("codex.turns", 1, &[("model", "gpt-5.1")])?;
 metrics.shutdown()?; // flushes in-memory exporter
 ```
+
+## WebSocket continuation
+
+`codex.websocket.continuation` counts `response.create` send attempts, including
+failed sends. It carries existing session tags plus `mode` (`incremental`/`full`),
+`phase` (`warmup`/`generation`), and `reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `incremental` | Send the previous response ID and new input. |
+| `no_previous_request` | First request from a fresh client. |
+| `restored_history` | First request after loading resumed or forked history. |
+| `connection_closed` | Full input after observing the previous socket closed. |
+| `other` | Full input for another reason, such as changed input/settings or unavailable response state. |
+
+Per-socket backend metrics label a resend after reconnect as `initial`; this client
+metric retains the first reset reason through reconnect failures and turn boundaries.
+Include warmups (`generate=false`), which can send full input before an incremental
+generation. Closes may be intentional; restored history includes manual resumes/forks.
+This measures client send attempts, not disconnect rates or engine cache reuse.
 
 ## Trace context
 
