@@ -1916,7 +1916,7 @@ impl AppServerSession {
     ) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadQueuedFollowupCountUpdateResponse = self
-            .client
+            .request_handle
             .request_typed(ClientRequest::ThreadQueuedFollowupCountUpdate {
                 request_id,
                 params: ThreadQueuedFollowupCountUpdateParams {

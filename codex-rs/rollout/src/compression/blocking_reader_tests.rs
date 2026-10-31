@@ -53,7 +53,7 @@ async fn cancellation_during_read_does_not_deliver_the_record() -> anyhow::Resul
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);
     let task = tokio::spawn(scan_lines(
-        io::BufReader::new(reader).lines(),
+        io::BufReader::new(reader.take(u64::MAX)).lines(),
         ReadMetrics::default(),
         move |lines| {
             for line in lines {

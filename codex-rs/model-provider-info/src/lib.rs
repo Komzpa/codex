@@ -696,6 +696,7 @@ other non-default provider fields are not supported"
             project_id: None,
             location: None,
             credential_file: None,
+            usage_url: None,
             include_internal_metadata: false,
         }
     }

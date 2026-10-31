@@ -14,7 +14,6 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::compaction_status_from_result;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_fall_back_to_local_compaction;
-use crate::compact_model_fallback::should_fall_back_to_local_compaction;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
@@ -969,6 +968,11 @@ mod tests {
     #[test]
     fn build_v2_compacted_history_preserves_retained_metadata_sidecar() {
         let retained = message("user", "keep", /*phase*/ None);
+        let selected_skill = message(
+            "user",
+            "<skill>\n<name>demo</name>\n<path>/tmp/demo/SKILL.md</path>\nRetain this skill body.\n</skill>",
+            /*phase*/ None,
+        );
         let generated_notice = message(
             "developer",
             "<image_resize_notice>generated</image_resize_notice>",
@@ -996,6 +1000,7 @@ mod tests {
                     harness.clone(),
                     client.clone(),
                     retained.clone(),
+                    selected_skill.clone(),
                     generated_notice.clone(),
                 ],
                 vec![
@@ -1004,6 +1009,7 @@ mod tests {
                         client_authored: true,
                         ..Default::default()
                     }),
+                    Some(CodexHarnessMetadata::default()),
                     Some(CodexHarnessMetadata::default()),
                     None,
                 ],
@@ -1014,6 +1020,10 @@ mod tests {
             let mut expected = vec![
                 ResponseItemEnvelope {
                     item: retained.clone(),
+                    metadata: Some(CodexHarnessMetadata::default()),
+                },
+                ResponseItemEnvelope {
+                    item: selected_skill.clone(),
                     metadata: Some(CodexHarnessMetadata::default()),
                 },
                 ResponseItemEnvelope::new(generated_notice.clone()),

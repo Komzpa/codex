@@ -127,6 +127,7 @@ async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()
                     token_budget: GoalTokenBudgetUpdate::Keep,
                     max_goal_token_budget: None,
                 },
+                std::future::ready(Ok(())),
             )
             .await?;
         outcome.apply_runtime_effects(&harness.goal_service).await;
@@ -157,6 +158,7 @@ async fn goal_context_tracks_current_objective_and_status() -> anyhow::Result<()
                     token_budget: GoalTokenBudgetUpdate::Keep,
                     max_goal_token_budget: None,
                 },
+                std::future::ready(Ok(())),
             )
             .await?;
         outcome.apply_runtime_effects(&harness.goal_service).await;
@@ -240,6 +242,7 @@ async fn sampling_reminders_follow_delivery_and_ancestor_state() -> anyhow::Resu
                 timezone: None,
                 stages: None,
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     output.apply_runtime_effects(&root.goal_service).await;
@@ -1653,7 +1656,7 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     let result = api
         .set_thread_goal(
             runtime.as_ref(),
-            request,
+            request.clone(),
             std::future::ready(Err(failure.clone())),
         )
         .await;
@@ -2302,5 +2305,19 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+    }
+}
+
+trait FragmentText {
+    fn text(&self) -> &str;
+}
+
+impl FragmentText for codex_extension_api::PromptFragment {
+    fn text(&self) -> &str {
+        match self.content() {
+            codex_extension_api::ContentItem::InputText { text }
+            | codex_extension_api::ContentItem::OutputText { text, .. } => text,
+            other => panic!("expected text prompt fragment, got {other:?}"),
+        }
     }
 }

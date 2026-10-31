@@ -128,15 +128,8 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                         .and_then(Value::as_str)
                         .unwrap_or("Server is draining")
                         .to_string();
-                    let delay =
-                        extract_header(headers.as_ref(), http::header::RETRY_AFTER.as_str())
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .map(std::time::Duration::from_secs);
-                    let error = CodexErr::new(CodexErrorDetails::ServerDraining(message));
-                    return match delay {
-                        Some(delay) => error.with_retry_delay(delay),
-                        None => error,
-                    };
+                    // `map_api_error` attaches the server's Retry-After advice to every HTTP error.
+                    return CodexErr::new(CodexErrorDetails::ServerDraining(message));
                 }
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE

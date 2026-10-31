@@ -234,15 +234,17 @@ fn map_api_error_maps_server_draining_503_to_delayed_retry() {
         url: Some("http://example.com/backend-api/codex/responses".to_string()),
         headers: Some(headers),
         body: Some(body),
+        retry_after: RetryAfter::from_delay(std::time::Duration::from_secs(2)),
     }));
 
     let CodexErrorDetails::ServerDraining(message) = err.details() else {
         panic!("expected server-draining retry, got {err:?}");
     };
     assert_eq!(message, "Server is draining");
-    assert_eq!(
-        err.server_retry_delay(),
-        Some(std::time::Duration::from_secs(2))
+    // Server advice is stored as a deadline, so the remaining delay shrinks as time passes.
+    let delay = err.server_retry_delay().expect("server-advised delay");
+    assert!(
+        delay > std::time::Duration::from_secs(1) && delay <= std::time::Duration::from_secs(2)
     );
 }
 

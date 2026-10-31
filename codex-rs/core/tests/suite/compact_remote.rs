@@ -1591,6 +1591,8 @@ async fn remote_mid_turn_compact_v2_preserves_terminal_transaction_correction_an
     let initial_history = vec![RolloutItem::ResponseItem(ResponseItemEnvelope {
         item: ResponseItem::Message {
             id: None,
+            encrypted_content: None,
+            status: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: selected_skill.to_string(),

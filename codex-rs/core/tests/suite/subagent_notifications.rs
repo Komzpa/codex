@@ -3707,11 +3707,13 @@ async fn spawn_agent_rejects_reasoning_effort_unsupported_by_role_model() -> Res
         .single_request()
         .function_call_output_content_and_success(SPAWN_CALL_ID)
         .expect("spawn_agent output");
-    assert_eq!(
-        output.as_deref(),
-        Some(
-            "Reasoning effort `ultra` is not supported for model `gpt-5.5`. Supported reasoning efforts: low, medium, high, xhigh"
-        )
+    // Local patch: a role that changes the model drops the inherited/default effort instead of
+    // validating it against the role model, so the spawn succeeds with the model's own default.
+    let output = output.expect("spawn_agent output");
+    let value: serde_json::Value = serde_json::from_str(&output)?;
+    assert!(
+        value.get("agent_id").is_some(),
+        "spawn should succeed after the role clears the unsupported effort: {output}"
     );
     Ok(())
 }

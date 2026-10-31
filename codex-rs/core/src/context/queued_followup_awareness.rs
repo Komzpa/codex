@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// Bounded, content-free awareness of later TUI follow-ups.
 pub(crate) struct QueuedFollowupAwareness {
@@ -32,13 +34,13 @@ impl ContextualUserFragment for QueuedFollowupAwareness {
         )
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         if self.count == 0 {
-            return "The user has 0 queued follow-up messages. This clears any earlier queue notice; do not assume another user iteration is pending. Continue the current task normally.".to_string();
+            return input_text("The user has 0 queued follow-up messages. This clears any earlier queue notice; do not assume another user iteration is pending. Continue the current task normally.".to_string());
         }
-        format!(
+        input_text(format!(
             "The user has {} queued follow-up messages. This supersedes earlier queue counts. Their contents are withheld until the next normal turn. Finish the meaningful current work, report remaining checks and yield when practical. Defer optional exhaustive tests to the next iteration; required correctness and safety checks still apply.",
             self.count
-        )
+        ))
     }
 }

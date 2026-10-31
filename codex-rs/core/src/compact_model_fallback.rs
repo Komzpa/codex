@@ -38,16 +38,22 @@ pub(crate) fn should_retry_with_current_model(
 /// presents itself as OpenAI while routing to third-party models is treated as if it could serve
 /// remote compaction. Those models cannot produce a `compaction` item, and the proxy may reject the
 /// request outright, so a model- or provider-specific failure retries with local compaction instead
-/// of aborting the turn. Aborts and tool collisions are never retried.
+/// of aborting the turn. Aborts, tool collisions and account-level rejections are never retried
+/// locally, and neither are failures that carry server retry advice: the server called them
+/// temporary and asked the client to wait, so swapping implementations would defeat that advice.
 pub(crate) fn should_fall_back_to_local_compaction(error: &CodexErr) -> bool {
-    !matches!(
-        error.details(),
-        CodexErrorDetails::TurnAborted
-            | CodexErrorDetails::Interrupted
-            | CodexErrorDetails::SessionBudgetExceeded
-            | CodexErrorDetails::ResponseIncomplete(_)
-            | CodexErrorDetails::ToolCollision(_)
-    )
+    error.retry_after().is_none()
+        && !matches!(
+            error.details(),
+            CodexErrorDetails::TurnAborted
+                | CodexErrorDetails::Interrupted
+                | CodexErrorDetails::SessionBudgetExceeded
+                | CodexErrorDetails::ResponseIncomplete(_)
+                | CodexErrorDetails::ToolCollision(_)
+                | CodexErrorDetails::UsageNotIncluded
+                | CodexErrorDetails::QuotaExceeded
+                | CodexErrorDetails::RateLimitExceeded(_)
+        )
 }
 
 pub(crate) fn record_model_fallback(
@@ -108,6 +114,7 @@ mod tests {
             rate_limits: None,
             promo_message: None,
             rate_limit_reached_type: None,
+            limit_window_minutes: None,
         });
         assert!(should_fall_back_to_local_compaction(&usage_limit));
         assert!(should_fall_back_to_local_compaction(
@@ -127,6 +134,27 @@ mod tests {
         ));
         assert!(should_fall_back_to_local_compaction(
             &CodexErr::InternalServerError
+        ));
+    }
+
+    #[test]
+    fn never_falls_back_to_local_compaction_for_account_level_or_advised_failures() {
+        assert!(!should_fall_back_to_local_compaction(
+            &CodexErr::UsageNotIncluded
+        ));
+        assert!(!should_fall_back_to_local_compaction(
+            &CodexErr::QuotaExceeded
+        ));
+        let advised = CodexErr::ServerOverloaded.with_retry_after(
+            codex_http_client::RetryAfter::from_delay(std::time::Duration::from_secs(3))
+                .expect("retry advice"),
+        );
+        assert!(!should_fall_back_to_local_compaction(&advised));
+        assert!(!should_fall_back_to_local_compaction(&CodexErr::new(
+            CodexErrorDetails::RateLimitExceeded("slow down".to_string())
+        )));
+        assert!(should_fall_back_to_local_compaction(
+            &CodexErr::ServerOverloaded
         ));
     }
 

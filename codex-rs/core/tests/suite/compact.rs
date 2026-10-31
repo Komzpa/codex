@@ -1019,7 +1019,8 @@ async fn reasoning_effort_override_remote_v2_compaction_resets_pinned_effort(
                 ev_completed("r2"),
             ]),
             if fail_compaction {
-                sse_failed("r3", "server_error", "compaction failed")
+                // Account-level rejections do not fall back to local compaction.
+                sse_failed("r3", "insufficient_quota", "compaction failed")
             } else {
                 remote_v2_compaction_response()
             },

@@ -784,17 +784,14 @@ pub(crate) async fn run_turn(
                     }
                     if stop_outcome.should_compact && !hook_requested_compaction {
                         hook_requested_compaction = true;
-                        if let Err(AutoCompactError { error: err, .. }) = run_auto_compact(
+                        if let Err(err) = run_auto_compact(
                             &sess,
                             Arc::clone(&step_context),
-                            /*fallback_step_context*/ None,
+                            Arc::clone(&step_context),
                             &mut client_session,
-                            InitialContextInjection::BeforeLastUserMessage {
-                                world_state: Arc::clone(&world_state),
-                                step_context: Arc::clone(&step_context),
-                            },
                             CompactionReason::HookRequested,
                             CompactionPhase::MidTurn,
+                            /*candidate*/ None,
                         )
                         .await
                         {
@@ -802,8 +799,12 @@ pub(crate) async fn run_turn(
                                 return Err(err);
                             }
                             let error = err.to_codex_protocol_error();
-                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                                .await;
+                            sess.emit_turn_error_lifecycle(
+                                turn_context.as_ref(),
+                                error.clone(),
+                                err.details(),
+                            )
+                            .await;
                             return Ok(None);
                         }
                         if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -1692,7 +1693,7 @@ async fn run_auto_compact_with_implementation(
     phase: CompactionPhase,
     candidate: Option<Box<BackgroundCompactionCandidate>>,
 ) -> Result<bool, AutoCompactError> {
-    let turn_context = &step_context.turn;
+    let turn_context = Arc::clone(&step_context.turn);
     if matches!(phase, CompactionPhase::PreTurn)
         && crate::guardian::is_basic_session_source(&turn_context.session_source)
         && !crate::guardian::should_compact_guardian_input(sess)?
@@ -1734,7 +1735,7 @@ async fn run_auto_compact_with_implementation(
             }
             let fallback = if has_candidate && matches!(reason, CompactionReason::ContextLimit) {
                 let status =
-                    super::context_window::context_window_token_status(sess, turn_context).await;
+                    super::context_window::context_window_token_status(sess, &turn_context).await;
                 let required = match phase {
                     CompactionPhase::PostTurn => status.turn_end_compaction_threshold_reached,
                     CompactionPhase::PreTurn
@@ -1774,7 +1775,7 @@ async fn run_auto_compact_with_implementation(
                     );
                     run_inline_auto_compact_task(
                         Arc::clone(sess),
-                        Arc::clone(turn_context),
+                        Arc::clone(&turn_context),
                         replacement_step_context,
                         world_state,
                         reason,
@@ -1811,7 +1812,7 @@ async fn run_auto_compact_with_implementation(
             );
             run_inline_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
+                Arc::clone(&turn_context),
                 replacement_step_context,
                 world_state,
                 reason,

@@ -511,7 +511,7 @@ async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
         .and_then(|tools| tools.send_user_message_async.as_ref())
         .and_then(|tool| tool.description.as_deref())
         .unwrap_or(
-            "Ask the user one or more questions during ongoing work. Use this tool only to request missing information, preferences, constraints, clarification, or approval. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Keep questions concise, self-contained, and easy to understand, using a level of detail appropriate to the user and task. The UI always allows a free-text answer, including when suggested options are provided. A preselected option is not submitted automatically.",
+            "Ask the user an unresolved question whose answer will materially change the work. Use this tool only to request missing information, preferences, constraints, clarification, or required approval. Use commentary for progress, status, acknowledgements, and actions already authorized. Never use this tool for a notification or a message saying no answer or confirmation is needed. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Keep questions concise, self-contained, and easy to understand, using a level of detail appropriate to the user and task. The UI always allows a free-text answer, including when suggested options are provided. A preselected option is not submitted automatically.",
         )
         .to_string();
     let test = test_codex()

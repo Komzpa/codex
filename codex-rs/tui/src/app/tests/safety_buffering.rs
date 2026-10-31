@@ -280,6 +280,8 @@ async fn safety_recourse_handles_a_policy_block() -> Result<()> {
                 Some("Excluded objective".into()),
                 Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
                 /*token_budget*/ None,
+                /*timezone*/ None,
+                /*stages*/ None,
             )
             .await?
             .goal;
