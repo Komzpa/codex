@@ -135,10 +135,12 @@ impl GoalQuotaProvider {
     /// Refresh the observed scope without postponing the usage refresh for other
     /// sessions' key spend.
     pub async fn observe_response(&self, limit: codex_protocol::protocol::RateLimitSnapshot) {
-        let identity = self.current_identity().await;
+        // Resolving the identity can run a command-backed credential helper; skip it for
+        // responses that carry no quota data.
         if !has_quota_data(&limit) {
             return;
         }
+        let identity = self.current_identity().await;
         let scope_id = self.response_scope_id(&identity);
         let mut cache = self.cache.lock().await;
         if cache
@@ -371,14 +373,17 @@ impl GoalQuotaProvider {
                 .map(|value| format!("{:?}", value.auth_mode()))
                 .unwrap_or_else(|| "none".to_string());
             let auth_fingerprint = match provider.api_auth().await {
-                Ok(auth_provider) => {
-                    let mut hasher = Sha1::new();
-                    for (name, value) in auth_provider.to_auth_headers().iter() {
-                        hasher.update(name.as_str().as_bytes());
-                        hasher.update(value.as_bytes());
+                Ok(auth_provider) => match auth_provider.to_auth_headers() {
+                    Ok(headers) => {
+                        let mut hasher = Sha1::new();
+                        for (name, value) in headers.iter() {
+                            hasher.update(name.as_str().as_bytes());
+                            hasher.update(value.as_bytes());
+                        }
+                        format!("{:x}", hasher.finalize())
                     }
-                    format!("{:x}", hasher.finalize())
-                }
+                    Err(_) => "auth-error".to_string(),
+                },
                 Err(_) => "auth-error".to_string(),
             };
             return format!(

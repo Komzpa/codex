@@ -26,8 +26,14 @@ where
     let lines: BlockingLineReader = match reader.inner {
         RolloutLineReaderInner::Plain(lines) => {
             // The fresh reader has no buffered data to preserve when converting the file.
-            let file = lines.into_inner().into_inner().into_std().await;
-            io::BufReader::new(Box::new(file) as Box<dyn io::Read + Send>).lines()
+            let limited = lines.into_inner();
+            let remaining = limited.limit();
+            let file = limited.into_inner().into_inner().into_std().await;
+            io::BufReader::new(io::Read::take(
+                Box::new(file) as Box<dyn io::Read + Send>,
+                remaining,
+            ))
+            .lines()
         }
         RolloutLineReaderInner::Blocking(Some(lines)) => lines,
         RolloutLineReaderInner::Blocking(None) => {

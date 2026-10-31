@@ -308,7 +308,7 @@ impl fmt::Debug for CodexErr {
             CodexErrorDetails::ServerDraining(message) => formatter
                 .debug_tuple("ServerDraining")
                 .field(message)
-                .field(&self.server_retry_delay)
+                .field(&self.server_retry_delay())
                 .finish(),
             details => fmt::Debug::fmt(details, formatter),
         }

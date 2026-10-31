@@ -24,6 +24,8 @@ fn annotated(item: ResponseItem) -> ResponseItemEnvelope {
 fn message(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
+        encrypted_content: None,
+        status: None,
         role: role.to_string(),
         content: vec![ContentItem::InputText {
             text: text.to_string(),
@@ -36,6 +38,8 @@ fn message(role: &str, text: &str) -> ResponseItem {
 fn function_call(call_id: &str, name: &str) -> ResponseItem {
     ResponseItem::FunctionCall {
         id: None,
+        encrypted_content: None,
+        status: None,
         name: name.to_string(),
         namespace: None,
         arguments: "{}".to_string(),
@@ -162,6 +166,7 @@ fn recognizes_supported_terminal_transaction_types() {
     let custom = vec![
         envelope(ResponseItem::CustomToolCall {
             id: None,
+            encrypted_content: None,
             status: Some("completed".to_string()),
             call_id: "custom-1".to_string(),
             name: "js_repl".to_string(),
@@ -180,6 +185,7 @@ fn recognizes_supported_terminal_transaction_types() {
     let search = vec![
         envelope(ResponseItem::ToolSearchCall {
             id: None,
+            encrypted_content: None,
             call_id: Some("search-1".to_string()),
             status: Some("completed".to_string()),
             execution: "client".to_string(),
@@ -198,6 +204,7 @@ fn recognizes_supported_terminal_transaction_types() {
     let shell = vec![
         envelope(ResponseItem::LocalShellCall {
             id: None,
+            encrypted_content: None,
             call_id: Some("shell-1".to_string()),
             status: LocalShellStatus::Completed,
             action: LocalShellAction::Exec(LocalShellExecAction {
