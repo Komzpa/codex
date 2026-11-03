@@ -9,7 +9,6 @@ use codex_config::RequirementSource;
 use codex_config::Sourced;
 
 use codex_config::config_toml::ConfigToml;
-use codex_config::profile_toml::ConfigProfile;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
@@ -51,7 +50,9 @@ impl ManagedFeatures {
         )
     }
 
-    pub(crate) fn from_configured_with_warnings(
+    /// Applies managed feature requirements and dependency normalization to
+    /// configured features, collecting warnings for unsupported requirements.
+    pub fn from_configured_with_warnings(
         configured_features: Features,
         feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
         startup_warnings: &mut Vec<String>,
@@ -117,6 +118,29 @@ impl ManagedFeatures {
         self.set(next)
     }
 
+    /// Refresh ordinary MCP feature values and pins without changing session-static features.
+    pub(crate) fn refresh_mcp_features(&mut self, next: &Self) -> ConstraintResult<()> {
+        let mut refreshed = self.clone();
+        let mut values = self.get().clone();
+        for feature in [
+            Feature::EnableMcpApps,
+            Feature::McpConnectionSharing,
+            Feature::SecretAuthStorage,
+            Feature::McpOAuthRefreshCoordination,
+        ] {
+            values.set_enabled(feature, next.enabled(feature));
+            if let Some(enabled) = next.pinned_features.get(&feature) {
+                refreshed.pinned_features.insert(feature, *enabled);
+            } else {
+                refreshed.pinned_features.remove(&feature);
+            }
+        }
+        refreshed.value.source = next.value.source.clone().or(refreshed.value.source);
+        refreshed.set(values)?;
+        *self = refreshed;
+        Ok(())
+    }
+
     pub fn enable(&mut self, feature: Feature) -> ConstraintResult<()> {
         self.set_enabled(feature, /*enabled*/ true)
     }
@@ -153,6 +177,12 @@ fn normalize_candidate(
     mut candidate: Features,
     pinned_features: &BTreeMap<Feature, bool>,
 ) -> Features {
+    // Legacy user opt-outs selected the removed shell backend. Only managed
+    // requirements may disable the remaining unified-exec implementation.
+    if !pinned_features.contains_key(&Feature::UnifiedExec) {
+        candidate.enable(Feature::UnifiedExec);
+    }
+
     for (feature, enabled) in pinned_features {
         candidate.set_enabled(*feature, *enabled);
     }
@@ -211,6 +241,39 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
+        if key == Feature::Personality.key() {
+            continue;
+        }
+        if matches!(
+            key.as_str(),
+            "daemon_auto_start" | "worktrees" | "realtime_conversation"
+        ) {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; availability no longer depends on this feature flag."
+                ),
+            );
+            continue;
+        }
+        if matches!(key.as_str(), "shell_zsh_fork" | "unified_exec_zsh_fork") {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; the patched zsh backend has been removed."
+                ),
+            );
+            continue;
+        }
+        if key == Feature::GuardianThreadContext.key() {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; thread-owned Guardian context is always enabled."
+                ),
+            );
+            continue;
+        }
         if key == "auto_review" {
             pinned_features.insert(Feature::GuardianApproval, enabled);
             continue;
@@ -269,48 +332,6 @@ fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature
             enabled,
         ));
     }
-    if let Some(enabled) = cfg.experimental_use_freeform_apply_patch {
-        explicit_settings.push((
-            "experimental_use_freeform_apply_patch".to_string(),
-            Feature::ApplyPatchFreeform,
-            enabled,
-        ));
-    }
-    for (profile_name, profile) in &cfg.profiles {
-        if let Some(features) = profile.features.as_ref() {
-            for (key, enabled) in features.entries() {
-                if let Some(feature) = feature_for_key(&key) {
-                    explicit_settings.push((
-                        format!("profiles.{profile_name}.features.{key}"),
-                        feature,
-                        enabled,
-                    ));
-                }
-            }
-        }
-        if let Some(enabled) = profile.include_apply_patch_tool {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.include_apply_patch_tool"),
-                Feature::ApplyPatchFreeform,
-                enabled,
-            ));
-        }
-        if let Some(enabled) = profile.experimental_use_unified_exec_tool {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.experimental_use_unified_exec_tool"),
-                Feature::UnifiedExec,
-                enabled,
-            ));
-        }
-        if let Some(enabled) = profile.experimental_use_freeform_apply_patch {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.experimental_use_freeform_apply_patch"),
-                Feature::ApplyPatchFreeform,
-                enabled,
-            ));
-        }
-    }
-
     explicit_settings
 }
 
@@ -360,52 +381,13 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<()> {
-    fn validate_profile(
-        cfg: &ConfigToml,
-        profile_name: Option<&str>,
-        profile: &ConfigProfile,
-        feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-    ) -> std::io::Result<()> {
-        let configured_features = Features::from_sources(
-            FeatureConfigSource {
-                features: cfg.features.as_ref(),
-                include_apply_patch_tool: None,
-                experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
-                experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-            },
-            FeatureConfigSource {
-                features: profile.features.as_ref(),
-                include_apply_patch_tool: profile.include_apply_patch_tool,
-                experimental_use_freeform_apply_patch: profile
-                    .experimental_use_freeform_apply_patch,
-                experimental_use_unified_exec_tool: profile.experimental_use_unified_exec_tool,
-            },
-            FeatureOverrides::default(),
-        );
-        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())
-            .map(|_| ())
-            .map_err(|err| {
-                if let Some(profile_name) = profile_name {
-                    std::io::Error::new(
-                        err.kind(),
-                        format!(
-                            "invalid feature configuration for profile `{profile_name}`: {err}"
-                        ),
-                    )
-                } else {
-                    err
-                }
-            })
-    }
-
-    validate_profile(
-        cfg,
-        /*profile_name*/ None,
-        &ConfigProfile::default(),
-        feature_requirements,
-    )?;
-    for (profile_name, profile) in &cfg.profiles {
-        validate_profile(cfg, Some(profile_name), profile, feature_requirements)?;
-    }
-    Ok(())
+    let configured_features = Features::from_sources(
+        FeatureConfigSource {
+            features: cfg.features.as_ref(),
+            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
 }

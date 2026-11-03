@@ -1,19 +1,25 @@
 //! Hot-path helpers for recording upstream inference attempts.
 //!
-//! The model client should not need to know whether rollout tracing is enabled.
 //! A disabled context records nothing, which keeps one-shot HTTP calls,
-//! WebSocket reuse, and retry/fallback attempts on the same code path.
+//! WebSocket reuse, and retry/fallback attempts on the same lifecycle path.
+//! Transport callers can check whether terminal records need output items
+//! before retaining them.
 
 use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
+use http::HeaderMap;
+use http::HeaderValue;
 use serde::Serialize;
+use serde::Serializer;
+use serde::ser::Error;
+use serde::ser::SerializeSeq;
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
@@ -23,7 +29,7 @@ use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
 
-static NEXT_INFERENCE_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+const INFERENCE_CALL_ID_HEADER: &str = "x-codex-inference-call-id";
 
 /// Turn-local inference tracing context.
 ///
@@ -86,7 +92,7 @@ struct TracedResponseStreamOutput<'a> {
     response_id: Option<&'a str>,
     upstream_request_id: Option<&'a str>,
     token_usage: Option<&'a TokenUsage>,
-    output_items: Vec<JsonValue>,
+    output_items: TraceResponseItems<'a>,
 }
 
 impl InferenceTraceContext {
@@ -140,7 +146,40 @@ impl InferenceTraceAttempt {
         }
     }
 
-    /// Records the exact request object about to be sent to the model provider.
+    /// Whether terminal trace records need the completed output items.
+    pub fn needs_output_items(&self) -> bool {
+        matches!(&self.state, InferenceTraceAttemptState::Enabled(_))
+    }
+
+    fn inference_call_id(&self) -> Option<&str> {
+        match &self.state {
+            InferenceTraceAttemptState::Disabled => None,
+            InferenceTraceAttemptState::Enabled(attempt) => {
+                Some(attempt.inference_call_id.as_str())
+            }
+        }
+    }
+
+    /// Adds rollout-trace propagation headers for this attempt when tracing is enabled.
+    pub fn add_request_headers(&self, headers: &mut HeaderMap) {
+        let Some(inference_call_id) = self.inference_call_id() else {
+            return;
+        };
+        let Ok(inference_call_id) = HeaderValue::from_str(inference_call_id) else {
+            // These IDs are generated internally as UUID strings, so rejection
+            // should be impossible in practice. Tracing remains best-effort,
+            // though, and must never make provider requests fail.
+            return;
+        };
+
+        headers.insert(INFERENCE_CALL_ID_HEADER, inference_call_id);
+    }
+
+    /// Records the request payload replay should treat as the model-visible inference input.
+    ///
+    /// This is usually the exact provider request. Callers may instead pass a
+    /// logical request when the transport omits already-sent input, such as
+    /// websocket reuse after an untraced warmup response.
     pub fn record_started(&self, request: &impl Serialize) {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
@@ -288,12 +327,8 @@ impl InferenceTraceAttempt {
 /// The protocol serializer intentionally omits some readable reasoning content
 /// when shaping items for later model requests. Rollout traces need the item as
 /// Codex received it, so this helper restores that content in the raw payload.
-pub(crate) fn trace_response_item_json(item: &ResponseItem) -> JsonValue {
-    let mut value = serde_json::to_value(item).unwrap_or_else(|err| {
-        serde_json::json!({
-            "serialization_error": err.to_string(),
-        })
-    });
+fn trace_response_item_json(item: &ResponseItem) -> serde_json::Result<JsonValue> {
+    let mut value = serde_json::to_value(item)?;
 
     if let ResponseItem::Reasoning {
         content: Some(content),
@@ -301,22 +336,28 @@ pub(crate) fn trace_response_item_json(item: &ResponseItem) -> JsonValue {
     } = item
         && let JsonValue::Object(object) = &mut value
     {
-        object.insert(
-            "content".to_string(),
-            serde_json::to_value(content).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "serialization_error": err.to_string(),
-                })
-            }),
-        );
+        object.insert("content".to_string(), serde_json::to_value(content)?);
     }
 
-    value
+    Ok(value)
+}
+
+/// Serializes response evidence one item at a time, propagating failures to the writer.
+pub(crate) struct TraceResponseItems<'a>(pub &'a [ResponseItem]);
+
+impl Serialize for TraceResponseItems<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for item in self.0 {
+            let value = trace_response_item_json(item).map_err(S::Error::custom)?;
+            sequence.serialize_element(&value)?;
+        }
+        sequence.end()
+    }
 }
 
 fn next_inference_call_id() -> InferenceCallId {
-    let ordinal = NEXT_INFERENCE_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    format!("inference:{ordinal}")
+    Uuid::new_v4().to_string()
 }
 
 fn write_json_payload_best_effort(
@@ -338,7 +379,7 @@ fn write_response_payload_best_effort(
         response_id,
         upstream_request_id,
         token_usage,
-        output_items: output_items.iter().map(trace_response_item_json).collect(),
+        output_items: TraceResponseItems(output_items),
     };
     write_json_payload_best_effort(
         &attempt.context.writer,
@@ -362,6 +403,7 @@ fn append_with_context_best_effort(
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::ResponseItemId;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
@@ -371,6 +413,44 @@ mod tests {
     use super::*;
     use crate::model::ExecutionStatus;
     use crate::replay_bundle;
+
+    #[test]
+    fn disabled_attempt_adds_no_request_headers() {
+        let mut headers = HeaderMap::new();
+
+        InferenceTraceAttempt::disabled().add_request_headers(&mut headers);
+
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = Arc::new(TraceWriter::create(
+            temp.path(),
+            "trace-1".to_string(),
+            "rollout-1".to_string(),
+            "thread-root".to_string(),
+        )?);
+        let context = InferenceTraceContext::enabled(
+            writer,
+            "thread-root".to_string(),
+            "turn-1".to_string(),
+            "gpt-test".to_string(),
+            "test-provider".to_string(),
+        );
+        let attempt = context.start_attempt();
+        let mut headers = HeaderMap::new();
+
+        attempt.add_request_headers(&mut headers);
+
+        let header = headers
+            .get(INFERENCE_CALL_ID_HEADER)
+            .expect("inference header present");
+        assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
+        assert!(Uuid::parse_str(header.to_str()?).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()> {
@@ -429,7 +509,7 @@ mod tests {
     #[test]
     fn traced_response_item_preserves_reasoning_content_omitted_by_normal_serializer() {
         let item = ResponseItem::Reasoning {
-            id: "rs-1".to_string(),
+            id: Some(ResponseItemId::with_suffix("rs", "1")),
             summary: vec![ReasoningItemReasoningSummary::SummaryText {
                 text: "summary".to_string(),
             }],
@@ -437,16 +517,18 @@ mod tests {
                 text: "raw reasoning".to_string(),
             }]),
             encrypted_content: Some("encoded".to_string()),
+            internal_chat_message_metadata_passthrough: None,
         };
 
         let normal = serde_json::to_value(&item).expect("response item serializes");
-        let traced = trace_response_item_json(&item);
+        let traced = trace_response_item_json(&item).expect("trace item serializes");
 
         assert_eq!(normal.get("content"), None);
         assert_eq!(
             traced,
             json!({
                 "type": "reasoning",
+                "id": "rs_1",
                 "summary": [{"type": "summary_text", "text": "summary"}],
                 "content": [{"type": "text", "text": "raw reasoning"}],
                 "encrypted_content": "encoded",

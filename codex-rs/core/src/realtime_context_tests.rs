@@ -13,10 +13,10 @@ use chrono::Utc;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_thread_store::StoredThread;
 use core_test_support::PathBufExt;
@@ -29,9 +29,14 @@ use tempfile::TempDir;
 
 fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThread {
     StoredThread {
+        creator_user_id: None,
+        creator_account_id: None,
+        originator: None,
         thread_id: ThreadId::new(),
+        extra_config: None,
         rollout_path: Some(PathBuf::from("/tmp/rollout.jsonl")),
         forked_from_id: None,
+        parent_thread_id: None,
         preview: first_user_message.to_string(),
         name: (!title.is_empty()).then(|| title.to_string()),
         model_provider: "test-provider".to_string(),
@@ -45,10 +50,21 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
             .timestamp_opt(1_709_251_200, 0)
             .single()
             .expect("valid timestamp"),
+        recency_at: Utc
+            .timestamp_opt(1_709_251_200, 0)
+            .single()
+            .expect("valid timestamp"),
         archived_at: None,
+        project_id: None,
+        daybreak_enabled: None,
+        section: None,
+        section_position: None,
+        section_entered_at: None,
         cwd: PathBuf::from(cwd),
         cli_version: "test".to_string(),
         source: SessionSource::Cli,
+        history_mode: Default::default(),
+        thread_source: None,
         agent_nickname: None,
         agent_role: None,
         agent_path: None,
@@ -58,7 +74,7 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
             repository_url: None,
         }),
         approval_mode: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: PermissionProfile::read_only(),
         token_usage: None,
         first_user_message: Some(first_user_message.to_string()),
         history: None,
@@ -67,10 +83,13 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
 
 fn message(role: &str, content: ContentItem) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![content],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -79,7 +98,14 @@ fn user_message(text: impl Into<String>) -> ResponseItem {
 }
 
 fn assistant_message(text: impl Into<String>) -> ResponseItem {
-    message("assistant", ContentItem::OutputText { text: text.into() })
+    message(
+        "assistant",
+        ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: text.into(),
+        },
+    )
 }
 
 fn long_turn_text(index: usize) -> String {

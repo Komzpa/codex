@@ -30,8 +30,8 @@ use portable_pty::PtySystem;
 use portable_pty::SlavePty;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::mem::ManuallyDrop;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::RawHandle;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use winapi::um::wincon::COORD;
@@ -82,13 +82,15 @@ impl RawConPty {
         self.con.raw_handle()
     }
 
-    pub fn into_raw_handles(self) -> (RawHandle, RawHandle, RawHandle) {
+    pub fn into_handles(self) -> (PsuedoCon, FileDescriptor, FileDescriptor) {
         let me = ManuallyDrop::new(self);
-        (
-            me.con.raw_handle(),
-            me.input_write.as_raw_handle(),
-            me.output_read.as_raw_handle(),
-        )
+        unsafe {
+            (
+                ptr::read(&me.con),
+                ptr::read(&me.input_write),
+                ptr::read(&me.output_read),
+            )
+        }
     }
 }
 
@@ -183,7 +185,7 @@ impl MasterPty for ConPtyMasterPty {
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let child = inner.con.spawn_command(cmd)?;
         Ok(Box::new(child))
     }

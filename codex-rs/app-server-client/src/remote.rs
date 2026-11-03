@@ -1,11 +1,13 @@
 /*
-This module implements the websocket-backed app-server client transport.
+This module implements the remote app-server client transport.
 
 It owns the remote connection lifecycle, including the initialize/initialized
 handshake, JSON-RPC request/response routing, server-request resolution, and
-notification streaming. The rest of the crate uses the same `AppServerEvent`
-surface for both in-process and remote transports, so callers such as the TUI
-can switch between them without changing their higher-level session logic.
+notification streaming. Remote connections always carry WebSocket frames, over
+either TCP WebSocket URLs or local Unix sockets. The rest of the crate uses the
+same `AppServerEvent` surface for both in-process and remote transports, so
+callers such as the TUI can switch between them without changing their
+higher-level session logic.
 */
 
 use std::collections::HashMap;
@@ -19,7 +21,9 @@ use crate::AppServerEvent;
 use crate::RequestResult;
 use crate::SHUTDOWN_TIMEOUT;
 use crate::TypedRequestError;
-use crate::request_method_name;
+use crate::decode_typed_response;
+use crate::remote_websocket::RemoteWebSocket;
+use crate::remote_websocket::WebSocketHandshake;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -35,19 +39,25 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_transport::WEBSOCKET_COMPRESSION_HEADER;
+use codex_app_server_transport::ZSTD_STREAM_PROTOCOL;
+use codex_uds::UnixStream;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
-use futures::SinkExt;
-use futures::StreamExt;
 use serde::de::DeserializeOwned;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -57,27 +67,47 @@ use url::Url;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
+// Tungstenite still needs an HTTP request URI for the WebSocket handshake;
+// the bytes travel over the Unix socket, not TCP.
+const UDS_WEBSOCKET_HANDSHAKE_URL: &str = "ws://localhost/rpc";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAppServerEndpoint {
+    WebSocket {
+        websocket_url: String,
+        auth_token: Option<String>,
+    },
+    UnixSocket {
+        socket_path: AbsolutePathBuf,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteAppServerConnectArgs {
-    pub websocket_url: String,
-    pub auth_token: Option<String>,
+    /// This client collects fresh human decisions for managed command checkpoints.
+    pub required_human_approval: bool,
+    pub endpoint: RemoteAppServerEndpoint,
     pub client_name: String,
     pub client_version: String,
     pub experimental_api: bool,
+    pub mcp_server_openai_form_elicitation: bool,
     pub opt_out_notification_methods: Vec<String>,
     pub channel_capacity: usize,
 }
-
 impl RemoteAppServerConnectArgs {
-    fn initialize_params(&self) -> InitializeParams {
+    pub(crate) fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            required_human_approval: self.required_human_approval,
+            explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
+            request_attestation: false,
+            extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
             } else {
                 Some(self.opt_out_notification_methods.clone())
             },
+            mcp_server_openai_form_elicitation: self.mcp_server_openai_form_elicitation,
         };
 
         InitializeParams {
@@ -103,7 +133,7 @@ pub(crate) fn websocket_url_supports_auth_token(url: &Url) -> bool {
 
 enum RemoteClientCommand {
     Request {
-        request: Box<ClientRequest>,
+        request: Box<JSONRPCRequest>,
         response_tx: oneshot::Sender<IoResult<RequestResult>>,
     },
     Notify {
@@ -125,10 +155,19 @@ enum RemoteClientCommand {
     },
 }
 
+#[derive(Default)]
+struct RemoteServerMetadata {
+    server_version: Option<String>,
+    codex_home: Option<String>,
+    platform_family: Option<String>,
+    platform_os: Option<String>,
+}
+
 pub struct RemoteAppServerClient {
     command_tx: mpsc::Sender<RemoteClientCommand>,
     event_rx: mpsc::UnboundedReceiver<AppServerEvent>,
     pending_events: VecDeque<AppServerEvent>,
+    metadata: RemoteServerMetadata,
     worker_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -137,72 +176,86 @@ pub struct RemoteAppServerRequestHandle {
     command_tx: mpsc::Sender<RemoteClientCommand>,
 }
 
+enum SocketPeerPolicy {
+    ExplicitEndpoint,
+    #[cfg(windows)]
+    NonElevatedCurrentUser,
+}
+
 impl RemoteAppServerClient {
     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
-        let channel_capacity = args.channel_capacity.max(1);
-        let websocket_url = args.websocket_url.clone();
-        let url = Url::parse(&websocket_url).map_err(|err| {
-            IoError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid websocket URL `{websocket_url}`: {err}"),
-            )
-        })?;
-        if args.auth_token.is_some() && !websocket_url_supports_auth_token(&url) {
+        Self::connect_with_policy(args, SocketPeerPolicy::ExplicitEndpoint).await
+    }
+
+    /// Connects to an implicitly discovered Windows daemon, verifying its peer
+    /// token before the WebSocket handshake or any session requests.
+    #[cfg(windows)]
+    pub async fn connect_local_daemon(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
+        if !matches!(args.endpoint, RemoteAppServerEndpoint::UnixSocket { .. }) {
             return Err(IoError::new(
                 ErrorKind::InvalidInput,
-                format!(
-                    "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{websocket_url}`"
-                ),
+                "local daemon requires a Unix socket",
             ));
         }
-        let mut request = url.as_str().into_client_request().map_err(|err| {
-            IoError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid websocket URL `{websocket_url}`: {err}"),
-            )
-        })?;
-        if let Some(auth_token) = args.auth_token.as_deref() {
-            let header_value =
-                HeaderValue::from_str(&format!("Bearer {auth_token}")).map_err(|err| {
-                    IoError::new(
-                        ErrorKind::InvalidInput,
-                        format!("invalid remote authorization header value: {err}"),
-                    )
-                })?;
-            request.headers_mut().insert(AUTHORIZATION, header_value);
+        Self::connect_with_policy(args, SocketPeerPolicy::NonElevatedCurrentUser).await
+    }
+
+    async fn connect_with_policy(
+        args: RemoteAppServerConnectArgs,
+        peer_policy: SocketPeerPolicy,
+    ) -> IoResult<Self> {
+        let channel_capacity = args.channel_capacity.max(1);
+        let initialize_params = args.initialize_params();
+        match args.endpoint {
+            RemoteAppServerEndpoint::WebSocket {
+                websocket_url,
+                auth_token,
+            } => {
+                let (endpoint, stream) =
+                    connect_websocket_endpoint(websocket_url, auth_token).await?;
+                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
+                    .await
+            }
+            RemoteAppServerEndpoint::UnixSocket { socket_path } => {
+                let (endpoint, stream) =
+                    connect_unix_socket_endpoint(socket_path, peer_policy).await?;
+                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
+                    .await
+            }
         }
-        ensure_rustls_crypto_provider();
-        // Remote resume responses can legitimately carry large thread histories.
-        // Keep a bounded cap, but raise it above tungstenite's 16 MiB frame default.
-        let websocket_config = WebSocketConfig::default()
-            .max_frame_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE))
-            .max_message_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE));
-        let stream = timeout(
-            CONNECT_TIMEOUT,
-            connect_async_with_config(
-                request,
-                Some(websocket_config),
-                /*disable_nagle*/ false,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            IoError::new(
-                ErrorKind::TimedOut,
-                format!("timed out connecting to remote app server at `{websocket_url}`"),
-            )
-        })?
-        .map(|(stream, _response)| stream)
-        .map_err(|err| {
-            IoError::other(format!(
-                "failed to connect to remote app server at `{websocket_url}`: {err}"
-            ))
-        })?;
-        let mut stream = stream;
-        let pending_events = initialize_remote_connection(
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        self.metadata.server_version.as_deref()
+    }
+
+    pub fn codex_home(&self) -> Option<&str> {
+        self.metadata.codex_home.as_deref()
+    }
+
+    pub fn platform_family(&self) -> Option<&str> {
+        self.metadata.platform_family.as_deref()
+    }
+
+    pub fn platform_os(&self) -> Option<&str> {
+        self.metadata.platform_os.as_deref()
+    }
+
+    async fn connect_with_stream<S>(
+        channel_capacity: usize,
+        endpoint: String,
+        stream: WebSocketHandshake<S>,
+        initialize_params: InitializeParams,
+    ) -> IoResult<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut stream =
+            RemoteWebSocket::from_handshake(stream, REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE)?;
+        let (pending_events, metadata) = initialize_remote_connection(
             &mut stream,
-            &websocket_url,
-            args.initialize_params(),
+            &endpoint,
+            initialize_params,
             INITIALIZE_TIMEOUT,
         )
         .await?;
@@ -217,12 +270,12 @@ impl RemoteAppServerClient {
                 tokio::select! {
                     command = command_rx.recv() => {
                         let Some(command) = command else {
-                            let _ = stream.close(None).await;
+                            let _ = stream.close().await;
                             break;
                         };
                         match command {
                             RemoteClientCommand::Request { request, response_tx } => {
-                                let request_id = request_id_from_client_request(&request);
+                                let request_id = request.id.clone();
                                 if pending_requests.contains_key(&request_id) {
                                     let _ = response_tx.send(Err(IoError::new(
                                         ErrorKind::InvalidInput,
@@ -233,14 +286,14 @@ impl RemoteAppServerClient {
                                 pending_requests.insert(request_id.clone(), response_tx);
                                 if let Err(err) = write_jsonrpc_message(
                                     &mut stream,
-                                    JSONRPCMessage::Request(jsonrpc_request_from_client_request(*request)),
-                                    &websocket_url,
+                                    JSONRPCMessage::Request(*request),
+                                    &endpoint,
                                 )
                                 .await
                                 {
                                     let err_message = err.to_string();
                                     let message = format!(
-                                        "remote app server at `{websocket_url}` write failed: {err_message}"
+                                        "remote app server at `{endpoint}` write failed: {err_message}"
                                     );
                                     if let Some(response_tx) = pending_requests.remove(&request_id) {
                                         let _ = response_tx.send(Err(err));
@@ -261,7 +314,7 @@ impl RemoteAppServerClient {
                                     JSONRPCMessage::Notification(
                                         jsonrpc_notification_from_client_notification(notification),
                                     ),
-                                    &websocket_url,
+                                    &endpoint,
                                 )
                                 .await;
                                 let _ = response_tx.send(result);
@@ -277,7 +330,7 @@ impl RemoteAppServerClient {
                                         id: request_id,
                                         result,
                                     }),
-                                    &websocket_url,
+                                    &endpoint,
                                 )
                                 .await;
                                 let _ = response_tx.send(result);
@@ -293,16 +346,20 @@ impl RemoteAppServerClient {
                                         error,
                                         id: request_id,
                                     }),
-                                    &websocket_url,
+                                    &endpoint,
                                 )
                                 .await;
                                 let _ = response_tx.send(result);
                             }
                             RemoteClientCommand::Shutdown { response_tx } => {
-                                let close_result = stream.close(None).await.map_err(|err| {
-                                    IoError::other(format!(
-                                        "failed to close websocket app server `{websocket_url}`: {err}"
-                                    ))
+                                let close_result = stream.close().await.or_else(|err| {
+                                    if websocket_close_error_is_already_closed(&err) {
+                                        Ok(())
+                                    } else {
+                                        Err(IoError::other(format!(
+                                            "failed to close websocket app server `{endpoint}`: {err}"
+                                        )))
+                                    }
                                 });
                                 let _ = response_tx.send(close_result);
                                 break;
@@ -342,7 +399,7 @@ impl RemoteAppServerClient {
                                             Ok(request) => {
                                                 if let Err(err) = deliver_event(
                                                     &event_tx,
-                                                    AppServerEvent::ServerRequest(request),
+                                                    AppServerEvent::ServerRequest(Box::new(request)),
                                                 )
                                                 {
                                                     warn!(%err, "failed to deliver remote app-server server request");
@@ -363,13 +420,13 @@ impl RemoteAppServerClient {
                                                         },
                                                         id: request_id,
                                                     }),
-                                                    &websocket_url,
+                                                    &endpoint,
                                                 )
                                                 .await
                                                 {
                                                     let err_message = reject_err.to_string();
                                                     let message = format!(
-                                                        "remote app server at `{websocket_url}` write failed: {err_message}"
+                                                        "remote app server at `{endpoint}` write failed: {err_message}"
                                                     );
                                                     let _ = deliver_event(
                                                         &event_tx,
@@ -386,7 +443,7 @@ impl RemoteAppServerClient {
                                     }
                                     Err(err) => {
                                         let message = format!(
-                                            "remote app server at `{websocket_url}` sent invalid JSON-RPC: {err}"
+                                            "remote app server at `{endpoint}` sent invalid JSON-RPC: {err}"
                                         );
                                         let _ = deliver_event(
                                             &event_tx,
@@ -407,7 +464,7 @@ impl RemoteAppServerClient {
                                     .filter(|reason| !reason.is_empty())
                                     .unwrap_or_else(|| "connection closed".to_string());
                                 let message = format!(
-                                    "remote app server at `{websocket_url}` disconnected: {reason}"
+                                    "remote app server at `{endpoint}` disconnected: {reason}"
                                 );
                                 let _ = deliver_event(
                                     &event_tx,
@@ -427,7 +484,7 @@ impl RemoteAppServerClient {
                             | Some(Ok(Message::Frame(_))) => {}
                             Some(Err(err)) => {
                                 let message = format!(
-                                    "remote app server at `{websocket_url}` transport failed: {err}"
+                                    "remote app server at `{endpoint}` transport failed: {err}"
                                 );
                                 let _ = deliver_event(
                                     &event_tx,
@@ -440,7 +497,7 @@ impl RemoteAppServerClient {
                             }
                             None => {
                                 let message = format!(
-                                    "remote app server at `{websocket_url}` closed the connection"
+                                    "remote app server at `{endpoint}` closed the connection"
                                 );
                                 let _ = deliver_event(
                                     &event_tx,
@@ -471,6 +528,7 @@ impl RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: pending_events.into(),
+            metadata,
             worker_handle,
         })
     }
@@ -482,45 +540,16 @@ impl RemoteAppServerClient {
     }
 
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(RemoteClientCommand::Request {
-                request: Box::new(request),
-                response_tx,
-            })
-            .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "remote app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "remote app-server request channel is closed",
-            )
-        })?
+        self.request_handle().request(request).await
     }
 
     pub async fn request_typed<T>(&self, request: ClientRequest) -> Result<T, TypedRequestError>
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
@@ -550,6 +579,63 @@ impl RemoteAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
+        self.request_handle()
+            .resolve_server_request(request_id, result)
+            .await
+    }
+
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        self.request_handle()
+            .reject_server_request(request_id, error)
+            .await
+    }
+
+    pub async fn next_event(&mut self) -> Option<AppServerEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
+        self.event_rx.recv().await
+    }
+
+    pub async fn shutdown(self) -> IoResult<()> {
+        let Self {
+            command_tx,
+            event_rx,
+            pending_events: _pending_events,
+            metadata: _,
+            worker_handle,
+        } = self;
+        let mut worker_handle = worker_handle;
+        let (response_tx, response_rx) = oneshot::channel();
+        if command_tx
+            .send(RemoteClientCommand::Shutdown { response_tx })
+            .await
+            .is_ok()
+            && let Ok(Ok(close_result)) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
+        {
+            close_result?;
+        }
+
+        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
+            worker_handle.abort();
+            let _ = worker_handle.await;
+        }
+        // Keep events deliverable until the worker has closed the websocket.
+        drop(event_rx);
+        Ok(())
+    }
+}
+
+impl RemoteAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::ResolveServerRequest {
@@ -572,7 +658,7 @@ impl RemoteAppServerClient {
         })?
     }
 
-    pub async fn reject_server_request(
+    pub(crate) async fn reject_server_request(
         &self,
         request_id: RequestId,
         error: JSONRPCErrorError,
@@ -599,42 +685,12 @@ impl RemoteAppServerClient {
         })?
     }
 
-    pub async fn next_event(&mut self) -> Option<AppServerEvent> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Some(event);
-        }
-        self.event_rx.recv().await
-    }
-
-    pub async fn shutdown(self) -> IoResult<()> {
-        let Self {
-            command_tx,
-            event_rx,
-            pending_events: _pending_events,
-            worker_handle,
-        } = self;
-        let mut worker_handle = worker_handle;
-        drop(event_rx);
-        let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(RemoteClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(Ok(close_result)) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
-        {
-            close_result?;
-        }
-
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
-        }
-        Ok(())
-    }
-}
-
-impl RemoteAppServerRequestHandle {
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
+        self.request_json_rpc(jsonrpc_request_from_client_request(request))
+            .await
+    }
+
+    pub async fn request_json_rpc(&self, request: JSONRPCRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::Request {
@@ -660,31 +716,151 @@ impl RemoteAppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
-async fn initialize_remote_connection(
-    stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    websocket_url: &str,
+async fn connect_websocket_endpoint(
+    websocket_url: String,
+    auth_token: Option<String>,
+) -> IoResult<(String, WebSocketHandshake<MaybeTlsStream<TcpStream>>)> {
+    let url = Url::parse(&websocket_url).map_err(|err| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid websocket URL `{websocket_url}`: {err}"),
+        )
+    })?;
+    if auth_token.is_some() && !websocket_url_supports_auth_token(&url) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{websocket_url}`"
+            ),
+        ));
+    }
+
+    let mut request = websocket_request(url.as_str()).map_err(|err| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid websocket URL `{websocket_url}`: {err}"),
+        )
+    })?;
+    if let Some(auth_token) = auth_token.as_deref() {
+        let header_value =
+            HeaderValue::from_str(&format!("Bearer {auth_token}")).map_err(|err| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid remote authorization header value: {err}"),
+                )
+            })?;
+        request.headers_mut().insert(AUTHORIZATION, header_value);
+    }
+
+    ensure_rustls_crypto_provider();
+    let websocket_config = remote_websocket_config();
+    let stream = timeout(
+        CONNECT_TIMEOUT,
+        connect_async_with_config(
+            request,
+            Some(websocket_config),
+            /*disable_nagle*/ false,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        IoError::new(
+            ErrorKind::TimedOut,
+            format!("timed out connecting to remote app server at `{websocket_url}`"),
+        )
+    })?
+    .map_err(|err| {
+        IoError::other(format!(
+            "failed to connect to remote app server at `{websocket_url}`: {err}"
+        ))
+    })?;
+
+    Ok((websocket_url, stream))
+}
+
+async fn connect_unix_socket_endpoint(
+    socket_path: AbsolutePathBuf,
+    peer_policy: SocketPeerPolicy,
+) -> IoResult<(String, WebSocketHandshake<UnixStream>)> {
+    let endpoint = format!("unix://{}", socket_path.display());
+    let request = websocket_request(UDS_WEBSOCKET_HANDSHAKE_URL).map_err(|err| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid UDS websocket handshake URL: {err}"),
+        )
+    })?;
+    let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path.as_path()))
+        .await
+        .map_err(|_| {
+            IoError::new(
+                ErrorKind::TimedOut,
+                format!("timed out connecting to remote app server at `{endpoint}`"),
+            )
+        })?
+        .map_err(|err| {
+            IoError::other(format!(
+                "failed to connect to remote app server at `{endpoint}`: {err}"
+            ))
+        })?;
+    match peer_policy {
+        SocketPeerPolicy::ExplicitEndpoint => {}
+        #[cfg(windows)]
+        SocketPeerPolicy::NonElevatedCurrentUser => stream.ensure_non_elevated_peer()?,
+    }
+    let websocket_config = remote_websocket_config();
+    let stream = timeout(
+        CONNECT_TIMEOUT,
+        client_async_with_config(request, stream, Some(websocket_config)),
+    )
+    .await
+    .map_err(|_| {
+        IoError::new(
+            ErrorKind::TimedOut,
+            format!("timed out upgrading remote app server at `{endpoint}`"),
+        )
+    })?
+    .map_err(|err| {
+        IoError::other(format!(
+            "failed to upgrade remote app server at `{endpoint}`: {err}"
+        ))
+    })?;
+
+    Ok((endpoint, stream))
+}
+
+fn websocket_request(url: &str) -> Result<Request, TungsteniteError> {
+    let mut request = url.into_client_request()?;
+    request.headers_mut().insert(
+        WEBSOCKET_COMPRESSION_HEADER,
+        HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+    );
+    Ok(request)
+}
+
+fn remote_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE))
+        .max_message_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE))
+}
+
+async fn initialize_remote_connection<S>(
+    stream: &mut RemoteWebSocket<S>,
+    endpoint: &str,
     params: InitializeParams,
     initialize_timeout: Duration,
-) -> IoResult<Vec<AppServerEvent>> {
+) -> IoResult<(Vec<AppServerEvent>, RemoteServerMetadata)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let initialize_request_id = RequestId::String("initialize".to_string());
     let mut pending_events = Vec::new();
+    let mut metadata = RemoteServerMetadata::default();
     write_jsonrpc_message(
         stream,
         JSONRPCMessage::Request(jsonrpc_request_from_client_request(
@@ -693,7 +869,7 @@ async fn initialize_remote_connection(
                 params,
             },
         )),
-        websocket_url,
+        endpoint,
     )
     .await?;
 
@@ -703,16 +879,34 @@ async fn initialize_remote_connection(
                 Some(Ok(Message::Text(text))) => {
                     let message = serde_json::from_str::<JSONRPCMessage>(&text).map_err(|err| {
                         IoError::other(format!(
-                            "remote app server at `{websocket_url}` sent invalid initialize response: {err}"
+                            "remote app server at `{endpoint}` sent invalid initialize response: {err}"
                         ))
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
+                            metadata.server_version = response
+                                .result
+                                .get("userAgent")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|user_agent| {
+                                    let (_, rest) = user_agent.split_once('/')?;
+                                    rest.split_whitespace().next().map(str::to_string)
+                                });
+                            metadata.codex_home = response
+                                .result
+                                .get("codexHome")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|codex_home| !codex_home.is_empty())
+                                .map(str::to_string);
+                            metadata.platform_family = response.result.get("platformFamily")
+                                .and_then(serde_json::Value::as_str).map(str::to_string);
+                            metadata.platform_os = response.result.get("platformOs")
+                                .and_then(serde_json::Value::as_str).map(str::to_string);
                             break Ok(());
                         }
                         JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
                             break Err(IoError::other(format!(
-                                "remote app server at `{websocket_url}` rejected initialize: {}",
+                                "remote app server at `{endpoint}` rejected initialize: {}",
                                 error.error.message
                             )));
                         }
@@ -726,7 +920,8 @@ async fn initialize_remote_connection(
                             let method = request.method.clone();
                             match ServerRequest::try_from(request) {
                                 Ok(request) => {
-                                    pending_events.push(AppServerEvent::ServerRequest(request));
+                                    pending_events
+                                        .push(AppServerEvent::ServerRequest(Box::new(request)));
                                 }
                                 Err(err) => {
                                     warn!(%err, method, "rejecting unknown remote app-server request during initialize");
@@ -742,7 +937,7 @@ async fn initialize_remote_connection(
                                             },
                                             id: request_id,
                                         }),
-                                        websocket_url,
+                                        endpoint,
                                     )
                                     .await?;
                                 }
@@ -764,19 +959,19 @@ async fn initialize_remote_connection(
                     break Err(IoError::new(
                         ErrorKind::ConnectionAborted,
                         format!(
-                            "remote app server at `{websocket_url}` closed during initialize: {reason}"
+                            "remote app server at `{endpoint}` closed during initialize: {reason}"
                         ),
                     ));
                 }
                 Some(Err(err)) => {
                     break Err(IoError::other(format!(
-                        "remote app server at `{websocket_url}` transport failed during initialize: {err}"
+                        "remote app server at `{endpoint}` transport failed during initialize: {err}"
                     )));
                 }
                 None => {
                     break Err(IoError::new(
                         ErrorKind::UnexpectedEof,
-                        format!("remote app server at `{websocket_url}` closed during initialize"),
+                        format!("remote app server at `{endpoint}` closed during initialize"),
                     ));
                 }
             }
@@ -786,7 +981,7 @@ async fn initialize_remote_connection(
     .map_err(|_| {
         IoError::new(
             ErrorKind::TimedOut,
-            format!("timed out waiting for initialize response from `{websocket_url}`"),
+            format!("timed out waiting for initialize response from `{endpoint}`"),
         )
     })??;
 
@@ -795,16 +990,16 @@ async fn initialize_remote_connection(
         JSONRPCMessage::Notification(jsonrpc_notification_from_client_notification(
             ClientNotification::Initialized,
         )),
-        websocket_url,
+        endpoint,
     )
     .await?;
 
-    Ok(pending_events)
+    Ok((pending_events, metadata))
 }
 
 fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
     match ServerNotification::try_from(notification) {
-        Ok(notification) => Some(AppServerEvent::ServerNotification(notification)),
+        Ok(notification) => Some(AppServerEvent::ServerNotification(Box::new(notification))),
         Err(_) => None,
     }
 }
@@ -819,10 +1014,6 @@ fn deliver_event(
             "remote app-server event consumer channel is closed",
         )
     })
-}
-
-fn request_id_from_client_request(request: &ClientRequest) -> RequestId {
-    jsonrpc_request_from_client_request(request.clone()).id
 }
 
 fn jsonrpc_request_from_client_request(request: ClientRequest) -> JSONRPCRequest {
@@ -849,20 +1040,31 @@ fn jsonrpc_notification_from_client_notification(
     }
 }
 
-async fn write_jsonrpc_message(
-    stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn write_jsonrpc_message<S>(
+    stream: &mut RemoteWebSocket<S>,
     message: JSONRPCMessage,
-    websocket_url: &str,
-) -> IoResult<()> {
+    endpoint: &str,
+) -> IoResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let payload = serde_json::to_string(&message).map_err(IoError::other)?;
-    stream
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(|err| {
-            IoError::other(format!(
-                "failed to write websocket message to `{websocket_url}`: {err}"
-            ))
-        })
+    stream.send_text(payload).await.map_err(|err| {
+        IoError::other(format!(
+            "failed to write websocket message to `{endpoint}`: {err}"
+        ))
+    })
+}
+
+fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
+    match err {
+        TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => true,
+        TungsteniteError::Io(err) => matches!(
+            err.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -871,14 +1073,27 @@ mod tests {
     #[tokio::test]
     async fn shutdown_tolerates_worker_exit_after_command_is_queued() {
         let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (_event_tx, event_rx) = mpsc::unbounded_channel::<AppServerEvent>();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<AppServerEvent>();
+        let (delivered_tx, delivered_rx) = oneshot::channel();
         let worker_handle = tokio::spawn(async move {
             let _ = command_rx.recv().await;
+            // Force an event after shutdown is queued but before this worker has exited.
+            let result = deliver_event(
+                &event_tx,
+                AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
+                    codex_app_server_protocol::AccountUpdatedNotification {
+                        auth_mode: None,
+                        plan_type: None,
+                    },
+                ))),
+            );
+            let _ = delivered_tx.send(result);
         });
         let client = RemoteAppServerClient {
             command_tx,
             event_rx,
             pending_events: VecDeque::new(),
+            metadata: RemoteServerMetadata::default(),
             worker_handle,
         };
 
@@ -886,5 +1101,9 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown should complete when worker exits first");
+        delivered_rx
+            .await
+            .expect("worker should attempt delivery")
+            .expect("an in-flight event must not abort the worker during shutdown");
     }
 }

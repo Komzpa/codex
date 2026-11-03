@@ -8,21 +8,28 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
+use crate::output_spill::AdditionalContext;
 use crate::schema::PreToolUseCommandInput;
+use crate::schema::SubagentCommandInputFields;
 
 #[derive(Debug, Clone)]
 pub struct PreToolUseRequest {
     pub session_id: ThreadId,
     pub turn_id: String,
+    pub subagent: Option<common::SubagentHookContext>,
     pub cwd: AbsolutePathBuf,
+    /// Local tool cwd for hook stdin. Remote commands leave this unset to retain
+    /// the host cwd. The hook process still runs in `cwd`.
+    pub tool_cwd: Option<PathUri>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -37,12 +44,16 @@ pub struct PreToolUseOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_block: bool,
     pub block_reason: Option<String>,
+    pub additional_contexts: Vec<crate::HookContext>,
+    pub updated_input: Option<Value>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PreToolUseHandlerData {
     should_block: bool,
     block_reason: Option<String>,
+    additional_contexts_for_model: Vec<AdditionalContext>,
+    updated_input: Option<Value>,
 }
 
 pub(crate) fn preview(
@@ -63,13 +74,12 @@ pub(crate) fn preview(
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
+    engine: &ClaudeHooksEngine,
     request: PreToolUseRequest,
 ) -> PreToolUseOutcome {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
     let matched = dispatcher::select_handlers_for_matcher_inputs(
-        handlers,
+        &engine.handlers,
         HookEventName::PreToolUse,
         &matcher_inputs,
     );
@@ -78,11 +88,13 @@ pub(crate) async fn run(
             hook_events: Vec::new(),
             should_block: false,
             block_reason: None,
+            additional_contexts: Vec::new(),
+            updated_input: None,
         };
     }
 
-    let input_json = match command_input_json(&request) {
-        Ok(input_json) => input_json,
+    let input = match command_input(&request) {
+        Ok(input) => input,
         Err(error) => {
             let hook_events = common::serialization_failure_hook_events_for_tool_use(
                 matched,
@@ -95,9 +107,9 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id.clone()),
         parse_completed,
@@ -108,6 +120,21 @@ pub(crate) async fn run(
     let block_reason = results
         .iter()
         .find_map(|result| result.data.block_reason.clone());
+    let additional_contexts = common::flatten_additional_contexts(
+        results
+            .iter()
+            .map(|result| result.data.additional_contexts_for_model.as_slice()),
+    );
+    let additional_contexts = engine
+        .command_runtime
+        .output_spiller()
+        .maybe_spill_additional_contexts(additional_contexts)
+        .await;
+    let updated_input = if should_block {
+        None
+    } else {
+        latest_updated_input(&results)
+    };
 
     PreToolUseOutcome {
         hook_events: results
@@ -118,7 +145,29 @@ pub(crate) async fn run(
             .collect(),
         should_block,
         block_reason,
+        additional_contexts,
+        updated_input,
     }
+}
+
+/// Chooses the rewrite from the hook that actually finished last.
+///
+/// Hook results stay in configured order for stable reporting, but the
+/// `PreToolUse` contract resolves competing rewrites by completion order.
+fn latest_updated_input(
+    results: &[dispatcher::ParsedHandler<PreToolUseHandlerData>],
+) -> Option<Value> {
+    results
+        .iter()
+        .filter_map(|result| {
+            result
+                .data
+                .updated_input
+                .clone()
+                .map(|updated_input| (result.completion_order, updated_input))
+        })
+        .max_by_key(|(completion_order, _)| *completion_order)
+        .map(|(_, updated_input)| updated_input)
 }
 
 /// Serializes command stdin for a selected `PreToolUse` hook.
@@ -126,13 +175,18 @@ pub(crate) async fn run(
 /// Handler selection may include internal matcher aliases, but hook stdin keeps
 /// the canonical `tool_name` so audit logs and downstream policy decisions stay
 /// stable. Shell-like tools pass `{ "command": ... }` as `tool_input`; MCP
-/// tools pass their resolved JSON arguments.
-fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&PreToolUseCommandInput {
+/// tools pass their resolved JSON arguments. Local commands can expose their
+/// execution cwd here, independently of the directory used to launch hooks.
+/// Remote commands retain the host cwd; remote cwd reporting is deferred.
+fn command_input(request: &PreToolUseRequest) -> Result<Value, serde_json::Error> {
+    let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
+    serde_json::to_value(PreToolUseCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
+        agent_id: subagent.agent_id,
+        agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_ref(), request.tool_cwd.as_ref()),
         hook_event_name: "PreToolUse".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
@@ -144,13 +198,15 @@ fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json:
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<PreToolUseHandlerData> {
     let mut entries = Vec::new();
     let mut status = HookRunStatus::Completed;
     let mut should_block = false;
     let mut block_reason = None;
+    let mut additional_contexts_for_model = Vec::new();
+    let mut updated_input = None;
 
     match run_result.error.as_deref() {
         Some(error) => {
@@ -171,22 +227,37 @@ fn parse_completed(
                             text: system_message,
                         });
                     }
-                    if let Some(invalid_reason) = parsed.invalid_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
-                    } else if let Some(reason) = parsed.block_reason {
-                        status = HookRunStatus::Blocked;
-                        should_block = true;
-                        block_reason = Some(reason.clone());
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Feedback,
-                            text: reason,
-                        });
+                    if (!handler.can_apply_control_effects() || parsed.invalid_reason.is_none())
+                        && let Some(additional_context) = parsed.additional_context
+                    {
+                        common::append_additional_context(
+                            &mut entries,
+                            &mut additional_contexts_for_model,
+                            handler,
+                            additional_context,
+                            &run_result.context_metadata,
+                        );
                     }
-                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
+                    if handler.can_apply_control_effects() {
+                        if let Some(invalid_reason) = parsed.invalid_reason {
+                            status = HookRunStatus::Failed;
+                            entries.push(HookOutputEntry {
+                                kind: HookOutputEntryKind::Error,
+                                text: invalid_reason,
+                            });
+                        } else if let Some(reason) = parsed.block_reason {
+                            status = HookRunStatus::Blocked;
+                            should_block = true;
+                            block_reason = Some(reason.clone());
+                            entries.push(HookOutputEntry {
+                                kind: HookOutputEntryKind::Feedback,
+                                text: reason,
+                            });
+                        } else {
+                            updated_input = parsed.updated_input;
+                        }
+                    }
+                } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -194,7 +265,7 @@ fn parse_completed(
                     });
                 }
             }
-            Some(2) => {
+            Some(2) if handler.can_apply_control_effects() => {
                 if let Some(reason) = common::trimmed_non_empty(&run_result.stderr) {
                     status = HookRunStatus::Blocked;
                     should_block = true;
@@ -238,7 +309,10 @@ fn parse_completed(
         data: PreToolUseHandlerData {
             should_block,
             block_reason,
+            additional_contexts_for_model,
+            updated_input,
         },
+        completion_order: 0,
     }
 }
 
@@ -247,6 +321,8 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PreToo
         hook_events,
         should_block: false,
         block_reason: None,
+        additional_contexts: Vec::new(),
+        updated_input: None,
     }
 }
 
@@ -262,23 +338,40 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::PreToolUseHandlerData;
-    use super::command_input_json;
+    use super::command_input;
+    use super::latest_updated_input;
     use super::parse_completed;
     use super::preview;
     use crate::engine::ConfiguredHandler;
-    use crate::engine::command_runner::CommandRunResult;
+    use crate::engine::HandlerRunResult;
     use crate::events::common;
+    use crate::output_spill::AdditionalContext;
+    use crate::output_spill::AdditionalContextLimit;
 
     #[test]
     fn command_input_uses_request_tool_name() {
         let mut request = request_for_tool_use("call-apply-patch");
         request.tool_name = "apply_patch".to_string();
 
-        let input_json = command_input_json(&request).expect("serialize command input");
-        let input: serde_json::Value =
-            serde_json::from_str(&input_json).expect("parse command input");
+        let input = command_input(&request).expect("serialize command input");
 
         assert_eq!(input["tool_name"], "apply_patch");
+    }
+
+    #[test]
+    fn command_input_uses_tool_cwd_with_its_own_path_convention() {
+        for (uri, expected) in [
+            ("file:///repo-B", "/repo-B"),
+            ("file:///C:/repo-B", r"C:\repo-B"),
+        ] {
+            let mut request = request_for_tool_use("call-cwd");
+            let original = command_input(&request).unwrap();
+            request.tool_cwd = Some(codex_utils_path_uri::PathUri::parse(uri).unwrap());
+            let actual = command_input(&request).unwrap();
+            let mut expected_input = original;
+            expected_input["cwd"] = serde_json::json!(expected);
+            assert_eq!(actual, expected_input);
+        }
     }
 
     #[test]
@@ -298,6 +391,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: true,
                 block_reason: Some("do not run that".to_string()),
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -307,6 +402,103 @@ mod tests {
                 kind: HookOutputEntryKind::Feedback,
                 text: "do not run that".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn permission_decision_allow_can_update_input() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"echo rewritten"}}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            PreToolUseHandlerData {
+                should_block: false,
+                block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: Some(serde_json::json!({ "command": "echo rewritten" })),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(parsed.completed.run.entries, vec![]);
+    }
+
+    #[test]
+    fn last_completed_updated_input_wins() {
+        let mut later_configured = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"echo configured later"}}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+        later_configured.completion_order = 0;
+        let mut earlier_configured = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"echo finished later"}}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+        earlier_configured.completion_order = 1;
+
+        assert_eq!(
+            latest_updated_input(&[later_configured, earlier_configured]),
+            Some(serde_json::json!({ "command": "echo finished later" }))
+        );
+    }
+
+    #[test]
+    fn permission_decision_allow_without_updated_input_fails_open() {
+        let stdout = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"preserved"}}"#;
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), stdout, ""),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            PreToolUseHandlerData {
+                should_block: false,
+                block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Error,
+                text: "PreToolUse hook returned unsupported permissionDecision:allow".to_string(),
+            }]
+        );
+
+        let async_handler = handler_with_async(/*async*/ true);
+        let parsed = parse_completed(
+            &async_handler,
+            run_result(Some(0), stdout, ""),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Context,
+                text: "preserved".to_string(),
+            }],
         );
     }
 
@@ -327,6 +519,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: true,
                 block_reason: Some("do not run that".to_string()),
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -336,6 +530,46 @@ mod tests {
                 kind: HookOutputEntryKind::Feedback,
                 text: "do not run that".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn deprecated_block_decision_with_additional_context_blocks_processing() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(0),
+                r#"{"decision":"block","reason":"do not run that","hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"remember this"}}"#,
+                "",
+            ),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            PreToolUseHandlerData {
+                should_block: true,
+                block_reason: Some("do not run that".to_string()),
+                additional_contexts_for_model: vec![AdditionalContext {
+                    context: crate::HookContext::harness("remember this".to_string()),
+                    limit: Default::default(),
+                }],
+                updated_input: None,
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![
+                HookOutputEntry {
+                    kind: HookOutputEntryKind::Context,
+                    text: "remember this".to_string(),
+                },
+                HookOutputEntry {
+                    kind: HookOutputEntryKind::Feedback,
+                    text: "do not run that".to_string(),
+                },
+            ]
         );
     }
 
@@ -356,6 +590,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: false,
                 block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
@@ -381,6 +617,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: false,
                 block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
@@ -394,9 +632,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_additional_context_fails_open() {
+    fn additional_context_is_recorded() {
+        let mut handler = handler();
+        handler.additional_context_limit = AdditionalContextLimit::from_config(Some(13));
         let parsed = parse_completed(
-            &handler(),
+            &handler,
             run_result(
                 Some(0),
                 r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"do not run that","additionalContext":"nope"}}"#,
@@ -408,17 +648,28 @@ mod tests {
         assert_eq!(
             parsed.data,
             PreToolUseHandlerData {
-                should_block: false,
-                block_reason: None,
+                should_block: true,
+                block_reason: Some("do not run that".to_string()),
+                additional_contexts_for_model: vec![AdditionalContext {
+                    context: crate::HookContext::harness("nope".to_string()),
+                    limit: AdditionalContextLimit::from_config(Some(13)),
+                }],
+                updated_input: None,
             }
         );
-        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
         assert_eq!(
             parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "PreToolUse hook returned unsupported additionalContext".to_string(),
-            }]
+            vec![
+                HookOutputEntry {
+                    kind: HookOutputEntryKind::Context,
+                    text: "nope".to_string(),
+                },
+                HookOutputEntry {
+                    kind: HookOutputEntryKind::Feedback,
+                    text: "do not run that".to_string(),
+                },
+            ]
         );
     }
 
@@ -435,6 +686,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: false,
                 block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
@@ -454,6 +707,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: false,
                 block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
@@ -479,6 +734,8 @@ mod tests {
             PreToolUseHandlerData {
                 should_block: true,
                 block_reason: Some("blocked by policy".to_string()),
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -532,21 +789,32 @@ mod tests {
     }
 
     fn handler() -> ConfiguredHandler {
+        handler_with_async(/*async*/ false)
+    }
+
+    fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::PreToolUse,
-            matcher: Some("^Bash$".to_string()),
-            command: "echo hook".to_string(),
+            matcher: Some(crate::engine::HookMatcher::new("^Bash$").expect("valid matcher")),
             timeout_sec: 5,
             status_message: None,
-            source_path: test_path_buf("/tmp/hooks.json").abs(),
+            additional_context_limit: Default::default(),
+            source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
+            kind: crate::engine::ConfiguredHandlerKind::Command {
+                command: "echo hook".to_string(),
+                r#async,
+                env: std::collections::HashMap::new(),
+            },
         }
     }
 
-    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult {
-        CommandRunResult {
+    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
+        HandlerRunResult {
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,
@@ -561,7 +829,9 @@ mod tests {
         super::PreToolUseRequest {
             session_id: ThreadId::new(),
             turn_id: "turn-1".to_string(),
+            subagent: None,
             cwd: test_path_buf("/tmp").abs(),
+            tool_cwd: None,
             transcript_path: None,
             model: "gpt-test".to_string(),
             permission_mode: "default".to_string(),

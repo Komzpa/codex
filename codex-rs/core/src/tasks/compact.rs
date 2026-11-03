@@ -1,10 +1,19 @@
 use std::sync::Arc;
 
 use super::SessionTask;
-use super::SessionTaskContext;
+use super::SessionTaskResult;
+use super::emit_compact_metric;
+use crate::compact::run_compact_task;
+use crate::compact::summarization_input;
+use crate::compact_model_fallback::should_fall_back_to_local_compaction;
+use crate::session::TurnInput;
+use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
-use codex_protocol::user_input::UserInput;
+use codex_features::Feature;
+use codex_model_provider::RemoteCompactionSupport;
+use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::protocol::CodexErrorInfo;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default)]
@@ -21,27 +30,87 @@ impl SessionTask for CompactTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
-        input: Vec<UserInput>,
-        _cancellation_token: CancellationToken,
-    ) -> Option<String> {
-        let session = session.clone_session();
-        let _ = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
-            session.services.session_telemetry.counter(
-                "codex.task.compact",
-                /*inc*/ 1,
-                &[("type", "remote")],
-            );
-            crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
-        } else {
-            session.services.session_telemetry.counter(
-                "codex.task.compact",
-                /*inc*/ 1,
-                &[("type", "local")],
-            );
-            crate::compact::run_compact_task(session.clone(), ctx, input).await
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let _profile_guard = ctx.turn_timing_state.begin_compaction();
+        let _compaction_span = tracing::trace_span!(
+            "codex.compaction",
+            codex.turn.phase = "compaction",
+            conversation.id = %session.thread_id,
+            turn.id = %ctx.sub_id,
+        );
+        // Preparation errors must reach the task runner, which reports them to the client.
+        session.emit_turn_started(&ctx, TaskKind::Compact).await;
+        let step_context = session
+            .capture_step_context(Arc::clone(&ctx), &cancellation_token)
+            .await?;
+        let world_state = Arc::new(
+            session
+                .build_world_state_for_step(&step_context, /*new_window*/ true)
+                .await?,
+        );
+        if ctx.config.features.enabled(Feature::TokenBudget) {
+            crate::compact_token_budget::run_manual_compact_task(
+                session,
+                step_context,
+                world_state,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        let result = match ctx.provider.capabilities().remote_compaction {
+            RemoteCompactionSupport::V2 => {
+                emit_compact_metric(
+                    &session.services.session_telemetry,
+                    "remote_v2",
+                    /*manual*/ true,
+                );
+                match crate::compact_remote_v2::run_remote_compact_task(
+                    session.clone(),
+                    Arc::clone(&step_context),
+                    Arc::clone(&world_state),
+                )
+                .await
+                {
+                    Err(err) if should_fall_back_to_local_compaction(&err) => {
+                        emit_compact_metric(
+                            &session.services.session_telemetry,
+                            "local",
+                            /*manual*/ true,
+                        );
+                        // The task already emitted `TurnStarted`; local compaction reuses that turn.
+                        let input = summarization_input(&ctx.config);
+                        run_compact_task(session.clone(), step_context, world_state, input).await
+                    }
+                    result => result,
+                }
+            }
+            RemoteCompactionSupport::Unsupported => {
+                emit_compact_metric(
+                    &session.services.session_telemetry,
+                    "local",
+                    /*manual*/ true,
+                );
+                let input = summarization_input(&ctx.config);
+                run_compact_task(session.clone(), step_context, world_state, input).await
+            }
         };
-        None
+        if let Err(err) = result {
+            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+                return Err(err);
+            }
+            let error = err.to_codex_protocol_error();
+            if matches!(error, CodexErrorInfo::UsageLimitExceeded) {
+                // Compaction already emitted the error; notify extensions without emitting it twice.
+                session
+                    .emit_turn_error_lifecycle(ctx.as_ref(), error, err.details())
+                    .await;
+            }
+        }
+        Ok(None)
     }
 }

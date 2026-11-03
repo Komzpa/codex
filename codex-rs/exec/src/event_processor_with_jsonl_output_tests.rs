@@ -1,5 +1,6 @@
 use super::*;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::tempdir;
 
 #[test]
@@ -11,16 +12,20 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
     let mut processor = EventProcessorWithJsonOutput::new(Some(output_path.clone()));
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
-            item: ThreadItem::AgentMessage {
+        codex_app_server_protocol::ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            ThreadItemPayload::AgentMessage {
                 id: "msg-1".to_string(),
                 text: "partial answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-        },
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ),
     ));
 
     assert_eq!(collected.status, CodexStatus::Running);
@@ -31,9 +36,12 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
             thread_id: "thread-1".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Failed,
                 error: Some(codex_app_server_protocol::TurnError {
+                    misalignment: None,
                     message: "turn failed".to_string(),
                     additional_details: None,
                     codex_error_info: None,
@@ -48,10 +56,93 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
     assert_eq!(status, CodexStatus::InitiateShutdown);
     assert_eq!(processor.final_message(), None);
 
-    EventProcessor::print_final_output(&mut processor);
+    let output = BoundOutput::open(&output_path).expect("bind output");
+    EventProcessor::print_final_output(&mut processor, Some(output)).expect("print final output");
 
     assert_eq!(
         std::fs::read_to_string(&output_path).expect("read output file"),
         "keep existing contents"
     );
+}
+
+#[test]
+fn runtime_warning_emits_a_non_fatal_error_item() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected = processor.collect_thread_events(ServerNotification::Warning(
+        codex_app_server_protocol::WarningNotification {
+            thread_id: Some("thread-1".to_string()),
+            message: "invalid global instructions".to_string(),
+        },
+    ));
+
+    assert_eq!(
+        collected,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: "item_0".to_string(),
+                    details: ThreadItemDetails::Error(ErrorItem {
+                        message: "invalid global instructions".to_string(),
+                    }),
+                },
+            })],
+            status: CodexStatus::Running,
+        }
+    );
+}
+
+#[test]
+fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            ThreadItemPayload::McpToolCall {
+                id: "mcp-1".to_string(),
+                server: "search service".to_string(),
+                tool: "web_run".to_string(),
+                status: McpToolCallStatus::Completed,
+                arguments: json!({"search_query": [{"q": "OpenAI Codex CLI documentation"}]}),
+                app_context: None,
+                mcp_app_resource_uri: None,
+                mcp_app_ui: None,
+                plugin_id: None,
+                read_only_hint: None,
+                result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+                    content: vec![json!({"type": "text", "text": "search result"})],
+                    structured_content: None,
+                    meta: Some(json!({"raw_messages": [{"ref_id": "turn0search0"}]})),
+                })),
+                error: None,
+                duration_ms: Some(42),
+            },
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ),
+    ));
+
+    assert_eq!(collected.status, CodexStatus::Running);
+    assert_eq!(collected.events.len(), 1);
+
+    let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = &collected.events[0] else {
+        panic!("expected item.completed event");
+    };
+    let ThreadItemDetails::McpToolCall(item) = &item.details else {
+        panic!("expected MCP tool call item");
+    };
+    let result = item.result.as_ref().expect("expected MCP tool result");
+    assert_eq!(
+        result.meta,
+        Some(json!({"raw_messages": [{"ref_id": "turn0search0"}]}))
+    );
+
+    let serialized = serde_json::to_value(&collected.events[0]).expect("serialize event");
+    assert_eq!(
+        serialized["item"]["result"]["_meta"],
+        json!({"raw_messages": [{"ref_id": "turn0search0"}]})
+    );
+    assert!(serialized["item"]["result"].get("meta").is_none());
 }

@@ -1,6 +1,6 @@
 ---
-source: tui/src/chatwidget/tests.rs
-expression: terminal.backend()
+source: tui/src/chatwidget/tests/status_and_layout.rs
+expression: normalized_backend_snapshot(terminal.backend())
 ---
 "                                                                                                    "
 "                                                                                                    "
@@ -9,6 +9,7 @@ expression: terminal.backend()
 "  Reason: this is a test reason such as one that would be produced by the model                     "
 "                                                                                                    "
 "  $ echo 'hello world'                                                                              "
+"                                                                                                    "
 "                                                                                                    "
 "› 1. Yes, proceed (y)                                                                               "
 "  2. Yes, and don't ask again for commands that start with `echo 'hello world'` (p)                 "

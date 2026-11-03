@@ -1,30 +1,31 @@
-use crate::FreeformTool;
-use crate::FreeformToolFormat;
-use crate::JsonSchema;
 use crate::ResponsesApiNamespaceTool;
-use crate::ResponsesApiTool;
 use crate::ToolName;
+use crate::ToolOutputSchema;
 use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
-use std::collections::BTreeMap;
 
 /// Augment tool descriptions with code-mode-specific exec samples.
-pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
+pub fn augment_tool_spec_for_code_mode(
+    spec: ToolSpec,
+    code_mode_input_schema_max_bytes: Option<usize>,
+) -> ToolSpec {
     match spec {
         ToolSpec::Function(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Function(tool.clone()))
-            else {
+            let Some(description) = augmented_description_for_spec(
+                &ToolSpec::Function(tool.clone()),
+                code_mode_input_schema_max_bytes,
+            ) else {
                 return ToolSpec::Function(tool);
             };
             tool.description = description;
             ToolSpec::Function(tool)
         }
         ToolSpec::Freeform(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Freeform(tool.clone()))
-            else {
+            let Some(description) = augmented_description_for_spec(
+                &ToolSpec::Freeform(tool.clone()),
+                code_mode_input_schema_max_bytes,
+            ) else {
                 return ToolSpec::Freeform(tool);
             };
             tool.description = description;
@@ -42,7 +43,29 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
-                            output_schema: tool.output_schema.clone(),
+                            input_schema_max_bytes: Some(effective_input_schema_max_bytes(
+                                tool.parameters.mcp_input_schema_max_bytes,
+                                code_mode_input_schema_max_bytes,
+                            )),
+                            output_schema: tool
+                                .output_schema
+                                .as_ref()
+                                .map(ToolOutputSchema::to_value),
+                        };
+                        tool.description =
+                            codex_code_mode::augment_tool_definition(definition).description;
+                    }
+                    ResponsesApiNamespaceTool::Custom(tool) => {
+                        let tool_name =
+                            ToolName::namespaced(namespace.name.clone(), tool.name.clone());
+                        let definition = CodeModeToolDefinition {
+                            name: code_mode_name_for_tool_name(&tool_name),
+                            tool_name,
+                            description: tool.description.clone(),
+                            kind: CodeModeToolKind::Freeform,
+                            input_schema: None,
+                            input_schema_max_bytes: None,
+                            output_schema: None,
                         };
                         tool.description =
                             codex_code_mode::augment_tool_definition(definition).description;
@@ -58,17 +81,32 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
 /// Convert a supported nested tool spec into the code-mode runtime shape,
 /// including the code-mode-specific description sample.
 pub fn tool_spec_to_code_mode_tool_definition(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
-    let definition = code_mode_tool_definition_for_spec(spec)?;
+    let definition =
+        code_mode_tool_definition_for_spec(spec, /*code_mode_input_schema_max_bytes*/ None)?;
     codex_code_mode::is_code_mode_nested_tool(&definition.name)
         .then(|| codex_code_mode::augment_tool_definition(definition))
 }
 
 pub fn collect_code_mode_tool_definitions<'a>(
     specs: impl IntoIterator<Item = &'a ToolSpec>,
+    code_mode_input_schema_max_bytes: Option<usize>,
 ) -> Vec<CodeModeToolDefinition> {
     let mut tool_definitions = specs
         .into_iter()
-        .flat_map(code_mode_tool_definitions_for_spec)
+        .flat_map(|spec| {
+            let mut definitions =
+                code_mode_tool_definitions_for_spec(spec, code_mode_input_schema_max_bytes);
+            if let ToolSpec::Namespace(namespace) = spec {
+                let namespace_description = namespace.description.trim();
+                if !namespace_description.is_empty() {
+                    for definition in &mut definitions {
+                        definition.description =
+                            format!("{}\n\n{namespace_description}", definition.description);
+                    }
+                }
+            }
+            definitions
+        })
         .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
         .map(codex_code_mode::augment_tool_definition)
         .collect::<Vec<_>>();
@@ -79,10 +117,13 @@ pub fn collect_code_mode_tool_definitions<'a>(
 
 pub fn collect_code_mode_exec_prompt_tool_definitions<'a>(
     specs: impl IntoIterator<Item = &'a ToolSpec>,
+    code_mode_input_schema_max_bytes: Option<usize>,
 ) -> Vec<CodeModeToolDefinition> {
     let mut tool_definitions = specs
         .into_iter()
-        .flat_map(code_mode_tool_definitions_for_spec)
+        .flat_map(|spec| {
+            code_mode_tool_definitions_for_spec(spec, code_mode_input_schema_max_bytes)
+        })
         .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
         .collect::<Vec<_>>();
     tool_definitions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -90,94 +131,37 @@ pub fn collect_code_mode_exec_prompt_tool_definitions<'a>(
     tool_definitions
 }
 
-pub fn create_wait_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "cell_id".to_string(),
-            JsonSchema::string(Some("Identifier of the running exec cell.".to_string())),
-        ),
-        (
-            "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                "How long to wait (in milliseconds) for more output before yielding again."
-                    .to_string(),
-            )),
-        ),
-        (
-            "max_tokens".to_string(),
-            JsonSchema::number(Some(
-                "Maximum number of output tokens to return for this wait call.".to_string(),
-            )),
-        ),
-        (
-            "terminate".to_string(),
-            JsonSchema::boolean(Some(
-                "Whether to terminate the running exec cell.".to_string(),
-            )),
-        ),
-    ]);
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: codex_code_mode::WAIT_TOOL_NAME.to_string(),
-        description: format!(
-            "Waits on a yielded `{}` cell and returns new output or completion.\n{}",
-            codex_code_mode::PUBLIC_TOOL_NAME,
-            codex_code_mode::build_wait_tool_description().trim()
-        ),
-        strict: false,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["cell_id".to_string()]),
-            Some(false.into()),
-        ),
-        output_schema: None,
-        defer_loading: None,
-    })
-}
-
-pub fn create_code_mode_tool(
-    enabled_tools: &[CodeModeToolDefinition],
-    namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
-    code_mode_only: bool,
-    deferred_tools_available: bool,
-) -> ToolSpec {
-    const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
-start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
-SOURCE: /[\s\S]+/
-"#;
-
-    ToolSpec::Freeform(FreeformTool {
-        name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-        description: codex_code_mode::build_exec_tool_description(
-            enabled_tools,
-            namespace_descriptions,
-            code_mode_only,
-            deferred_tools_available,
-        ),
-        format: FreeformToolFormat {
-            r#type: "grammar".to_string(),
-            syntax: "lark".to_string(),
-            definition: CODE_MODE_FREEFORM_GRAMMAR.to_string(),
-        },
-    })
-}
-
-fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
-    code_mode_tool_definition_for_spec(spec)
+fn augmented_description_for_spec(
+    spec: &ToolSpec,
+    code_mode_input_schema_max_bytes: Option<usize>,
+) -> Option<String> {
+    code_mode_tool_definition_for_spec(spec, code_mode_input_schema_max_bytes)
         .map(codex_code_mode::augment_tool_definition)
         .map(|definition| definition.description)
 }
 
-fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
-    code_mode_tool_definitions_for_spec(spec).into_iter().next()
+fn code_mode_tool_definition_for_spec(
+    spec: &ToolSpec,
+    code_mode_input_schema_max_bytes: Option<usize>,
+) -> Option<CodeModeToolDefinition> {
+    code_mode_tool_definitions_for_spec(spec, code_mode_input_schema_max_bytes)
+        .into_iter()
+        .next()
 }
 
-fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefinition> {
+fn effective_input_schema_max_bytes(
+    mcp_input_schema_max_bytes: Option<usize>,
+    code_mode_max_bytes: Option<usize>,
+) -> usize {
+    codex_code_mode::DEFAULT_INPUT_SCHEMA_MAX_BYTES
+        .max(code_mode_max_bytes.unwrap_or_default())
+        .max(mcp_input_schema_max_bytes.unwrap_or_default())
+}
+
+fn code_mode_tool_definitions_for_spec(
+    spec: &ToolSpec,
+    code_mode_input_schema_max_bytes: Option<usize>,
+) -> Vec<CodeModeToolDefinition> {
     match spec {
         ToolSpec::Function(tool) => {
             let name = tool.name.clone();
@@ -187,7 +171,11 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
-                output_schema: tool.output_schema.clone(),
+                input_schema_max_bytes: Some(effective_input_schema_max_bytes(
+                    tool.parameters.mcp_input_schema_max_bytes,
+                    code_mode_input_schema_max_bytes,
+                )),
+                output_schema: tool.output_schema.as_ref().map(ToolOutputSchema::to_value),
             }]
         }
         ToolSpec::Freeform(tool) => {
@@ -198,6 +186,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Freeform,
                 input_schema: None,
+                input_schema_max_bytes: None,
                 output_schema: None,
             }]
         }
@@ -213,24 +202,72 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                         description: tool.description.clone(),
                         kind: CodeModeToolKind::Function,
                         input_schema: serde_json::to_value(&tool.parameters).ok(),
-                        output_schema: tool.output_schema.clone(),
+                        input_schema_max_bytes: Some(effective_input_schema_max_bytes(
+                            tool.parameters.mcp_input_schema_max_bytes,
+                            code_mode_input_schema_max_bytes,
+                        )),
+                        output_schema: tool.output_schema.as_ref().map(ToolOutputSchema::to_value),
+                    }
+                }
+                ResponsesApiNamespaceTool::Custom(tool) => {
+                    let tool_name = ToolName::namespaced(namespace.name.clone(), tool.name.clone());
+                    CodeModeToolDefinition {
+                        name: code_mode_name_for_tool_name(&tool_name),
+                        tool_name,
+                        description: tool.description.clone(),
+                        kind: CodeModeToolKind::Freeform,
+                        input_schema: None,
+                        input_schema_max_bytes: None,
+                        output_schema: None,
                     }
                 }
             })
             .collect(),
-        ToolSpec::LocalShell {}
-        | ToolSpec::ImageGeneration { .. }
-        | ToolSpec::ToolSearch { .. }
-        | ToolSpec::WebSearch { .. } => Vec::new(),
+        ToolSpec::ToolSearch { parameters, .. } => {
+            let name = spec.name().to_string();
+            vec![CodeModeToolDefinition {
+                tool_name: ToolName::plain(name.clone()),
+                name,
+                description: codex_code_mode::TOOL_SEARCH_GUIDANCE.to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: serde_json::to_value(parameters).ok(),
+                input_schema_max_bytes: Some(effective_input_schema_max_bytes(
+                    parameters.mcp_input_schema_max_bytes,
+                    code_mode_input_schema_max_bytes,
+                )),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tools": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "description": { "type": "string" }
+                                },
+                                "required": ["name", "description"]
+                            }
+                        }
+                    },
+                    "required": ["tools"]
+                })),
+            }]
+        }
+        ToolSpec::WebSearch { .. } => Vec::new(),
     }
 }
 
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
+    if tool_name.is_default_namespace() {
+        return tool_name.name.clone();
+    }
+
     match tool_name.namespace.as_deref() {
         Some(namespace) if namespace.ends_with('_') || tool_name.name.starts_with('_') => {
             format!("{namespace}{}", tool_name.name)
         }
-        Some(namespace) => format!("{namespace}_{}", tool_name.name),
+        Some(namespace) => format!("{namespace}__{}", tool_name.name),
         None => tool_name.name.clone(),
     }
 }

@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Entry-point for the `codex-exec` binary.
 //!
 //! When this CLI is invoked normally, it parses the standard `codex-exec` CLI
@@ -32,8 +36,7 @@ fn main() -> anyhow::Result<()> {
         let mut inner = top_cli.inner;
         inner
             .config_overrides
-            .raw_overrides
-            .splice(0..0, top_cli.config_overrides.raw_overrides);
+            .prepend_root_overrides(top_cli.config_overrides);
 
         run_main(inner, arg0_paths).await?;
         Ok(())

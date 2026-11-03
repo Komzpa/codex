@@ -1,3 +1,7 @@
+//! Read clipboard images and text on the TUI host. Text reads run on the clipboard worker.
+
+pub(crate) mod text;
+
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::Builder;
@@ -73,9 +77,13 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         img
     } else {
         let _span = tracing::debug_span!("get_image").entered();
-        let img = cb
-            .get_image()
-            .map_err(|e| PasteImageError::NoImage(e.to_string()))?;
+        let img = cb.get_image().map_err(|e| {
+            if cfg!(windows) && !matches!(e, arboard::Error::ContentNotAvailable) {
+                PasteImageError::ClipboardUnavailable(e.to_string())
+            } else {
+                PasteImageError::NoImage(e.to_string())
+            }
+        })?;
         let w = img.width as u32;
         let h = img.height as u32;
         tracing::debug!("clipboard image opened from image: {}x{}", w, h);
@@ -236,6 +244,12 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
     ))
 }
 
+/// Normalize pasted text for a single-line search query.
+pub(crate) fn normalize_pasted_search_query(pasted: &str) -> Option<String> {
+    let normalized = pasted.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 /// Normalize pasted text that may represent a filesystem path.
 ///
 /// Supports:
@@ -365,6 +379,19 @@ pub fn pasted_image_format(path: &Path) -> EncodedImageFormat {
         Some("png") => EncodedImageFormat::Png,
         Some("jpg") | Some("jpeg") => EncodedImageFormat::Jpeg,
         _ => EncodedImageFormat::Other,
+    }
+}
+
+#[cfg(test)]
+mod pasted_search_query_tests {
+    use super::*;
+
+    #[test]
+    fn collapses_whitespace() {
+        assert_eq!(
+            normalize_pasted_search_query("  alpha\n\tbeta\r\n gamma  "),
+            Some(String::from("alpha beta gamma"))
+        );
     }
 }
 

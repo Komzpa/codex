@@ -12,18 +12,14 @@ use crate::protocol::v2::DynamicToolCallStatus;
 use crate::protocol::v2::FileChangePatchUpdatedNotification;
 use crate::protocol::v2::ItemCompletedNotification;
 use crate::protocol::v2::ItemStartedNotification;
-use crate::protocol::v2::McpToolCallError;
-use crate::protocol::v2::McpToolCallResult;
-use crate::protocol::v2::McpToolCallStatus;
 use crate::protocol::v2::PlanDeltaNotification;
 use crate::protocol::v2::ReasoningSummaryPartAddedNotification;
 use crate::protocol::v2::ReasoningSummaryTextDeltaNotification;
 use crate::protocol::v2::ReasoningTextDeltaNotification;
 use crate::protocol::v2::TerminalInteractionNotification;
-use crate::protocol::v2::ThreadItem;
+use crate::protocol::v2::ThreadItemPayload;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::protocol::EventMsg;
-use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 /// Build the v2 app-server notification that directly corresponds to a single core event.
@@ -46,7 +42,7 @@ pub fn item_event_to_server_notification(
                 DynamicToolCallStatus::Failed
             };
             let duration_ms = i64::try_from(response.duration.as_millis()).ok();
-            let item = ThreadItem::DynamicToolCall {
+            let item = ThreadItemPayload::DynamicToolCall {
                 id: response.call_id,
                 namespace: response.namespace,
                 tool: response.tool,
@@ -63,78 +59,25 @@ pub fn item_event_to_server_notification(
                             CoreDynamicToolCallOutputContentItem::InputImage { image_url } => {
                                 DynamicToolCallOutputContentItem::InputImage { image_url }
                             }
+                            CoreDynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                DynamicToolCallOutputContentItem::InputAudio { audio_url }
+                            }
                         })
                         .collect(),
                 ),
                 success: Some(response.success),
                 duration_ms,
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
-                turn_id: response.turn_id,
+                response.turn_id,
                 item,
-            })
-        }
-        EventMsg::McpToolCallBegin(begin_event) => {
-            let item = ThreadItem::McpToolCall {
-                id: begin_event.call_id,
-                server: begin_event.invocation.server,
-                tool: begin_event.invocation.tool,
-                status: McpToolCallStatus::InProgress,
-                arguments: begin_event.invocation.arguments.unwrap_or(JsonValue::Null),
-                mcp_app_resource_uri: begin_event.mcp_app_resource_uri,
-                result: None,
-                error: None,
-                duration_ms: None,
-            };
-            ServerNotification::ItemStarted(ItemStartedNotification {
-                thread_id,
-                turn_id,
-                item,
-            })
-        }
-        EventMsg::McpToolCallEnd(end_event) => {
-            let status = if end_event.is_success() {
-                McpToolCallStatus::Completed
-            } else {
-                McpToolCallStatus::Failed
-            };
-            let duration_ms = i64::try_from(end_event.duration.as_millis()).ok();
-            let (result, error) = match &end_event.result {
-                Ok(value) => (
-                    Some(Box::new(McpToolCallResult {
-                        content: value.content.clone(),
-                        structured_content: value.structured_content.clone(),
-                        meta: value.meta.clone(),
-                    })),
-                    None,
-                ),
-                Err(message) => (
-                    None,
-                    Some(McpToolCallError {
-                        message: message.clone(),
-                    }),
-                ),
-            };
-            let item = ThreadItem::McpToolCall {
-                id: end_event.call_id,
-                server: end_event.invocation.server,
-                tool: end_event.invocation.tool,
-                status,
-                arguments: end_event.invocation.arguments.unwrap_or(JsonValue::Null),
-                mcp_app_resource_uri: end_event.mcp_app_resource_uri,
-                result,
-                error,
-                duration_ms,
-            };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
-                thread_id,
-                turn_id,
-                item,
-            })
+                /*started_at_ms*/ None,
+                response.completed_at_ms,
+            ))
         }
         EventMsg::CollabAgentSpawnBegin(begin_event) => {
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::SpawnAgent,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -145,11 +88,12 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: Some(begin_event.reasoning_effort),
                 agents_states: HashMap::new(),
             };
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                begin_event.started_at_ms,
+            ))
         }
         EventMsg::CollabAgentSpawnEnd(end_event) => {
             let has_receiver = end_event.new_thread_id.is_some();
@@ -172,7 +116,7 @@ pub fn item_event_to_server_notification(
                 }
                 None => (Vec::new(), HashMap::new()),
             };
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::SpawnAgent,
                 status,
@@ -183,15 +127,17 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: Some(end_event.reasoning_effort),
                 agents_states,
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                /*started_at_ms*/ None,
+                end_event.completed_at_ms,
+            ))
         }
         EventMsg::CollabAgentInteractionBegin(begin_event) => {
             let receiver_thread_ids = vec![begin_event.receiver_thread_id.to_string()];
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::SendInput,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -202,11 +148,12 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                begin_event.started_at_ms,
+            ))
         }
         EventMsg::CollabAgentInteractionEnd(end_event) => {
             let status = match &end_event.status {
@@ -218,7 +165,7 @@ pub fn item_event_to_server_notification(
             };
             let receiver_id = end_event.receiver_thread_id.to_string();
             let received_status = CollabAgentState::from(end_event.status);
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::SendInput,
                 status,
@@ -229,11 +176,30 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                /*started_at_ms*/ None,
+                end_event.completed_at_ms,
+            ))
+        }
+        EventMsg::SubAgentActivity(activity) => {
+            let item = ThreadItemPayload::SubAgentActivity {
+                model: activity.model,
+                reasoning_effort: activity.reasoning_effort,
+                id: activity.event_id,
+                kind: activity.kind.into(),
+                agent_thread_id: activity.agent_thread_id.to_string(),
+                agent_path: String::from(activity.agent_path),
+            };
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+                thread_id,
+                turn_id,
+                item,
+                /*started_at_ms*/ None,
+                activity.occurred_at_ms,
+            ))
         }
         EventMsg::CollabWaitingBegin(begin_event) => {
             let receiver_thread_ids = begin_event
@@ -241,7 +207,7 @@ pub fn item_event_to_server_notification(
                 .iter()
                 .map(ToString::to_string)
                 .collect();
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::Wait,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -252,11 +218,12 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                begin_event.started_at_ms,
+            ))
         }
         EventMsg::CollabWaitingEnd(end_event) => {
             let status = if end_event.statuses.values().any(|status| {
@@ -276,7 +243,7 @@ pub fn item_event_to_server_notification(
                 .iter()
                 .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
                 .collect();
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::Wait,
                 status,
@@ -287,14 +254,16 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states,
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                /*started_at_ms*/ None,
+                end_event.completed_at_ms,
+            ))
         }
         EventMsg::CollabCloseBegin(begin_event) => {
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::CloseAgent,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -305,11 +274,12 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                begin_event.started_at_ms,
+            ))
         }
         EventMsg::CollabCloseEnd(end_event) => {
             let status = match &end_event.status {
@@ -326,7 +296,7 @@ pub fn item_event_to_server_notification(
             )]
             .into_iter()
             .collect();
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::CloseAgent,
                 status,
@@ -337,14 +307,16 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states,
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                /*started_at_ms*/ None,
+                end_event.completed_at_ms,
+            ))
         }
         EventMsg::CollabResumeBegin(begin_event) => {
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::ResumeAgent,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -355,11 +327,12 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                begin_event.started_at_ms,
+            ))
         }
         EventMsg::CollabResumeEnd(end_event) => {
             let status = match &end_event.status {
@@ -376,7 +349,7 @@ pub fn item_event_to_server_notification(
             )]
             .into_iter()
             .collect();
-            let item = ThreadItem::CollabAgentToolCall {
+            let item = ThreadItemPayload::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::ResumeAgent,
                 status,
@@ -387,11 +360,13 @@ pub fn item_event_to_server_notification(
                 reasoning_effort: None,
                 agents_states,
             };
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
                 item,
-            })
+                /*started_at_ms*/ None,
+                end_event.completed_at_ms,
+            ))
         }
         EventMsg::AgentMessageContentDelta(event) => {
             let codex_protocol::protocol::AgentMessageContentDeltaEvent { item_id, delta, .. } =
@@ -436,18 +411,21 @@ pub fn item_event_to_server_notification(
             })
         }
         EventMsg::ItemStarted(item_started_event) => {
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
-                item: item_started_event.item.into(),
-            })
+                ThreadItemPayload::from(item_started_event.item),
+                item_started_event.started_at_ms,
+            ))
         }
         EventMsg::ItemCompleted(item_completed_event) => {
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
-                item: item_completed_event.item.into(),
-            })
+                ThreadItemPayload::from(item_completed_event.item),
+                item_completed_event.started_at_ms,
+                item_completed_event.completed_at_ms,
+            ))
         }
         EventMsg::PatchApplyUpdated(event) => {
             ServerNotification::FileChangePatchUpdated(FileChangePatchUpdatedNotification {
@@ -458,11 +436,12 @@ pub fn item_event_to_server_notification(
             })
         }
         EventMsg::ExecCommandBegin(exec_command_begin_event) => {
-            ServerNotification::ItemStarted(ItemStartedNotification {
+            ServerNotification::ItemStarted(ItemStartedNotification::new(
                 thread_id,
                 turn_id,
-                item: build_command_execution_begin_item(&exec_command_begin_event),
-            })
+                build_command_execution_begin_item(&exec_command_begin_event),
+                exec_command_begin_event.started_at_ms,
+            ))
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id;
@@ -486,11 +465,13 @@ pub fn item_event_to_server_notification(
             })
         }
         EventMsg::ExecCommandEnd(exec_command_end_event) => {
-            ServerNotification::ItemCompleted(ItemCompletedNotification {
+            ServerNotification::ItemCompleted(ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
-                item: build_command_execution_end_item(&exec_command_end_event),
-            })
+                build_command_execution_end_item(&exec_command_end_event),
+                /*started_at_ms*/ None,
+                exec_command_end_event.completed_at_ms,
+            ))
         }
         _ => unreachable!("unsupported item event"),
     }
@@ -500,17 +481,11 @@ pub fn item_event_to_server_notification(
 mod tests {
     use super::*;
     use codex_protocol::ThreadId;
-    use codex_protocol::mcp::CallToolResult;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
     use codex_protocol::protocol::ExecOutputStream;
-    use codex_protocol::protocol::McpInvocation;
-    use codex_protocol::protocol::McpToolCallBeginEvent;
-    use codex_protocol::protocol::McpToolCallEndEvent;
     use pretty_assertions::assert_eq;
-    use rmcp::model::Content;
-    use std::time::Duration;
 
     fn assert_item_started_server_notification(
         notification: ServerNotification,
@@ -548,6 +523,7 @@ mod tests {
     fn collab_resume_begin_maps_to_item_started_resume_agent() {
         let event = CollabResumeBeginEvent {
             call_id: "call-1".to_string(),
+            started_at_ms: 123,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -561,10 +537,10 @@ mod tests {
         );
         assert_item_started_server_notification(
             notification,
-            ItemStartedNotification {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                item: ThreadItem::CollabAgentToolCall {
+            ItemStartedNotification::new(
+                "thread-1".to_string(),
+                "turn-1".to_string(),
+                ThreadItemPayload::CollabAgentToolCall {
                     id: event.call_id,
                     tool: CollabAgentTool::ResumeAgent,
                     status: CollabAgentToolCallStatus::InProgress,
@@ -575,7 +551,8 @@ mod tests {
                     reasoning_effort: None,
                     agents_states: HashMap::new(),
                 },
-            },
+                event.started_at_ms,
+            ),
         );
     }
 
@@ -583,6 +560,7 @@ mod tests {
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
         let event = CollabResumeEndEvent {
             call_id: "call-2".to_string(),
+            completed_at_ms: 456,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -598,10 +576,10 @@ mod tests {
         );
         assert_item_completed_server_notification(
             notification,
-            ItemCompletedNotification {
-                thread_id: "thread-2".to_string(),
-                turn_id: "turn-2".to_string(),
-                item: ThreadItem::CollabAgentToolCall {
+            ItemCompletedNotification::new(
+                "thread-2".to_string(),
+                "turn-2".to_string(),
+                ThreadItemPayload::CollabAgentToolCall {
                     id: event.call_id,
                     tool: CollabAgentTool::ResumeAgent,
                     status: CollabAgentToolCallStatus::Failed,
@@ -617,180 +595,9 @@ mod tests {
                     .into_iter()
                     .collect(),
                 },
-            },
-        );
-    }
-
-    #[test]
-    fn mcp_tool_call_begin_maps_to_item_started_notification_with_args() {
-        let begin_event = McpToolCallBeginEvent {
-            call_id: "call_123".to_string(),
-            invocation: McpInvocation {
-                server: "codex".to_string(),
-                tool: "list_mcp_resources".to_string(),
-                arguments: Some(serde_json::json!({"server": ""})),
-            },
-            mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::McpToolCallBegin(begin_event.clone()),
-            "thread-1",
-            "turn_1",
-        );
-        assert_item_started_server_notification(
-            notification,
-            ItemStartedNotification {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn_1".to_string(),
-                item: ThreadItem::McpToolCall {
-                    id: begin_event.call_id,
-                    server: begin_event.invocation.server,
-                    tool: begin_event.invocation.tool,
-                    status: McpToolCallStatus::InProgress,
-                    arguments: serde_json::json!({"server": ""}),
-                    mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
-                    result: None,
-                    error: None,
-                    duration_ms: None,
-                },
-            },
-        );
-    }
-
-    #[test]
-    fn mcp_tool_call_begin_maps_to_item_started_notification_without_args() {
-        let begin_event = McpToolCallBeginEvent {
-            call_id: "call_456".to_string(),
-            invocation: McpInvocation {
-                server: "codex".to_string(),
-                tool: "list_mcp_resources".to_string(),
-                arguments: None,
-            },
-            mcp_app_resource_uri: None,
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::McpToolCallBegin(begin_event.clone()),
-            "thread-2",
-            "turn_2",
-        );
-        assert_item_started_server_notification(
-            notification,
-            ItemStartedNotification {
-                thread_id: "thread-2".to_string(),
-                turn_id: "turn_2".to_string(),
-                item: ThreadItem::McpToolCall {
-                    id: begin_event.call_id,
-                    server: begin_event.invocation.server,
-                    tool: begin_event.invocation.tool,
-                    status: McpToolCallStatus::InProgress,
-                    arguments: JsonValue::Null,
-                    mcp_app_resource_uri: None,
-                    result: None,
-                    error: None,
-                    duration_ms: None,
-                },
-            },
-        );
-    }
-
-    #[test]
-    fn mcp_tool_call_end_maps_to_item_completed_notification_on_success() {
-        let content = vec![
-            serde_json::to_value(Content::text("{\"resources\":[]}"))
-                .expect("content should serialize"),
-        ];
-        let result = CallToolResult {
-            content: content.clone(),
-            is_error: Some(false),
-            structured_content: None,
-            meta: Some(serde_json::json!({
-                "ui/resourceUri": "ui://widget/list-resources.html"
-            })),
-        };
-
-        let end_event = McpToolCallEndEvent {
-            call_id: "call_789".to_string(),
-            invocation: McpInvocation {
-                server: "codex".to_string(),
-                tool: "list_mcp_resources".to_string(),
-                arguments: Some(serde_json::json!({"server": ""})),
-            },
-            mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
-            duration: Duration::from_nanos(92708),
-            result: Ok(result),
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::McpToolCallEnd(end_event.clone()),
-            "thread-3",
-            "turn_3",
-        );
-        assert_item_completed_server_notification(
-            notification,
-            ItemCompletedNotification {
-                thread_id: "thread-3".to_string(),
-                turn_id: "turn_3".to_string(),
-                item: ThreadItem::McpToolCall {
-                    id: end_event.call_id,
-                    server: end_event.invocation.server,
-                    tool: end_event.invocation.tool,
-                    status: McpToolCallStatus::Completed,
-                    arguments: serde_json::json!({"server": ""}),
-                    mcp_app_resource_uri: Some("ui://widget/list-resources.html".to_string()),
-                    result: Some(Box::new(McpToolCallResult {
-                        content,
-                        structured_content: None,
-                        meta: Some(serde_json::json!({
-                            "ui/resourceUri": "ui://widget/list-resources.html"
-                        })),
-                    })),
-                    error: None,
-                    duration_ms: Some(0),
-                },
-            },
-        );
-    }
-
-    #[test]
-    fn mcp_tool_call_end_maps_to_item_completed_notification_on_error() {
-        let end_event = McpToolCallEndEvent {
-            call_id: "call_err".to_string(),
-            invocation: McpInvocation {
-                server: "codex".to_string(),
-                tool: "list_mcp_resources".to_string(),
-                arguments: None,
-            },
-            mcp_app_resource_uri: None,
-            duration: Duration::from_millis(1),
-            result: Err("boom".to_string()),
-        };
-
-        let notification = item_event_to_server_notification(
-            EventMsg::McpToolCallEnd(end_event.clone()),
-            "thread-4",
-            "turn_4",
-        );
-        assert_item_completed_server_notification(
-            notification,
-            ItemCompletedNotification {
-                thread_id: "thread-4".to_string(),
-                turn_id: "turn_4".to_string(),
-                item: ThreadItem::McpToolCall {
-                    id: end_event.call_id,
-                    server: end_event.invocation.server,
-                    tool: end_event.invocation.tool,
-                    status: McpToolCallStatus::Failed,
-                    arguments: JsonValue::Null,
-                    mcp_app_resource_uri: None,
-                    result: None,
-                    error: Some(McpToolCallError {
-                        message: "boom".to_string(),
-                    }),
-                    duration_ms: Some(1),
-                },
-            },
+                /*started_at_ms*/ None,
+                event.completed_at_ms,
+            ),
         );
     }
 

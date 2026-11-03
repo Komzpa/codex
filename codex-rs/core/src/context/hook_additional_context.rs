@@ -1,22 +1,43 @@
 use super::ContextualUserFragment;
+use codex_hooks::HookContext;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ContentItemMetadata;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HookAdditionalContext {
-    text: String,
+    context: HookContext,
 }
 
 impl HookAdditionalContext {
-    pub(crate) fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+    pub(crate) fn new(context: HookContext) -> Self {
+        Self { context }
     }
 }
 
 impl ContextualUserFragment for HookAdditionalContext {
-    const ROLE: &'static str = "developer";
-    const START_MARKER: &'static str = "";
-    const END_MARKER: &'static str = "";
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("hooks.additional_context".to_string())
+    }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+
+    fn body(&self) -> ContentItem {
+        input_text(self.context.text.clone())
+    }
+
+    fn content_metadata(&self) -> ContentItemMetadata {
+        self.context.metadata.clone()
     }
 }

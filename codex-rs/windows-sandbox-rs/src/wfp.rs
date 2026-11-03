@@ -1,6 +1,3 @@
-#![cfg(target_os = "windows")]
-
-#[path = "wfp_filter_specs.rs"]
 mod filter_specs;
 
 use crate::to_wide;
@@ -9,23 +6,24 @@ use std::ffi::OsStr;
 use std::mem::zeroed;
 use std::ptr::null;
 use std::ptr::null_mut;
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::FWP_E_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTRL_MATCH_FILTER;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_BLOCK;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTRL_MATCH_FILTER;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_EMPTY;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_EQUAL;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_SECURITY_DESCRIPTOR_TYPE;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT8;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0_0;
@@ -33,21 +31,23 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDIT
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_PROTOCOL;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_PORT;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_CONDITION0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_PERSISTENT;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_PROVIDER0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_PROVIDER_FLAG_PERSISTENT;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_PROVIDER0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SESSION0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER_FLAG_PERSISTENT;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerDeleteByKey0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
@@ -58,6 +58,7 @@ use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::core::GUID;
 
 use filter_specs::ConditionSpec;
 use filter_specs::FILTER_SPECS;
@@ -78,9 +79,10 @@ const SUBLAYER_KEY: GUID = GUID::from_u128(0xe65054fd_4d32_4c7c_95ef_621f0cf6431
 /// Installs the persistent Codex WFP filters for `account`.
 ///
 /// This is intended to run from the already-elevated setup helper. Callers
-/// should treat any returned error as non-fatal to the rest of setup.
+/// may continue ordinary setup after an error, but must restore these filters
+/// before re-enabling accounts left disabled by interrupted cleanup.
 pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
-    let engine = Engine::open()?;
+    let engine = Engine::open(INFINITE)?;
     let mut transaction = engine.begin_transaction()?;
     ensure_provider(engine.handle)?;
     ensure_sublayer(engine.handle)?;
@@ -97,20 +99,44 @@ pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
     Ok(installed_filter_count)
 }
 
+pub(crate) fn remove_wfp_filters() -> Result<()> {
+    // Leave time for other cleanup if a WFP policy writer holds the transaction lock.
+    let engine = Engine::open(/*transaction_wait_timeout_ms*/ 1_000)?;
+    let mut transaction = engine.begin_transaction()?;
+    for spec in FILTER_SPECS {
+        delete_filter_if_present(engine.handle, &spec.key)?;
+    }
+    for (result, operation, missing) in [
+        (
+            unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &SUBLAYER_KEY) },
+            "FwpmSubLayerDeleteByKey0",
+            FWP_E_SUBLAYER_NOT_FOUND as u32,
+        ),
+        (
+            unsafe { FwpmProviderDeleteByKey0(engine.handle, &PROVIDER_KEY) },
+            "FwpmProviderDeleteByKey0",
+            FWP_E_PROVIDER_NOT_FOUND as u32,
+        ),
+    ] {
+        ensure_success_or(result, operation, &[missing, FWP_E_NOT_FOUND as u32])?;
+    }
+    transaction.commit()
+}
+
 /// Owns an open WFP engine handle and closes it on drop.
 struct Engine {
     handle: HANDLE,
 }
 
 impl Engine {
-    fn open() -> Result<Self> {
+    fn open(transaction_wait_timeout_ms: u32) -> Result<Self> {
         let session_name = to_wide(OsStr::new(SESSION_NAME));
         let mut session: FWPM_SESSION0 = unsafe { zeroed() };
         session.displayData = FWPM_DISPLAY_DATA0 {
             name: session_name.as_ptr() as *mut _,
             description: null_mut(),
         };
-        session.txnWaitTimeoutInMSec = INFINITE;
+        session.txnWaitTimeoutInMSec = transaction_wait_timeout_ms;
 
         let mut handle = HANDLE::default();
         let result = unsafe {
@@ -267,7 +293,11 @@ fn ensure_sublayer(engine: HANDLE) -> Result<()> {
 }
 
 /// Adds one blocking WFP filter from the static filter spec list.
-fn add_filter(engine: HANDLE, spec: &FilterSpec, user_condition: &UserMatchCondition) -> Result<()> {
+fn add_filter(
+    engine: HANDLE,
+    spec: &FilterSpec,
+    user_condition: &UserMatchCondition,
+) -> Result<()> {
     let filter_name = to_wide(OsStr::new(spec.name));
     let filter_description = to_wide(OsStr::new(spec.description));
     let mut filter_conditions = build_conditions(spec.conditions, user_condition);
@@ -288,7 +318,9 @@ fn add_filter(engine: HANDLE, spec: &FilterSpec, user_condition: &UserMatchCondi
         filterCondition: filter_conditions.as_mut_ptr(),
         action: FWPM_ACTION0 {
             r#type: FWP_ACTION_BLOCK,
-            Anonymous: FWPM_ACTION0_0 { filterType: zero_guid() },
+            Anonymous: FWPM_ACTION0_0 {
+                filterType: zero_guid(),
+            },
         },
         Anonymous: FWPM_FILTER0_0 { rawContext: 0 },
         reserved: null_mut(),
@@ -396,14 +428,24 @@ mod tests {
     fn filter_keys_are_unique() {
         let keys = FILTER_SPECS
             .iter()
-            .map(|spec| (spec.key.data1, spec.key.data2, spec.key.data3, spec.key.data4))
+            .map(|spec| {
+                (
+                    spec.key.data1,
+                    spec.key.data2,
+                    spec.key.data3,
+                    spec.key.data4,
+                )
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), FILTER_SPECS.len());
     }
 
     #[test]
     fn filter_names_are_unique() {
-        let names = FILTER_SPECS.iter().map(|spec| spec.name).collect::<BTreeSet<_>>();
+        let names = FILTER_SPECS
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), FILTER_SPECS.len());
     }
 }

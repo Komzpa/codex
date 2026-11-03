@@ -1,4 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TurnAborted {
@@ -17,11 +20,23 @@ impl TurnAborted {
 }
 
 impl ContextualUserFragment for TurnAborted {
-    const ROLE: &'static str = "user";
-    const START_MARKER: &'static str = "<turn_aborted>";
-    const END_MARKER: &'static str = "</turn_aborted>";
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("generic.turn_aborted".to_string())
+    }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.guidance)
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("<turn_aborted>", "</turn_aborted>")
+    }
+
+    fn body(&self) -> ContentItem {
+        input_text(format!("\n{}\n", self.guidance))
     }
 }

@@ -28,6 +28,8 @@ pub type CodexTurnId = String;
 pub type ConversationItemId = String;
 /// Local ID for one outbound upstream inference request.
 pub type InferenceCallId = String;
+/// Globally unique ID for one concrete MCP backend request.
+pub type McpCallId = String;
 /// Reducer-owned ID for one runtime tool-call object.
 pub type ToolCallId = String;
 /// Responses `call_id` / custom-tool call ID visible in inference payloads.
@@ -65,6 +67,9 @@ pub struct RolloutTrace {
     /// Wall-clock timestamp for terminal rollout status. `None` means running or partial trace.
     pub ended_at_unix_ms: Option<i64>,
     pub status: RolloutStatus,
+    /// All recorder handles closed without a recorded write failure; not task success.
+    #[serde(default)]
+    pub recording_complete: bool,
     pub root_thread_id: AgentThreadId,
     pub threads: BTreeMap<AgentThreadId, AgentThread>,
     pub codex_turns: BTreeMap<CodexTurnId, CodexTurn>,
@@ -103,6 +108,7 @@ impl RolloutTrace {
             started_at_unix_ms,
             ended_at_unix_ms: None,
             status: RolloutStatus::Running,
+            recording_complete: false,
             root_thread_id,
             threads: BTreeMap::new(),
             codex_turns: BTreeMap::new(),

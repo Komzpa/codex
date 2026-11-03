@@ -16,12 +16,13 @@
 use std::path::PathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::PermissionRequestCommandInput;
+use crate::schema::SubagentCommandInputFields;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
@@ -29,13 +30,18 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequestRequest {
     pub session_id: ThreadId,
     pub turn_id: String,
+    pub subagent: Option<common::SubagentHookContext>,
     pub cwd: PathBuf,
+    /// Local approval action cwd for hook stdin. Remote commands leave this unset
+    /// to retain the host cwd. The hook process still runs in `cwd`.
+    pub tool_cwd: Option<PathUri>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -83,13 +89,12 @@ pub(crate) fn preview(
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
+    engine: &ClaudeHooksEngine,
     request: PermissionRequestRequest,
 ) -> PermissionRequestOutcome {
     let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
     let matched = dispatcher::select_handlers_for_matcher_inputs(
-        handlers,
+        &engine.handlers,
         HookEventName::PermissionRequest,
         &matcher_inputs,
     );
@@ -100,8 +105,8 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match serde_json::to_string(&build_command_input(&request)) {
-        Ok(input_json) => input_json,
+    let input = match serde_json::to_value(build_command_input(&request)) {
+        Ok(input) => input,
         Err(error) => {
             let hook_events = common::serialization_failure_hook_events_for_tool_use(
                 matched,
@@ -117,9 +122,9 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id.clone()),
         parse_completed,
@@ -168,11 +173,14 @@ fn resolve_permission_request_decision<'a>(
 }
 
 fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestCommandInput {
+    let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     PermissionRequestCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
+        agent_id: subagent.agent_id,
+        agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_ref(), request.tool_cwd.as_ref()),
         hook_event_name: "PermissionRequest".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
@@ -183,7 +191,7 @@ fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestC
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<PermissionRequestHandlerData> {
     let mut entries = Vec::new();
@@ -211,28 +219,36 @@ fn parse_completed(
                             text: system_message,
                         });
                     }
-                    if let Some(invalid_reason) = parsed.invalid_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
-                    } else if let Some(parsed_decision) = parsed.decision {
-                        match parsed_decision {
-                            output_parser::PermissionRequestDecision::Allow => {
-                                decision = Some(PermissionRequestDecision::Allow);
-                            }
-                            output_parser::PermissionRequestDecision::Deny { message } => {
-                                status = HookRunStatus::Blocked;
-                                entries.push(HookOutputEntry {
-                                    kind: HookOutputEntryKind::Feedback,
-                                    text: message.clone(),
-                                });
-                                decision = Some(PermissionRequestDecision::Deny { message });
+                    if handler.can_apply_control_effects() {
+                        if let Some(invalid_reason) = parsed.invalid_reason {
+                            status = HookRunStatus::Failed;
+                            entries.push(HookOutputEntry {
+                                kind: HookOutputEntryKind::Error,
+                                text: invalid_reason,
+                            });
+                        } else if let Some(parsed_decision) = parsed.decision {
+                            match parsed_decision {
+                                output_parser::PermissionRequestDecision::Allow => {
+                                    // Environment authority may restrict the controller's policy, never grant it.
+                                    if !matches!(
+                                        handler.source_path,
+                                        crate::engine::HandlerSourcePath::Environment { .. }
+                                    ) {
+                                        decision = Some(PermissionRequestDecision::Allow);
+                                    }
+                                }
+                                output_parser::PermissionRequestDecision::Deny { message } => {
+                                    status = HookRunStatus::Blocked;
+                                    entries.push(HookOutputEntry {
+                                        kind: HookOutputEntryKind::Feedback,
+                                        text: message.clone(),
+                                    });
+                                    decision = Some(PermissionRequestDecision::Deny { message });
+                                }
                             }
                         }
                     }
-                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
+                } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -240,7 +256,7 @@ fn parse_completed(
                     });
                 }
             }
-            Some(2) => {
+            Some(2) if handler.can_apply_control_effects() => {
                 if let Some(message) = common::trimmed_non_empty(&run_result.stderr) {
                     status = HookRunStatus::Blocked;
                     entries.push(HookOutputEntry {
@@ -281,6 +297,7 @@ fn parse_completed(
     dispatcher::ParsedHandler {
         completed,
         data: PermissionRequestHandlerData { decision },
+        completion_order: 0,
     }
 }
 
@@ -290,6 +307,37 @@ mod tests {
 
     use super::PermissionRequestDecision;
     use super::resolve_permission_request_decision;
+
+    #[test]
+    fn command_input_uses_approval_cwd_path_convention() {
+        let mut request = super::PermissionRequestRequest {
+            session_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-1".into(),
+            subagent: None,
+            cwd: codex_utils_absolute_path::test_support::test_path_buf("/local"),
+            tool_cwd: None,
+            transcript_path: None,
+            model: "test".into(),
+            permission_mode: "default".into(),
+            tool_name: "Bash".into(),
+            matcher_aliases: Vec::new(),
+            run_id_suffix: "call-cwd".into(),
+            tool_input: serde_json::json!({"command": "pwd"}),
+        };
+        let original: serde_json::Value =
+            serde_json::to_value(super::build_command_input(&request)).unwrap();
+        for (uri, expected) in [
+            ("file:///repo-B", "/repo-B"),
+            ("file:///C:/repo-B", r"C:\repo-B"),
+        ] {
+            request.tool_cwd = Some(codex_utils_path_uri::PathUri::parse(uri).unwrap());
+            let actual: serde_json::Value =
+                serde_json::to_value(super::build_command_input(&request)).unwrap();
+            let mut expected_input = original.clone();
+            expected_input["cwd"] = serde_json::json!(expected);
+            assert_eq!(actual, expected_input);
+        }
+    }
 
     #[test]
     fn permission_request_deny_overrides_earlier_allow() {

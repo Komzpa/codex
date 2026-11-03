@@ -3,15 +3,22 @@ use anyhow::anyhow;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
+use codex_protocol::goal::GoalQuotaSnapshot;
+use codex_protocol::goal::ThreadGoalStage;
+use serde::Serialize;
+use serde_json::from_str;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::epoch_millis_to_datetime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ThreadGoalStatus {
     Active,
     Paused,
+    Blocked,
+    UsageLimited,
     BudgetLimited,
     Complete,
 }
@@ -21,6 +28,8 @@ impl ThreadGoalStatus {
         match self {
             Self::Active => "active",
             Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::UsageLimited => "usage_limited",
             Self::BudgetLimited => "budget_limited",
             Self::Complete => "complete",
         }
@@ -42,6 +51,8 @@ impl TryFrom<&str> for ThreadGoalStatus {
         match value {
             "active" => Ok(Self::Active),
             "paused" => Ok(Self::Paused),
+            "blocked" => Ok(Self::Blocked),
+            "usage_limited" => Ok(Self::UsageLimited),
             "budget_limited" => Ok(Self::BudgetLimited),
             "complete" => Ok(Self::Complete),
             other => Err(anyhow!("unknown thread goal status `{other}`")),
@@ -49,7 +60,7 @@ impl TryFrom<&str> for ThreadGoalStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThreadGoal {
     pub thread_id: ThreadId,
     pub goal_id: String,
@@ -60,6 +71,10 @@ pub struct ThreadGoal {
     pub time_used_seconds: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub timezone: Option<String>,
+    pub stages: Vec<ThreadGoalStage>,
+    pub initial_quota_snapshots: Vec<GoalQuotaSnapshot>,
+    pub initial_token_budget: Option<i64>,
 }
 
 pub(crate) struct ThreadGoalRow {
@@ -72,6 +87,10 @@ pub(crate) struct ThreadGoalRow {
     pub time_used_seconds: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub timezone: Option<String>,
+    pub stages_json: String,
+    pub initial_quota_snapshots_json: String,
+    pub initial_token_budget: Option<i64>,
 }
 
 impl ThreadGoalRow {
@@ -86,6 +105,10 @@ impl ThreadGoalRow {
             time_used_seconds: row.try_get("time_used_seconds")?,
             created_at_ms: row.try_get("created_at_ms")?,
             updated_at_ms: row.try_get("updated_at_ms")?,
+            timezone: row.try_get("timezone")?,
+            stages_json: row.try_get("stages_json")?,
+            initial_quota_snapshots_json: row.try_get("initial_quota_snapshots_json")?,
+            initial_token_budget: row.try_get("initial_token_budget")?,
         })
     }
 }
@@ -104,6 +127,10 @@ impl TryFrom<ThreadGoalRow> for ThreadGoal {
             time_used_seconds: row.time_used_seconds,
             created_at: epoch_millis_to_datetime(row.created_at_ms)?,
             updated_at: epoch_millis_to_datetime(row.updated_at_ms)?,
+            timezone: row.timezone,
+            stages: from_str(&row.stages_json)?,
+            initial_quota_snapshots: from_str(&row.initial_quota_snapshots_json)?,
+            initial_token_budget: row.initial_token_budget,
         })
     }
 }

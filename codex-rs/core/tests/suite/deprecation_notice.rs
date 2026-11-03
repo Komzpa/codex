@@ -1,23 +1,18 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Ok;
-use codex_app_server_protocol::ConfigLayerSource;
-use codex_config::ConfigLayerEntry;
-use codex_config::ConfigLayerStack;
-use codex_config::ConfigRequirements;
-use codex_config::ConfigRequirementsToml;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_features::Feature;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::EventMsg;
+use core_test_support::responses;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_absolute_path;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
-use toml::Value as TomlValue;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()> {
@@ -27,14 +22,12 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
 
     let mut builder = test_codex().with_config(|config| {
         let mut features = config.features.get().clone();
-        features.enable(Feature::UnifiedExec);
         features
             .record_legacy_usage_force("use_experimental_unified_exec_tool", Feature::UnifiedExec);
         config
             .features
             .set(features)
             .expect("test config should allow managed feature metadata updates");
-        config.use_experimental_unified_exec_tool = true;
     });
 
     let TestCodex { codex, .. } = builder.build(&server).await?;
@@ -57,93 +50,6 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
         ),
     );
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn emits_deprecation_notice_for_experimental_instructions_file() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-
-    let mut builder = test_codex().with_config(|config| {
-        let mut table = toml::map::Map::new();
-        table.insert(
-            "experimental_instructions_file".to_string(),
-            TomlValue::String("legacy.md".to_string()),
-        );
-        let config_layer = ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: test_absolute_path("/tmp/config.toml"),
-            },
-            TomlValue::Table(table),
-        );
-        let config_layer_stack = ConfigLayerStack::new(
-            vec![config_layer],
-            ConfigRequirements::default(),
-            ConfigRequirementsToml::default(),
-        )
-        .expect("build config layer stack");
-        config.config_layer_stack = config_layer_stack;
-    });
-
-    let TestCodex { codex, .. } = builder.build(&server).await?;
-
-    let notice = wait_for_event_match(&codex, |event| match event {
-        EventMsg::DeprecationNotice(ev)
-            if ev.summary.contains("experimental_instructions_file") =>
-        {
-            Some(ev.clone())
-        }
-        _ => None,
-    })
-    .await;
-
-    let DeprecationNoticeEvent { summary, details } = notice;
-    assert_eq!(
-        summary,
-        "`experimental_instructions_file` is deprecated and ignored. Use `model_instructions_file` instead."
-            .to_string(),
-    );
-    assert_eq!(
-        details.as_deref(),
-        Some(
-            "Move the setting to `model_instructions_file` in config.toml (or under a profile) to load instructions from a file."
-        ),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn emits_deprecation_notice_for_notify() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-
-    let mut builder = test_codex().with_config(|config| {
-        config.notify = Some(vec!["notify-send".to_string(), "Codex".to_string()]);
-    });
-
-    let TestCodex { codex, .. } = builder.build(&server).await?;
-
-    let notice = wait_for_event_match(&codex, |event| match event {
-        EventMsg::DeprecationNotice(ev) if ev.summary.contains("`notify`") => Some(ev.clone()),
-        _ => None,
-    })
-    .await;
-
-    let DeprecationNoticeEvent { summary, details } = notice;
-    assert_eq!(
-        summary,
-        "`notify` is deprecated and will be removed in a future release.".to_string(),
-    );
-    assert_eq!(
-        details.as_deref(),
-        Some(
-            "Switch to a `Stop` hook for end-of-turn automation. See https://developers.openai.com/codex/hooks."
-        ),
-    );
     Ok(())
 }
 
@@ -186,7 +92,7 @@ async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow
         assert_eq!(
             details.as_deref(),
             Some(
-                "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
+                "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
             ),
         );
     }
@@ -233,5 +139,88 @@ async fn emits_deprecation_notice_for_use_legacy_landlock() -> anyhow::Result<()
         Some("Remove this setting to stop opting into the legacy Linux sandbox behavior."),
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_zsh_config_starts_session_with_migration_notices() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            std::fs::write(
+                home.join("config.toml"),
+                r#"[features]
+shell_zsh_fork = true
+unified_exec_zsh_fork = true
+"#,
+            )
+            .expect("write legacy configuration");
+        })
+        .with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\nshell_zsh_fork = true\nunified_exec_zsh_fork = true\n",
+            ),
+        );
+    let test = builder.build_with_auto_env(&server).await?;
+
+    for feature in ["shell_zsh_fork", "unified_exec_zsh_fork"] {
+        let expected = DeprecationNoticeEvent {
+            summary: format!("`[features].{feature}` is deprecated and ignored."),
+            details: Some(format!(
+                "The patched zsh backend has been removed. Shell commands now use the standard shell executor. Remove `{feature}` from [features] in config.toml or profile configuration files."
+            )),
+        };
+        let notice = wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::DeprecationNotice(notice) if notice.summary == expected.summary => {
+                Some(notice.clone())
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            (notice.summary, notice.details),
+            (expected.summary, expected.details)
+        );
+    }
+    let shell = match core_test_support::test_target_os() {
+        core_test_support::TestTargetOs::Linux | core_test_support::TestTargetOs::MacOs => {
+            "/bin/sh"
+        }
+        core_test_support::TestTargetOs::Windows => "powershell",
+    };
+    let arguments = serde_json::json!({
+        "cmd": "echo migrated-shell",
+        "shell": shell,
+        "login": false,
+        "yield_time_ms": 10_000,
+    });
+    let mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call(
+                    "shell-migration",
+                    "exec_command",
+                    &arguments.to_string(),
+                ),
+                responses::ev_completed("response-1"),
+            ]),
+            responses::sse(vec![responses::ev_completed("response-2")]),
+        ],
+    )
+    .await;
+    test.submit_turn("run a command with the configured shell")
+        .await?;
+    let output = mock
+        .function_call_output_text("shell-migration")
+        .expect("shell tool output");
+    assert!(output.contains("Process exited with code 0\n"), "{output}");
+    assert_eq!(
+        output
+            .split_once("Output:\n")
+            .map(|(_, stdout)| stdout.trim()),
+        Some("migrated-shell")
+    );
     Ok(())
 }
