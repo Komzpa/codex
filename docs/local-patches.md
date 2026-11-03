@@ -1,6 +1,6 @@
 # Local source-refresh patches
 
-This branch is rebased on upstream `67f0994b53`. It retains focused
+This branch is rebased on upstream `9e77fb4ad5ff4975f25c4d1d121aece3c40c5176`. It retains focused
 patches that upstream did not yet cover. The archive used to reconstruct the
 set was `9c57bef5d1`; the entries below describe the current behavior, not the
 old replay chronology.
@@ -106,6 +106,15 @@ must be regenerated with `just write-app-server-schema --experimental` (or the
 `schema_fixtures_tests::write_schema_fixtures_from_env` ignored test with
 `CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL=1`) and checked with
 `cargo test -p codex-app-server-protocol --lib schema_fixtures_tests`.
+
+Run Cargo from `codex-rs/`, not from the repository root with only
+`--manifest-path`: rustup selects the pinned workspace compiler by the current
+directory. Regenerate both stable and experimental schema bundles, and the
+Python SDK through `app-server-protocol/scripts/write_schema_fixtures.py`.
+Select a generator-supported Python explicitly (`UV_PYTHON=3.14`); an ambient
+newer Python can be unsupported by the locked `datamodel_code_generator`.
+When upstream extracts test modules, move local fixture fields to the new
+`*_tests.rs` owners rather than restoring the old inline modules.
 
 Run scenario snapshots with an isolated process home and explicit Cargo and
 Rustup cache paths. An isolated `CODEX_HOME` alone does not hide skills from
