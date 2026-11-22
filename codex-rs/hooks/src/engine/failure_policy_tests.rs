@@ -201,6 +201,8 @@ async fn run(engine: &ClaudeHooksEngine, event: HookEventName) -> (bool, Vec<Hoo
                     transcript_path: None,
                     model: "test".to_string(),
                     trigger: "manual".to_string(),
+                    context_window: crate::ContextWindowUsage::default(),
+                    goal_context: None,
                 })
                 .await;
             assert_eq!(outcome.should_stop, outcome.stop_reason.is_some());
@@ -242,6 +244,8 @@ async fn run(engine: &ClaudeHooksEngine, event: HookEventName) -> (bool, Vec<Hoo
                     request_metadata: None,
                     stop_hook_active: false,
                     last_assistant_message: None,
+                    context_window: crate::ContextWindowUsage::default(),
+                    goal_context: None,
                     target,
                 })
                 .await;

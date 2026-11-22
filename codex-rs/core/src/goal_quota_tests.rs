@@ -21,6 +21,7 @@ fn provider(server: &MockServer) -> GoalQuotaProvider {
         "acct-fixture".to_string(),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
+    .unwrap()
 }
 
 fn body(account: &str, used_percent: u64) -> serde_json::Value {
@@ -179,7 +180,8 @@ async fn response_observation_is_available_without_passive_usage_url() {
         Arc::new(BearerAuthProvider::new("fixture-key".to_string())),
         "acct-fixture".to_string(),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    );
+    )
+    .unwrap();
     let limit = serde_json::from_value(serde_json::json!({
         "limit_id": "codex",
         "primary": {"used_percent": 44.0, "window_minutes": 15}

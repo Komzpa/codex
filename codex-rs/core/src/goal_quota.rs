@@ -81,9 +81,9 @@ impl GoalQuotaProvider {
         auth: SharedAuthProvider,
         scope_hint: String,
         http_client_factory: HttpClientFactory,
-    ) -> Self {
-        Self {
-            client: Client::new(base_url.clone(), http_client_factory).with_auth_provider(auth),
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: Client::new(base_url.clone(), http_client_factory).with_auth_provider(auth)?,
             runtime_provider: None,
             runtime_factory: None,
             source: if provider.usage_url.is_some() {
@@ -96,7 +96,7 @@ impl GoalQuotaProvider {
             usage_url: provider.usage_url.as_ref().map(|url| url.to_string()),
             pool_scope: format!("pool@{}", normalize_endpoint(&base_url)),
             cache: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Construct a provider that resolves the effective endpoint and auth on every refresh.
@@ -273,7 +273,9 @@ impl GoalQuotaProvider {
                 base_url
             };
             let auth = provider.api_auth().await.map_err(|err| err.to_string())?;
-            let client = Client::new(base_url.clone(), factory.clone()).with_auth_provider(auth);
+            let client = Client::new(base_url.clone(), factory.clone())
+                .with_auth_provider(auth)
+                .map_err(|err| err.to_string())?;
             let account = provider
                 .auth()
                 .await

@@ -9574,6 +9574,9 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
         thread_id,
         crate::goal_files::GoalDraft {
             objective: format!("Describe {placeholder} {image_placeholder}"),
+            schedule_editor_text: None,
+            timezone: None,
+            stages: None,
             text_elements: vec![
                 TextElement::new(
                     (9..9 + placeholder.len()).into(),

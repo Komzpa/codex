@@ -291,7 +291,9 @@ pub(super) async fn run_remote_compact_v2_attempt(
         input.pop();
         rejected_audio::project_compaction_audio(input, &mut prompt_input_metadata, &unavailable);
     };
-    let mut prompt_input = Arc::unwrap_or_clone(prompt).input;
+    let prompt = Arc::unwrap_or_clone(prompt);
+    let base_instructions = prompt.base_instructions;
+    let mut prompt_input = prompt.input;
     prompt_input.pop(); // Exclude the request-only trigger from checkpoint history.
     Ok(RemoteCompactV2Attempt {
         rejected_audio_file_ids: unavailable,
@@ -299,7 +301,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
-        base_instructions: prompt.base_instructions,
+        base_instructions,
         compaction_output,
         compaction_response_id: response_id,
         token_usage,

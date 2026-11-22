@@ -7,7 +7,8 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
-use codex_utils_audio::estimate_audio_token_count;
+use codex_thread_context_ids::ThreadContextIds;
+use codex_utils_audio::estimate_tool_audio_tokens;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_function_output_payload;
@@ -165,7 +166,7 @@ fn estimated_history_tokens(
     history: &[ResponseItemEnvelope],
     base_instructions: &BaseInstructions,
 ) -> Option<i64> {
-    let mut context = ContextManager::new();
+    let mut context = ContextManager::new(ThreadContextIds::for_thread(), /*retention*/ None);
     context.replace_annotated(history.to_vec());
     context.estimate_token_count_with_base_instructions(base_instructions)
 }
@@ -209,7 +210,7 @@ fn bound_function_output_item(item: &mut ResponseItem) -> CodexResult<()> {
                 truncate_function_output_payload(
                     output,
                     TruncationPolicy::Tokens(output_tokens),
-                    estimate_audio_token_count,
+                    estimate_tool_audio_tokens,
                 );
             }
             _ => unreachable!("response item kind was checked before bounding output"),
@@ -248,7 +249,7 @@ fn function_output_text_token_count(output: &FunctionCallOutputPayload) -> usize
 }
 
 fn estimate_item_tokens(item: &ResponseItem) -> i64 {
-    let mut item_context = ContextManager::new();
+    let mut item_context = ContextManager::new(ThreadContextIds::for_thread(), /*retention*/ None);
     item_context.replace_annotated(vec![ResponseItemEnvelope::new(item.clone())]);
     item_context
         .estimate_token_count_with_base_instructions(&BaseInstructions {
