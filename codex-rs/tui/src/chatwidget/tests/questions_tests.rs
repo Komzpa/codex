@@ -55,9 +55,9 @@ async fn accepted_question_answer_uses_existing_delivery_and_keeps_main_draft() 
             );
             let restored = chat.pop_latest_queued_composer_state().unwrap();
             assert_eq!(restored.text, expected);
-            assert!(op_rx.try_recv().is_err());
+            assert!(try_recv_input_action(&mut op_rx).is_err());
         } else {
-            assert_answer(op_rx.try_recv().unwrap(), expected);
+            assert_answer(try_recv_input_action(&mut op_rx).unwrap(), expected);
         }
     }
 }
@@ -136,9 +136,9 @@ async fn ordinary_follow_up_clears_unanswered_questions_after_accepted_input() {
                 chat.input_queue.queued_user_messages.front().unwrap().text,
                 "New prompt"
             );
-            assert!(op_rx.try_recv().is_err());
+            assert!(try_recv_input_action(&mut op_rx).is_err());
         } else {
-            assert_answer(op_rx.try_recv().unwrap(), "New prompt");
+            assert_answer(try_recv_input_action(&mut op_rx).unwrap(), "New prompt");
             insta::assert_snapshot!(
                 "questions_cleared_by_follow_up",
                 render_bottom_popup(&chat, /*width*/ 80)
@@ -165,7 +165,7 @@ async fn local_shell_command_preserves_unanswered_questions() {
 
     assert_eq!(question_count(&chat), 2);
     assert_matches!(
-        op_rx.try_recv(),
+        try_recv_input_action(&mut op_rx),
         Ok(Op::RunUserShellCommand { command }) if command == "echo hi"
     );
 }
@@ -222,7 +222,10 @@ async fn recovered_question_answers_preserve_other_questions() {
         chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
         chat.bottom_pane.handle_paste("answer".into());
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert_answer(op_rx.try_recv().unwrap(), "> Which way?\n\nanswer");
+        assert_answer(
+            try_recv_input_action(&mut op_rx).unwrap(),
+            "> Which way?\n\nanswer",
+        );
         assert_eq!(question_count(&chat), 1);
         chat.add_async_questions("late", &[question("Late?", /*options*/ None)]);
 
@@ -240,7 +243,10 @@ async fn recovered_question_answers_preserve_other_questions() {
             chat.update_task_running_state();
         }
         assert!(chat.maybe_send_next_queued_input());
-        assert_answer(op_rx.try_recv().unwrap(), "> Which way?\n\nanswer");
+        assert_answer(
+            try_recv_input_action(&mut op_rx).unwrap(),
+            "> Which way?\n\nanswer",
+        );
         assert_eq!(question_count(&chat), 2);
     }
 }
@@ -254,14 +260,14 @@ async fn slash_and_mode_prompts_clear_unanswered_questions_after_delivery() {
         InputResult::CommandWithArgs(SlashCommand::Plan, "New plan".into(), Vec::new()),
         /*had_modal_or_popup*/ false,
     );
-    assert_answer(op_rx.try_recv().unwrap(), "New plan");
+    assert_answer(try_recv_input_action(&mut op_rx).unwrap(), "New plan");
     assert_eq!(question_count(&chat), 0);
 
     chat.input_queue.user_turn_pending_start = false;
     chat.add_async_questions("next", &questions());
     let mode = collaboration_modes::default_mask(chat.model_catalog.as_ref()).unwrap();
     chat.submit_user_message_with_mode("Implement".to_string(), mode);
-    assert_answer(op_rx.try_recv().unwrap(), "Implement");
+    assert_answer(try_recv_input_action(&mut op_rx).unwrap(), "Implement");
     assert_eq!(question_count(&chat), 0);
 }
 
@@ -275,7 +281,7 @@ async fn accepted_review_clears_questions_but_rejected_review_preserves_them() {
         /*had_modal_or_popup*/ false,
     );
     assert_matches!(
-        op_rx.try_recv(),
+        try_recv_input_action(&mut op_rx),
         Ok(Op::Review {
             target: ReviewTarget::Custom { instructions }
         }) if instructions == "check this"
@@ -289,7 +295,7 @@ async fn accepted_review_clears_questions_but_rejected_review_preserves_them() {
         /*had_modal_or_popup*/ false,
     );
     assert_eq!(question_count(&chat), 2);
-    assert!(op_rx.try_recv().is_err());
+    assert!(try_recv_input_action(&mut op_rx).is_err());
 }
 
 #[tokio::test]
@@ -351,7 +357,7 @@ async fn rejected_synchronous_literal_prompt_keeps_questions() {
         /*had_modal_or_popup*/ false,
     );
     assert_eq!(question_count(&chat), 2);
-    assert!(op_rx.try_recv().is_err());
+    assert!(try_recv_input_action(&mut op_rx).is_err());
 }
 
 #[tokio::test]
@@ -362,7 +368,10 @@ async fn reconnect_preserves_buffered_question_answer_source() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
     chat.bottom_pane.handle_paste("answer".into());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    assert_answer(op_rx.try_recv().unwrap(), "> Which way?\n\nanswer");
+    assert_answer(
+        try_recv_input_action(&mut op_rx).unwrap(),
+        "> Which way?\n\nanswer",
+    );
     assert_eq!(question_count(&chat), 1);
     chat.pause_for_disconnect();
     let state = chat.capture_thread_input_state();
@@ -382,7 +391,10 @@ async fn reconnect_preserves_buffered_question_answer_source() {
     // Recovered input stays paused until the user elects to retry it.
     restored.input_queue.recovered_queue = false;
     assert!(restored.maybe_send_next_queued_input());
-    assert_answer(op_rx.try_recv().unwrap(), "> Which way?\n\nanswer");
+    assert_answer(
+        try_recv_input_action(&mut op_rx).unwrap(),
+        "> Which way?\n\nanswer",
+    );
     assert_eq!(question_count(&restored), 1);
 }
 
@@ -397,7 +409,7 @@ async fn blocked_follow_up_keeps_unanswered_questions() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     assert_eq!(question_count(&chat), 2);
-    assert!(op_rx.try_recv().is_err());
+    assert!(try_recv_input_action(&mut op_rx).is_err());
 }
 
 #[tokio::test]
@@ -415,7 +427,7 @@ async fn disconnected_questions_remain_editable_without_sending() {
         RestrictedInputMode::Disconnected,
     );
     assert_eq!(question_count(&chat), 2);
-    assert!(op_rx.try_recv().is_err());
+    assert!(try_recv_input_action(&mut op_rx).is_err());
     chat.handle_restricted_key(
         KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
         RestrictedInputMode::Disconnected,
@@ -510,7 +522,7 @@ async fn question_inputs_support_vim_editing_and_search() {
         let search = render_bottom_popup(&chat, /*width*/ 80);
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_eq!(question_count(&chat), 1);
-        assert!(op_rx.try_recv().is_err());
+        assert!(try_recv_input_action(&mut op_rx).is_err());
         for ch in "ciw".chars() {
             chat.handle_key_event(KeyEvent::from(KeyCode::Char(ch)));
         }
@@ -518,7 +530,7 @@ async fn question_inputs_support_vim_editing_and_search() {
         chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_answer(
-            op_rx.try_recv().unwrap(),
+            try_recv_input_action(&mut op_rx).unwrap(),
             "> Which way?\n\nalpha beta\nalpha delta",
         );
         insta::assert_snapshot!(
@@ -585,10 +597,10 @@ async fn question_history_search_uses_updated_bindings() {
             );
         }
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert!(op_rx.try_recv().is_err());
+        assert!(try_recv_input_action(&mut op_rx).is_err());
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_answer(
-            op_rx.try_recv().unwrap(),
+            try_recv_input_action(&mut op_rx).unwrap(),
             &format!("> Which way?\n\n{word} answer"),
         );
     }
@@ -639,11 +651,11 @@ async fn async_questions_reject_blank_answers_but_allow_explicit_skip() {
             chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
             assert_eq!(render_bottom_popup(&chat, /*width*/ 80), before);
             assert!(chat.input_queue.queued_user_messages.is_empty());
-            assert!(op_rx.try_recv().is_err());
+            assert!(try_recv_input_action(&mut op_rx).is_err());
         }
         chat.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert_eq!(question_count(&chat), 0);
-        assert!(op_rx.try_recv().is_err());
+        assert!(try_recv_input_action(&mut op_rx).is_err());
     }
 }
 

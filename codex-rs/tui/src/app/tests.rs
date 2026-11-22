@@ -9469,6 +9469,8 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
             Some(placeholder.to_string()),
         )],
         pending_pastes: vec![(placeholder.to_string(), "hello".to_string())],
+        // Pin the schedule timezone: the goal editor otherwise renders the host's local zone.
+        timezone: Some("UTC".to_string()),
         ..Default::default()
     };
 

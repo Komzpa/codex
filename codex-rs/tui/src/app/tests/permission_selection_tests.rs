@@ -206,7 +206,10 @@ async fn inline_server_permission_selection_holds_queued_prompt_until_confirmati
     while let Ok(event) = events.try_recv() {
         app.handle_event(&mut tui, &mut server, event).await?;
     }
-    assert!(ops.try_recv().is_err());
+    // Queue size is metadata; no other op may be sent before the profile change is confirmed.
+    while let Ok(op) = ops.try_recv() {
+        assert!(matches!(op, Op::SetQueuedFollowupCount { .. }), "{op:?}");
+    }
 
     let settings = next_thread_settings_updated(&mut server, thread_id).await;
     app.enqueue_thread_notification(

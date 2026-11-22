@@ -2490,7 +2490,7 @@ async fn streaming_final_answer_keeps_task_running_state() {
         chat.input_queue.queued_user_messages.front().unwrap().text,
         "queued submission"
     );
-    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     match op_rx.try_recv() {

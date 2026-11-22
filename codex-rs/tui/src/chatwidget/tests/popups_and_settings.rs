@@ -3879,9 +3879,9 @@ async fn ultra_reasoning_selection_skips_warning_below_threshold() {
 
 #[tokio::test]
 async fn ultra_reasoning_can_be_saved_as_default() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
-    let mut preset = get_available_model(&chat, "gpt-5.4");
+    let mut preset = get_available_model(&chat, "gpt-5.5");
     preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
         effort: ReasoningEffortConfig::Ultra,
         description: "Ultra reasoning".to_string(),
@@ -3899,7 +3899,7 @@ async fn ultra_reasoning_can_be_saved_as_default() {
         .collect::<Vec<_>>();
     assert_eq!(
         selections,
-        vec![("gpt-5.4".to_string(), Some(ReasoningEffortConfig::Ultra))]
+        vec![("gpt-5.5".to_string(), Some(ReasoningEffortConfig::Ultra))]
     );
 }
 

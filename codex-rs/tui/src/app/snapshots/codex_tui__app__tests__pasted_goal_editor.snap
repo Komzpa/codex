@@ -5,5 +5,8 @@ expression: "render_bottom_popup(&app.chat_widget, 80)"
   Edit goal
 
 › Use hello
+  --- schedule ---
+  timezone: UTC
+
 
   enter submit · esc back

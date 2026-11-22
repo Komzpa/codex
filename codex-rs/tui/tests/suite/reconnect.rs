@@ -159,6 +159,7 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
                     }
                     "thread/read" => json!({"thread": thread}),
                     "thread/goal/get" => json!({"goal": null}),
+                    "thread/queuedFollowupCount/update" => json!({}),
                     "skills/list" => json!({"data": []}),
                     _ => {
                         socket

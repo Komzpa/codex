@@ -159,6 +159,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
                     "thread/read" => Some(json!({"result": {"thread": thread}})),
                     "thread/list" | "thread/loaded/list" => Some(json!({"result": {"data": [], "nextCursor": null}})),
                     "thread/goal/get" => Some(json!({"result": {"goal": null}})),
+                    "thread/queuedFollowupCount/update" => Some(json!({"result": {}})),
                     "turn/start" => {
                         assert!(!edit_offline);
                         let params = request.params.as_ref().unwrap();
@@ -441,7 +442,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
                 app.chat_widget.composer_text_with_pending(),
                 "unacknowledged prompt"
             );
-            assert!(ops.try_recv().is_err());
+            assert!(crate::chatwidget::tests::helpers::try_recv_input_action(&mut ops).is_err());
         } else if recovered_queue {
             assert!(!app.chat_widget.has_queued_follow_up_messages());
             assert_snapshot!(

@@ -424,7 +424,7 @@ async fn assert_cancelled_queued_menu_drains_next_input(
                 .any(|event| matches!(event, AppEvent::OpenPermissionsPopup)),
             "permission menu must go through the app"
         );
-        assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+        assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
         chat.open_permissions_popup();
     }
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -3943,7 +3943,7 @@ async fn owned_copy_guard_defers_queued_input_until_released() {
             .unwrap();
         complete_turn_with_message(&mut chat, "active", Some("New response"));
         assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-        assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+        assert_matches!(try_recv_input_action(&mut op_rx), Err(TryRecvError::Empty));
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(
                 event,

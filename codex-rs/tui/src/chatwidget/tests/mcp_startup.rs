@@ -477,7 +477,7 @@ async fn pending_mcp_startup_does_not_unblock_foreground_shell() {
         Vec::new(),
     );
 
-    assert_matches!(op_rx.try_recv(), Ok(Op::RunUserShellCommand { command }) if command == "echo hi");
+    assert_matches!(try_recv_input_action(&mut op_rx), Ok(Op::RunUserShellCommand { command }) if command == "echo hi");
     chat.bottom_pane
         .set_composer_text("queued follow-up".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

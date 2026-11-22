@@ -54,6 +54,7 @@ use crate::spec::GET_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::steering::budget_limit_steering_item;
 use crate::steering::continuation_prompt;
+use crate::steering::untrusted_objective_prompt;
 use crate::tool::GoalToolExecutor;
 use crate::tool::protocol_goal_from_state;
 
@@ -255,8 +256,13 @@ where
                 return Vec::new();
             }
 
+            let goal = protocol_goal_from_state(goal);
             vec![PromptFragment::developer_policy(
-                continuation_prompt(&protocol_goal_from_state(goal), config.update_plan_enabled),
+                format!(
+                    "{}\n\n{}",
+                    continuation_prompt(&goal, config.update_plan_enabled),
+                    untrusted_objective_prompt(&goal)
+                ),
                 ContentItemKind("goal.continuation".to_string()),
             )]
         })

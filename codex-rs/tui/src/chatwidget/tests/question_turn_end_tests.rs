@@ -59,10 +59,10 @@ async fn question_turn_end_escapes_command_drafts_before_submission() {
                 let queued_message = chat.input_queue.queued_user_messages.front().unwrap();
                 assert_eq!(queued_message.text, submitted_text);
                 assert_eq!(queued_message.action, queued_action);
-                assert!(ops.try_recv().is_err());
+                assert!(try_recv_input_action(&mut ops).is_err());
             } else {
                 chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-                let Op::UserTurn { items, .. } = ops.try_recv().unwrap() else {
+                let Op::UserTurn { items, .. } = try_recv_input_action(&mut ops).unwrap() else {
                     panic!("expected user turn");
                 };
                 assert_eq!(
@@ -114,7 +114,7 @@ async fn question_turn_end_appends_open_drafts_in_order_once() {
         ),
         (recovered.into(), vec![element], 0)
     );
-    assert!(ops.try_recv().is_err());
+    assert!(try_recv_input_action(&mut ops).is_err());
     insta::assert_snapshot!(
         "question_turn_end_recovered_composer",
         normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80))
@@ -170,7 +170,10 @@ async fn question_turn_end_recovers_collapsed_drafts_on_completion_and_failure()
                 chat.pending_notification.as_ref().map(Notification::display),
                 @"None"
             );
-            assert!(matches!(ops.try_recv().unwrap(), Op::UserTurn { .. }));
+            assert!(matches!(
+                try_recv_input_action(&mut ops).unwrap(),
+                Op::UserTurn { .. }
+            ));
             assert_eq!(
                 chat.capture_thread_input_state()
                     .unwrap()
@@ -201,7 +204,7 @@ async fn question_turn_end_recovers_collapsed_drafts_on_completion_and_failure()
         assert!(!chat.bottom_pane.no_modal_or_popup_active());
         chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
         assert_recovered_draft(&mut chat, "main\n\n> Which way?\n\nanswer");
-        assert!(ops.try_recv().is_err());
+        assert!(try_recv_input_action(&mut ops).is_err());
     }
 }
 
@@ -289,7 +292,7 @@ async fn question_turn_end_recovers_after_interruption_restores_queued_input() {
             );
         }
         assert!(!chat.has_queued_follow_up_messages());
-        assert!(ops.try_recv().is_err());
+        assert!(try_recv_input_action(&mut ops).is_err());
     }
 }
 
@@ -317,10 +320,10 @@ async fn question_turn_end_keeps_multiline_question_and_answer_as_text() {
         ),
         (recovered.to_string(), 0),
     );
-    assert!(ops.try_recv().is_err());
+    assert!(try_recv_input_action(&mut ops).is_err());
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    let Op::UserTurn { items, .. } = ops.try_recv().unwrap() else {
+    let Op::UserTurn { items, .. } = try_recv_input_action(&mut ops).unwrap() else {
         panic!("user turn")
     };
     assert_eq!(

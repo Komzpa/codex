@@ -40,17 +40,21 @@ pub(crate) fn should_retry_with_current_model(
 /// presents itself as OpenAI while routing to third-party models is treated as if it could serve
 /// remote compaction. Those models cannot produce a `compaction` item, and the proxy may reject the
 /// request outright, so a model- or provider-specific failure retries with local compaction instead
-/// of aborting the turn. Aborts, tool collisions and account-level rejections are never retried
-/// locally, and neither are failures that carry server retry advice: the server called them
+/// of aborting the turn. Aborts, tool collisions and account-level rejections, explicit policy denials, context-window overflows and terminal sampling outcomes are never
+/// retried locally, and neither are failures that carry server retry advice: the server called them
 /// temporary and asked the client to wait, so swapping implementations would defeat that advice.
 pub(crate) fn should_fall_back_to_local_compaction(error: &CodexErr) -> bool {
     error.retry_after().is_none()
+        && !crate::responses_retry::is_terminal_sampling_outcome(error)
         && !matches!(
             error.details(),
             CodexErrorDetails::TurnAborted
                 | CodexErrorDetails::Interrupted
                 | CodexErrorDetails::SessionBudgetExceeded
                 | CodexErrorDetails::ResponseIncomplete(_)
+                | CodexErrorDetails::WorkspaceAccessDenied(_)
+                | CodexErrorDetails::ContentPolicyViolation { .. }
+                | CodexErrorDetails::ContextWindowExceeded
                 | CodexErrorDetails::ToolCollision(_)
                 | CodexErrorDetails::UsageNotIncluded
                 | CodexErrorDetails::QuotaExceeded
@@ -171,5 +175,29 @@ mod tests {
         assert!(!should_fall_back_to_local_compaction(
             &CodexErr::Interrupted
         ));
+    }
+
+    #[test]
+    fn never_falls_back_to_local_compaction_for_explicit_denials() {
+        assert!(!should_fall_back_to_local_compaction(&CodexErr::new(
+            CodexErrorDetails::ContextWindowExceeded
+        )));
+        assert!(!should_fall_back_to_local_compaction(&CodexErr::new(
+            CodexErrorDetails::InferenceHookDenied {
+                message: "denied".to_string()
+            }
+        )));
+        assert!(!should_fall_back_to_local_compaction(&CodexErr::new(
+            CodexErrorDetails::WorkspaceAccessDenied(UnexpectedResponseError {
+                status: http::StatusCode::FORBIDDEN,
+                body: "denied".to_string(),
+                user_message: None,
+                url: None,
+                cf_ray: None,
+                request_id: None,
+                identity_authorization_error: None,
+                identity_error_code: None,
+            })
+        )));
     }
 }

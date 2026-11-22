@@ -197,7 +197,7 @@ async fn lost_mutation_reply_preserves_work_without_resubmitting() -> Result<()>
         .next()
         .unwrap();
     assert_snapshot!("offline_expanded_paste", draft);
-    assert!(ops.try_recv().is_err());
+    assert!(crate::chatwidget::tests::helpers::try_recv_input_action(&mut ops).is_err());
     for character in ['c', 'C', 'd', 'D'] {
         if character.eq_ignore_ascii_case(&'d') {
             app.handle_tui_event(

@@ -234,7 +234,7 @@ async fn hidden_shell_paste_submits_literal_prompt() {
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -244,13 +244,13 @@ async fn hidden_shell_paste_recalled_from_history_submits_literal_prompt() {
     let payload = paste_hidden_shell_payload(&mut chat);
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload.clone());
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload.clone());
     handle_turn_started(&mut chat, "turn-1");
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
     chat.handle_key_event(KeyEvent::from(KeyCode::Up));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -301,7 +301,7 @@ async fn hidden_shell_paste_restored_by_interrupt_submits_literal_prompt() {
     chat.on_interrupted_turn(TurnAbortReason::Interrupted);
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -324,7 +324,7 @@ async fn hidden_shell_paste_restored_after_image_rejection_submits_literal_promp
     chat.set_remote_image_urls(Vec::new());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -339,7 +339,7 @@ async fn hidden_shell_paste_restored_after_unavailable_model_submits_literal_pro
     chat.set_model(&model);
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    assert_hidden_shell_payload_is_literal(try_recv_input_action(&mut op_rx), payload);
 }
 
 #[tokio::test]
@@ -365,7 +365,10 @@ async fn rejected_hidden_shell_paste_preserves_colliding_draft_paste() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
-    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), format!("{payload}\n{draft_payload}"));
+    assert_hidden_shell_payload_is_literal(
+        try_recv_input_action(&mut op_rx),
+        format!("{payload}\n{draft_payload}"),
+    );
 }
 
 #[tokio::test]
@@ -1524,7 +1527,10 @@ async fn draft_handoffs_preserve_literal_and_shell_bang() {
             },
         );
         chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert_hidden_shell_payload_is_literal(ops.try_recv(), text.trim().to_string());
+        assert_hidden_shell_payload_is_literal(
+            try_recv_input_action(&mut ops),
+            text.trim().to_string(),
+        );
     }
 
     let (mut source, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -1544,7 +1550,7 @@ async fn draft_handoffs_preserve_literal_and_shell_bang() {
         },
     );
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    assert_matches!(ops.try_recv(), Ok(Op::RunUserShellCommand { command }) if command == "pwd");
+    assert_matches!(try_recv_input_action(&mut ops), Ok(Op::RunUserShellCommand { command }) if command == "pwd");
 }
 
 #[tokio::test]

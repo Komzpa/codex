@@ -801,9 +801,15 @@ impl App {
         }
         match op {
             AppCommand::SetQueuedFollowupCount { count } => {
-                app_server
+                // The count is a best-effort hint for the active model turn; a
+                // rejected update (for example a thread that is closing) must not
+                // tear down the TUI.
+                if let Err(err) = app_server
                     .thread_queued_followup_count_update(thread_id, *count)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!("failed to publish queued follow-up count: {err:#}");
+                }
                 Ok(true)
             }
             AppCommand::Interrupt => {
