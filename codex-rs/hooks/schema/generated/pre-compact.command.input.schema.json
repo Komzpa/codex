@@ -270,7 +270,7 @@
           "type": "integer"
         },
         "used_percent": {
-          "description": "Percentage (0-100) of the window that has been consumed.",
+          "description": "Percentage of the allowance consumed during the window. Can exceed 100.",
           "format": "double",
           "type": "number"
         },
