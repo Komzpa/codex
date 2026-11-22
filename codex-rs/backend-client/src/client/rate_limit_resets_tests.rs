@@ -63,12 +63,11 @@ async fn custom_usage_url_is_passive_and_preserves_account_scope() {
         .mount(&server)
         .await;
 
-    let client =
-        test_client(&server.uri(), PathStyle::CodexApi)
-            .with_auth_provider(std::sync::Arc::new(
-                codex_model_provider::BearerAuthProvider::new("provider-key".to_string()),
-            ))
-            .unwrap();
+    let client = test_client(&server.uri(), PathStyle::CodexApi)
+        .with_auth_provider(std::sync::Arc::new(
+            codex_model_provider::BearerAuthProvider::new("provider-key".to_string()),
+        ))
+        .unwrap();
     let response = client
         .get_rate_limits_at(&format!("{}/custom-usage", server.uri()))
         .await

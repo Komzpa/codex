@@ -249,7 +249,8 @@ fn function_output_text_token_count(output: &FunctionCallOutputPayload) -> usize
 }
 
 fn estimate_item_tokens(item: &ResponseItem) -> i64 {
-    let mut item_context = ContextManager::new(ThreadContextIds::for_thread(), /*retention*/ None);
+    let mut item_context =
+        ContextManager::new(ThreadContextIds::for_thread(), /*retention*/ None);
     item_context.replace_annotated(vec![ResponseItemEnvelope::new(item.clone())]);
     item_context
         .estimate_token_count_with_base_instructions(&BaseInstructions {
