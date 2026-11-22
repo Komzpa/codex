@@ -294,14 +294,6 @@ async fn run_remote_compact_task_inner(
             );
             Err(err)
         }
-        Err(err) if should_fall_back_to_local_compaction(&err) => {
-            // The caller retries with local compaction, so this attempt is not a user-facing error.
-            tracing::warn!(
-                error = %err,
-                "remote compaction v2 failed; falling back to local compaction"
-            );
-            Err(err)
-        }
         Err(err) => {
             sess.track_turn_codex_error(turn_context, &err);
             // Pre-turn failures are reported by run_turn after preserving the incoming prompt.

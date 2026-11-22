@@ -6,8 +6,8 @@ Scenario: Core renders the host's roster with native World State cadence. Compac
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=a7c46a0959d54866):
-        - namespace/functions; hash=81846de5bc4e7474
+00:additional_tools/developer (3; hash=3b8646e59a528921):
+        - namespace/functions; hash=3d2156c9b8093fa7
           - custom/exec
           - function/wait
           - function/request_user_input
@@ -62,8 +62,8 @@ Scenario: Core renders the host's roster with native World State cadence. Compac
 
 ## Window 2 (after request 4: input diverged at item 02)
 -- request 5 (turn) --
-00:additional_tools/developer (3; hash=a7c46a0959d54866):
-        - namespace/functions; hash=81846de5bc4e7474
+00:additional_tools/developer (3; hash=3b8646e59a528921):
+        - namespace/functions; hash=3d2156c9b8093fa7
           - custom/exec
           - function/wait
           - function/request_user_input

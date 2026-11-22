@@ -16,8 +16,8 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=a7c46a0959d54866):
-        - namespace/functions; hash=81846de5bc4e7474
+00:additional_tools/developer (3; hash=3b8646e59a528921):
+        - namespace/functions; hash=3d2156c9b8093fa7
           - custom/exec
           - function/wait
           - function/request_user_input
@@ -55,11 +55,17 @@ Settings:
         A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list ...ed into an absolute path using the skill roots table. [hash=d516c00c9246c269]
         ### Skill roots
         - `r0` = `<SKILLS_ROOT>`
-        - `r1` = `<PLUGINS_CACHE>/openai-curated-remote`
+        - `r1` = `<SKILLS_ROOT>`
+        - `r2` = `<PLUGINS_CACHE>/openai-curated-remote`
         ### Available skills
-        - calendar:agenda: (file: r1/calendar/local/skills/agenda/SKILL.md)
-        - final-check: (file: r0/final-check/SKILL.md)
-        - outline: (file: r0/outline/SKILL.md)
+        <OMITTED 25 LINES; ~464 TOKENS; hash=8fd76e4cfdaf3a8a>
+        - postgres: (file: r1/postgres/SKILL.md)
+        - pptx: (file: r1/synced/39b52ccd-db22-4e25-a683-27c74d3fd5a9_e774dff2-f4f5-4798-9e0b-4a819cc01fed/pptx/SKILL.md)
+        - product-launch-video: (file: r1/product-launch-video/SKILL.md)
+        - reverse-any-video: (file: r1/reverse-any-video/SKILL.md)
+        - skill-creator: (file: r1/synced/39b52ccd-db22-4e25-a683-27c74d3fd5a9_e774dff2-f4f5-4798-9e0b-4a819cc01fed/skill-creator/SKILL.md)
+        - style-sampling: (file: r1/style-sampling/SKILL.md)
+        - xlsx: (file: r1/synced/39b52ccd-db22-4e25-a683-27c74d3fd5a9_e774dff2-f4f5-4798-9e0b-4a819cc01fed/xlsx/SKILL.md)
         </skills_instructions>
     [02] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
