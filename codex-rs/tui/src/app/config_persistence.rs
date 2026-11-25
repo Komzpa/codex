@@ -1559,7 +1559,7 @@ mod tests {
                 effort: ReasoningEffortConfig::Ultra,
                 description: "Ultra reasoning".to_string(),
             });
-        app.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+        app.model_catalog = Arc::new(ModelCatalog::new(vec![preset], None));
         app.config.model = Some("saved-ultra-model".to_string());
         app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
         let effort =

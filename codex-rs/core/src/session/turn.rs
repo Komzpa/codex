@@ -923,7 +923,13 @@ pub(crate) async fn run_turn(
                             .await;
                             return Ok(None);
                         }
-                        if run_pending_session_start_hooks(&sess, &turn_context).await {
+                        if run_pending_session_start_hooks(
+                            &sess,
+                            &turn_context,
+                            &cancellation_token,
+                        )
+                        .await
+                        {
                             return Ok(None);
                         }
                         // Deliberately fall through instead of continuing the

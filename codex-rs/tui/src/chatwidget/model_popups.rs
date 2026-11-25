@@ -788,9 +788,6 @@ impl ChatWidget {
             Line::from("Advanced Reasoning".bold()),
             Line::from("⚠ Consumes usage limits faster".cyan()),
         ]);
-            Line::from("Advanced Reasoning".bold()),
-            Line::from("⚠ Consumes usage limits faster".cyan()),
-        ]);
         self.bottom_pane.show_selection_view(SelectionViewParams {
             view_id: Some(MODEL_OPTIONS_VIEW_ID),
             header,
