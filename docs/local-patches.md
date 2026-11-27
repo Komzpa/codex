@@ -1,6 +1,6 @@
 # Local source-refresh patches
 
-This branch is rebased on upstream `1476a08f1b410e359e64becf2494bc248743e396`. It retains focused
+This branch is rebased on upstream `b9e830fb986ae478ce59c3c97408bdfa1bd5ddab`. It retains focused
 patches that upstream did not yet cover. The archive used to reconstruct the
 set was `9c57bef5d1`; the entries below describe the current behavior, not the
 old replay chronology.
