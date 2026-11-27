@@ -1,19 +1,24 @@
 //! Hot-path helpers for recording upstream inference attempts.
 //!
-//! The model client should not need to know whether rollout tracing is enabled.
 //! A disabled context records nothing, which keeps one-shot HTTP calls,
-//! WebSocket reuse, and retry/fallback attempts on the same code path.
+//! WebSocket reuse, and retry/fallback attempts on the same lifecycle path.
+//! Transport callers can check whether terminal records need output items
+//! before retaining them.
 
 use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
+use http::HeaderMap;
+use http::HeaderValue;
 use serde::Serialize;
-use serde_json::Value as JsonValue;
+use serde::Serializer;
+use serde::ser::Error;
+use serde::ser::SerializeSeq;
+use uuid::Uuid;
 
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
@@ -23,7 +28,7 @@ use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
 
-static NEXT_INFERENCE_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+const INFERENCE_CALL_ID_HEADER: &str = "x-codex-inference-call-id";
 
 /// Turn-local inference tracing context.
 ///
@@ -72,7 +77,7 @@ enum InferenceTraceAttemptState {
 struct EnabledInferenceTraceAttempt {
     context: EnabledInferenceTraceContext,
     inference_call_id: InferenceCallId,
-    terminal_recorded: AtomicBool,
+    awaiting_terminal: AtomicBool,
 }
 
 /// Non-delta response payload saved for completed or interrupted inference streams.
@@ -86,7 +91,8 @@ struct TracedResponseStreamOutput<'a> {
     response_id: Option<&'a str>,
     upstream_request_id: Option<&'a str>,
     token_usage: Option<&'a TokenUsage>,
-    output_items: Vec<JsonValue>,
+    #[serde(serialize_with = "serialize_trace_items")]
+    output_items: &'a [ResponseItem],
 }
 
 impl InferenceTraceContext {
@@ -116,6 +122,26 @@ impl InferenceTraceContext {
         }
     }
 
+    /// Original history IDs of tool outputs omitted during request preparation.
+    pub fn stripped_output_ids(&self, input: &[ResponseItem]) -> Vec<(usize, String)> {
+        if matches!(self.state, InferenceTraceContextState::Disabled) {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        for (index, item) in input.iter().enumerate() {
+            if matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            ) && let Some(id) = item
+                .id()
+                .filter(|id| id.allocation().is_none() && !id.is_prefixed())
+            {
+                ids.push((index, id.to_string()));
+            }
+        }
+        ids
+    }
+
     /// Starts a new attempt after the concrete provider request has been built.
     pub fn start_attempt(&self) -> InferenceTraceAttempt {
         let InferenceTraceContextState::Enabled(context) = &self.state else {
@@ -126,7 +152,7 @@ impl InferenceTraceContext {
             state: InferenceTraceAttemptState::Enabled(EnabledInferenceTraceAttempt {
                 context: context.clone(),
                 inference_call_id: next_inference_call_id(),
-                terminal_recorded: AtomicBool::new(false),
+                awaiting_terminal: AtomicBool::new(false),
             }),
         }
     }
@@ -140,30 +166,87 @@ impl InferenceTraceAttempt {
         }
     }
 
-    /// Records the exact request object about to be sent to the model provider.
-    pub fn record_started(&self, request: &impl Serialize) {
-        let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
+    /// Whether this attempt records inference payloads.
+    pub fn is_enabled(&self) -> bool {
+        matches!(&self.state, InferenceTraceAttemptState::Enabled(_))
+    }
+
+    /// Whether terminal trace records need the completed output items.
+    pub fn needs_output_items(&self) -> bool {
+        self.is_enabled()
+    }
+
+    fn inference_call_id(&self) -> Option<&str> {
+        match &self.state {
+            InferenceTraceAttemptState::Disabled => None,
+            InferenceTraceAttemptState::Enabled(attempt) => {
+                Some(attempt.inference_call_id.as_str())
+            }
+        }
+    }
+
+    /// Adds rollout-trace propagation headers for this attempt when tracing is enabled.
+    pub fn add_request_headers(&self, headers: &mut HeaderMap) {
+        let Some(inference_call_id) = self.inference_call_id() else {
             return;
         };
-        let Some(request_payload) = write_json_payload_best_effort(
-            &attempt.context.writer,
-            RawPayloadKind::InferenceRequest,
-            request,
-        ) else {
+        let Ok(inference_call_id) = HeaderValue::from_str(inference_call_id) else {
+            // These IDs are generated internally as UUID strings, so rejection
+            // should be impossible in practice. Tracing remains best-effort,
+            // though, and must never make provider requests fail.
             return;
         };
 
-        append_with_context_best_effort(
-            &attempt.context,
-            RawTraceEventPayload::InferenceStarted {
-                inference_call_id: attempt.inference_call_id.clone(),
-                thread_id: attempt.context.thread_id.clone(),
-                codex_turn_id: attempt.context.codex_turn_id.clone(),
-                model: attempt.context.model.clone(),
-                provider_name: attempt.context.provider_name.clone(),
-                request_payload,
+        headers.insert(INFERENCE_CALL_ID_HEADER, inference_call_id);
+    }
+
+    /// Captures the transport's encoded JSON and the immutable Core prompt that produced it.
+    /// A continuation from an unrecorded warmup also supplies its full formatted context.
+    pub fn record_started<P: Serialize + Send + Sync + 'static>(
+        &self,
+        outgoing: impl AsRef<[u8]> + Send + 'static,
+        prepared_prompt: Arc<P>,
+        stripped_tool_output_ids: Vec<(usize, String)>,
+        warmup_context: impl FnOnce() -> serde_json::Result<Option<Vec<u8>>> + Send + 'static,
+    ) {
+        let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
+            return;
+        };
+        let ctx = &attempt.context;
+        let thread_id = ctx.thread_id.clone();
+        let codex_turn_id = ctx.codex_turn_id.clone();
+        let inference_call_id = attempt.inference_call_id.clone();
+        let model = ctx.model.clone();
+        let provider_name = ctx.provider_name.clone();
+        let start = ctx.writer.defer_event(
+            RawTraceEventContext::turn(&thread_id, &codex_turn_id),
+            move |bundle| {
+                let request_payload =
+                    bundle.write_body(RawPayloadKind::InferenceRequest, outgoing.as_ref())?;
+                let prepared_prompt_payload = bundle.write_body(
+                    RawPayloadKind::PreparedPrompt,
+                    &serde_json::to_vec(prepared_prompt.as_ref())?,
+                )?;
+                let warmup_context_payload = warmup_context()?
+                    .map(|bytes| bundle.write_body(RawPayloadKind::WarmupContext, &bytes))
+                    .transpose()?;
+                Ok(RawTraceEventPayload::InferenceStarted {
+                    inference_call_id,
+                    thread_id,
+                    codex_turn_id,
+                    model,
+                    provider_name,
+                    request_payload,
+                    stripped_tool_output_ids,
+                    prepared_prompt_payload,
+                    warmup_context_payload,
+                })
             },
         );
+        // A transport encoding error produces no outgoing request or start row.
+        attempt
+            .awaiting_terminal
+            .store(start.is_ok(), Ordering::Release);
     }
 
     /// Records successful provider completion and serializes the observed output items.
@@ -182,22 +265,23 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
-        let Some(response_payload) = write_response_payload_best_effort(
-            attempt,
-            Some(response_id),
+        let payload = TracedResponseStreamOutput {
+            response_id: Some(response_id),
             upstream_request_id,
-            token_usage.as_ref(),
+            token_usage: token_usage.as_ref(),
             output_items,
-        ) else {
-            return;
         };
-
-        append_with_context_best_effort(
-            &attempt.context,
-            RawTraceEventPayload::InferenceCompleted {
-                inference_call_id: attempt.inference_call_id.clone(),
-                response_id: Some(response_id.to_string()),
-                upstream_request_id: upstream_request_id.map(str::to_string),
+        let inference_call_id = attempt.inference_call_id.clone();
+        let response_id = Some(response_id.to_owned());
+        let upstream_request_id = upstream_request_id.map(str::to_owned);
+        let _ = attempt.context.writer.event_with_payload(
+            RawTraceEventContext::turn(&attempt.context.thread_id, &attempt.context.codex_turn_id),
+            RawPayloadKind::InferenceResponse,
+            &payload,
+            move |response_payload| RawTraceEventPayload::InferenceCompleted {
+                inference_call_id,
+                response_id,
+                upstream_request_id,
                 response_payload,
             },
         );
@@ -213,23 +297,17 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
-        let partial_response_payload = if output_items.is_empty() {
-            None
-        } else {
-            write_response_payload_best_effort(
-                attempt,
-                /*response_id*/ None,
-                upstream_request_id,
-                /*token_usage*/ None,
-                output_items,
-            )
-        };
-        append_with_context_best_effort(
-            &attempt.context,
-            RawTraceEventPayload::InferenceFailed {
-                inference_call_id: attempt.inference_call_id.clone(),
-                upstream_request_id: upstream_request_id.map(str::to_string),
-                error: error.to_string(),
+        let inference_call_id = attempt.inference_call_id.clone();
+        let error = error.to_string();
+        let upstream = upstream_request_id.map(str::to_owned);
+        record_partial_response(
+            attempt,
+            upstream_request_id,
+            output_items,
+            move |partial_response_payload| RawTraceEventPayload::InferenceFailed {
+                inference_call_id,
+                upstream_request_id: upstream,
+                error,
                 partial_response_payload,
             },
         );
@@ -249,23 +327,17 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
-        let partial_response_payload = if output_items.is_empty() {
-            None
-        } else {
-            write_response_payload_best_effort(
-                attempt,
-                /*response_id*/ None,
-                upstream_request_id,
-                /*token_usage*/ None,
-                output_items,
-            )
-        };
-        append_with_context_best_effort(
-            &attempt.context,
-            RawTraceEventPayload::InferenceCancelled {
-                inference_call_id: attempt.inference_call_id.clone(),
-                upstream_request_id: upstream_request_id.map(str::to_string),
-                reason: reason.to_string(),
+        let inference_call_id = attempt.inference_call_id.clone();
+        let reason = reason.to_string();
+        let upstream = upstream_request_id.map(str::to_owned);
+        record_partial_response(
+            attempt,
+            upstream_request_id,
+            output_items,
+            move |partial_response_payload| RawTraceEventPayload::InferenceCancelled {
+                inference_call_id,
+                upstream_request_id: upstream,
+                reason,
                 partial_response_payload,
             },
         );
@@ -276,92 +348,71 @@ impl InferenceTraceAttempt {
             InferenceTraceAttemptState::Disabled => return None,
             InferenceTraceAttemptState::Enabled(attempt) => attempt,
         };
-        if attempt.terminal_recorded.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some(attempt)
+        attempt
+            .awaiting_terminal
+            .swap(false, Ordering::AcqRel)
+            .then_some(attempt)
     }
 }
 
-/// Serializes a response item for trace evidence rather than future request construction.
-///
-/// The protocol serializer intentionally omits some readable reasoning content
-/// when shaping items for later model requests. Rollout traces need the item as
-/// Codex received it, so this helper restores that content in the raw payload.
-pub(crate) fn trace_response_item_json(item: &ResponseItem) -> JsonValue {
-    let mut value = serde_json::to_value(item).unwrap_or_else(|err| {
-        serde_json::json!({
-            "serialization_error": err.to_string(),
-        })
-    });
-
-    if let ResponseItem::Reasoning {
-        content: Some(content),
-        ..
-    } = item
-        && let JsonValue::Object(object) = &mut value
-    {
-        object.insert(
-            "content".to_string(),
-            serde_json::to_value(content).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "serialization_error": err.to_string(),
-                })
-            }),
-        );
+/// Serializes Core history or received response items for replay, preserving
+/// readable reasoning that the outbound request serializer can omit.
+pub fn serialize_trace_items<S: Serializer>(
+    items: &[ResponseItem],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+    for item in items {
+        if let ResponseItem::Reasoning {
+            content: Some(content),
+            ..
+        } = item
+        {
+            let mut value = serde_json::to_value(item).map_err(S::Error::custom)?;
+            value["content"] = serde_json::to_value(content).map_err(S::Error::custom)?;
+            sequence.serialize_element(&value)?;
+        } else {
+            sequence.serialize_element(item)?;
+        }
     }
-
-    value
+    sequence.end()
 }
 
 fn next_inference_call_id() -> InferenceCallId {
-    let ordinal = NEXT_INFERENCE_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    format!("inference:{ordinal}")
+    Uuid::new_v4().to_string()
 }
 
-fn write_json_payload_best_effort(
-    writer: &TraceWriter,
-    kind: RawPayloadKind,
-    payload: &impl Serialize,
-) -> Option<crate::RawPayloadRef> {
-    writer.write_json_payload(kind, payload).ok()
-}
-
-fn write_response_payload_best_effort(
+fn record_partial_response(
     attempt: &EnabledInferenceTraceAttempt,
-    response_id: Option<&str>,
     upstream_request_id: Option<&str>,
-    token_usage: Option<&TokenUsage>,
     output_items: &[ResponseItem],
-) -> Option<crate::RawPayloadRef> {
-    let response_payload = TracedResponseStreamOutput {
-        response_id,
-        upstream_request_id,
-        token_usage,
-        output_items: output_items.iter().map(trace_response_item_json).collect(),
-    };
-    write_json_payload_best_effort(
-        &attempt.context.writer,
-        RawPayloadKind::InferenceResponse,
-        &response_payload,
-    )
-}
-
-fn append_with_context_best_effort(
-    context: &EnabledInferenceTraceContext,
-    payload: RawTraceEventPayload,
+    event: impl FnOnce(Option<crate::RawPayloadRef>) -> RawTraceEventPayload + Clone + Send + 'static,
 ) {
-    let event_context = RawTraceEventContext {
-        thread_id: Some(context.thread_id.clone()),
-        codex_turn_id: Some(context.codex_turn_id.clone()),
-    };
-    let _ = context.writer.append_with_context(event_context, payload);
+    let ctx = &attempt.context;
+    let envelope = RawTraceEventContext::turn(&ctx.thread_id, &ctx.codex_turn_id);
+    if output_items.is_empty() {
+        let _ = ctx.writer.enqueue_event(envelope, event(None));
+    } else {
+        let payload = TracedResponseStreamOutput {
+            response_id: None,
+            upstream_request_id,
+            token_usage: None,
+            output_items,
+        };
+        let _ = ctx.writer.event_with_payload(
+            envelope,
+            RawPayloadKind::InferenceResponse,
+            &payload,
+            move |reference| event(Some(reference)),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::ResponseItemId;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
@@ -371,6 +422,44 @@ mod tests {
     use super::*;
     use crate::model::ExecutionStatus;
     use crate::replay_bundle;
+
+    #[test]
+    fn disabled_attempt_adds_no_request_headers() {
+        let mut headers = HeaderMap::new();
+
+        InferenceTraceAttempt::disabled().add_request_headers(&mut headers);
+
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = Arc::new(TraceWriter::create(
+            temp.path(),
+            "trace-1".to_string(),
+            "rollout-1".to_string(),
+            "thread-root".to_string(),
+        )?);
+        let context = InferenceTraceContext::enabled(
+            writer,
+            "thread-root".to_string(),
+            "turn-1".to_string(),
+            "gpt-test".to_string(),
+            "test-provider".to_string(),
+        );
+        let attempt = context.start_attempt();
+        let mut headers = HeaderMap::new();
+
+        attempt.add_request_headers(&mut headers);
+
+        let header = headers
+            .get(INFERENCE_CALL_ID_HEADER)
+            .expect("inference header present");
+        assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
+        assert!(Uuid::parse_str(header.to_str()?).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()> {
@@ -391,7 +480,7 @@ mod tests {
             thread_id: "thread-root".to_string(),
         })?;
         let context = InferenceTraceContext::enabled(
-            writer,
+            Arc::clone(&writer),
             "thread-root".to_string(),
             "turn-1".to_string(),
             "gpt-test".to_string(),
@@ -399,16 +488,23 @@ mod tests {
         );
 
         let attempt = context.start_attempt();
-        attempt.record_started(&json!({
+        let request = json!({
             "model": "gpt-test",
             "input": [{
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "hello"}]
             }],
-        }));
+        });
+        attempt.record_started(
+            serde_json::to_vec(&request)?,
+            Arc::new(request),
+            Vec::new(),
+            || Ok(None),
+        );
         attempt.record_completed("resp-1", Some("req-1"), &None, &[]);
 
+        writer.flush()?;
         let rollout = replay_bundle(temp.path())?;
         let inference = rollout
             .inference_calls
@@ -421,7 +517,9 @@ mod tests {
         assert_eq!(inference.codex_turn_id, "turn-1");
         assert_eq!(inference.execution.status, ExecutionStatus::Completed);
         assert_eq!(inference.upstream_request_id, Some("req-1".to_string()));
-        assert_eq!(rollout.raw_payloads.len(), 2);
+        let prepared = &rollout.raw_payloads[&inference.prepared_prompt_payload_id];
+        assert_eq!(prepared.parts.len(), 1);
+        assert_eq!(rollout.raw_payloads.len(), 4);
 
         Ok(())
     }
@@ -429,7 +527,7 @@ mod tests {
     #[test]
     fn traced_response_item_preserves_reasoning_content_omitted_by_normal_serializer() {
         let item = ResponseItem::Reasoning {
-            id: "rs-1".to_string(),
+            id: Some(ResponseItemId::with_suffix("rs", "1")),
             summary: vec![ReasoningItemReasoningSummary::SummaryText {
                 text: "summary".to_string(),
             }],
@@ -437,20 +535,28 @@ mod tests {
                 text: "raw reasoning".to_string(),
             }]),
             encrypted_content: Some("encoded".to_string()),
+            internal_chat_message_metadata_passthrough: None,
         };
 
         let normal = serde_json::to_value(&item).expect("response item serializes");
-        let traced = trace_response_item_json(&item);
+        let traced =
+            serialize_trace_items(std::slice::from_ref(&item), serde_json::value::Serializer)
+                .expect("trace item serializes");
 
         assert_eq!(normal.get("content"), None);
         assert_eq!(
             traced,
-            json!({
+            json!([{
                 "type": "reasoning",
+                "id": "rs_1",
                 "summary": [{"type": "summary_text", "text": "summary"}],
                 "content": [{"type": "text", "text": "raw reasoning"}],
                 "encrypted_content": "encoded",
-            }),
+            }]),
         );
     }
 }
+
+#[cfg(test)]
+#[path = "inference_recording_tests.rs"]
+mod recording_tests;

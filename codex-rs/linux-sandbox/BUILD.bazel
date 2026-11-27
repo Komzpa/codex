@@ -1,36 +1,31 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
 load("//:defs.bzl", "codex_rust_crate")
 
 codex_rust_crate(
     name = "linux-sandbox",
     crate_name = "codex_linux_sandbox",
-    # Bazel wires vendored bubblewrap + libcap via :vendored-bwrap-ffi below
-    # and sets vendored_bwrap_available explicitly, so we skip Cargo's
-    # build.rs in Bazel builds.
-    build_script_enabled = False,
-    deps_extra = select({
-        "@platforms//os:linux": [":vendored-bwrap-ffi"],
+    extra_binaries = [
+        "//codex-rs/bwrap:bwrap",
+    ],
+    rustc_env_files = select({
+        "@platforms//os:linux": ["//codex-rs/bwrap:bwrap-sha256-env"],
         "//conditions:default": [],
     }),
-    rustc_flags_extra = select({
-        "@platforms//os:linux": ["--cfg=vendored_bwrap_available"],
-        "//conditions:default": [],
-    }),
+    test_data_extra = [":managed-tcp-test-data"],
 )
 
-cc_library(
-    name = "vendored-bwrap-ffi",
-    srcs = ["//codex-rs/vendor:bubblewrap_c_sources"],
-    hdrs = [
-        "config.h",
-        "//codex-rs/vendor:bubblewrap_headers",
+config_setting(
+    name = "linux-x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
     ],
-    copts = [
-        "-D_GNU_SOURCE",
-        "-Dmain=bwrap_main",
-    ],
-    includes = ["."],
-    deps = ["@libcap//:libcap"],
-    target_compatible_with = ["@platforms//os:linux"],
-    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "managed-tcp-test-data",
+    testonly = True,
+    srcs = select({
+        ":linux-x86_64": ["@managed_tcp_test_bubblewrap_noble_amd64//:usr/bin/bwrap"],
+        "//conditions:default": [],
+    }),
 )

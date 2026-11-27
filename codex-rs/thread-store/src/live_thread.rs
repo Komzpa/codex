@@ -1,21 +1,37 @@
+use codex_rollout::ResponseItemEnvelope;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::realtime::RealtimeItem;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutPersistenceTelemetry;
+use codex_rollout::measure_and_filter_rollout_items;
+use codex_rollout::persisted_rollout_item;
+use codex_rollout::persisted_rollout_items;
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
+use crate::PersistContext;
+use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
+use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
+use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::ThreadStoreResumePreparation;
 use crate::UpdateThreadMetadataParams;
+use crate::thread_metadata_sync::ThreadMetadataSync;
 
 /// Handle for an active thread's persistence lifecycle.
 ///
@@ -25,21 +41,55 @@ use crate::UpdateThreadMetadataParams;
 #[derive(Clone)]
 pub struct LiveThread {
     thread_id: ThreadId,
+    history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
+    metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+    persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
-/// Owns a live thread while session initialization is still fallible.
+/// Owns persistence acquisition and its live thread while initialization is still fallible.
 ///
 /// If initialization returns early after persistence has been opened, dropping this guard discards
 /// the live writer without forcing lazy in-memory state to become durable. Call [`commit`] once the
-/// session owns the live thread for normal operation.
+/// session owns the live thread for normal operation. Cancellation leaves an in-flight acquisition
+/// owned by the guard: cleanup waits for it to finish before discarding any acquired writer.
+#[derive(Default)]
 pub struct LiveThreadInitGuard {
     live_thread: Option<LiveThread>,
+    acquiring: Option<ThreadStoreFuture<'static, LiveThread>>,
 }
 
 impl LiveThreadInitGuard {
     pub fn new(live_thread: Option<LiveThread>) -> Self {
-        Self { live_thread }
+        Self {
+            live_thread,
+            acquiring: None,
+        }
+    }
+
+    /// Retains the operation even if the caller stops waiting. Store operations may install a
+    /// writer before returning or delegate to another runtime, so they cannot simply be dropped.
+    pub async fn acquire(
+        &mut self,
+        acquisition: impl Future<Output = ThreadStoreResult<LiveThread>> + Send + 'static,
+    ) -> ThreadStoreResult<LiveThread> {
+        assert!(self.live_thread.is_none() && self.acquiring.is_none());
+        self.acquiring = Some(Box::pin(acquisition));
+        self.finish_acquisition().await?;
+        self.live_thread
+            .clone()
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "persistence acquisition returned no live thread".to_owned(),
+            })
+    }
+
+    async fn finish_acquisition(&mut self) -> ThreadStoreResult<()> {
+        if let Some(acquiring) = self.acquiring.as_mut() {
+            let result = acquiring.await;
+            self.acquiring = None;
+            self.live_thread = Some(result?);
+        }
+        Ok(())
     }
 
     pub fn as_ref(&self) -> Option<&LiveThread> {
@@ -50,27 +100,34 @@ impl LiveThreadInitGuard {
         self.live_thread = None;
     }
 
-    pub async fn discard(&mut self) {
+    pub async fn discard(&mut self) -> ThreadStoreResult<()> {
+        self.finish_acquisition().await?;
         let Some(live_thread) = self.live_thread.take() else {
-            return;
+            return Ok(());
         };
-        if let Err(err) = live_thread.discard().await {
-            warn!("failed to discard thread persistence for failed session init: {err}");
-        }
+        live_thread.discard().await
     }
 }
 
 impl Drop for LiveThreadInitGuard {
     fn drop(&mut self) {
-        let Some(live_thread) = self.live_thread.take() else {
+        if self.live_thread.is_none() && self.acquiring.is_none() {
             return;
-        };
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("failed to discard thread persistence for failed session init: no Tokio runtime");
             return;
         };
+        let acquiring = self.acquiring.take();
+        let live_thread = self.live_thread.take();
         handle.spawn(async move {
-            if let Err(err) = live_thread.discard().await {
+            let live_thread = match acquiring {
+                Some(acquiring) => acquiring.await.ok(),
+                None => live_thread,
+            };
+            if let Some(live_thread) = live_thread
+                && let Err(err) = live_thread.discard().await
+            {
                 warn!("failed to discard thread persistence for failed session init: {err}");
             }
         });
@@ -83,44 +140,269 @@ impl LiveThread {
         params: CreateThreadParams,
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
+        let history_mode = params.history_mode;
+        let inherited_preview = if params.forked_from_id.is_some() {
+            thread_store
+                .read_pending_thread_metadata(thread_id)
+                .await?
+                .and_then(|patch| patch.preview)
+        } else {
+            None
+        };
+        let metadata_sync =
+            ThreadMetadataSync::for_create(&params, inherited_preview.as_deref()).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
             thread_id,
+            history_mode,
             thread_store,
+            metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
 
+    /// Create a child thread with inherited model context already durable.
+    ///
+    /// The boundary belongs in session metadata before the copied prefix is written so history
+    /// projection can distinguish inherited context from the child's own records immediately.
+    pub async fn create_with_inherited_model_context(
+        thread_store: Arc<dyn ThreadStore>,
+        mut params: CreateThreadParams,
+        inherited_model_context: &[RolloutItem],
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
+        let persisted_prefix_item_count = inherited_model_context
+            .iter()
+            .filter(|item| persisted_rollout_item(item, params.history_mode).is_some())
+            .count();
+        params.subagent_history_start_ordinal = Some(
+            u64::try_from(persisted_prefix_item_count)
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
+                })?
+                .checked_add(1)
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
+                })?,
+        );
+        let live_thread = guard.acquire(Self::create(thread_store, params)).await?;
+        live_thread
+            .persist_appended_items(inherited_model_context)
+            .await?;
+        Ok(live_thread)
+    }
+
+    /// Reopens persistence and returns the replay history selected under writer ownership.
     pub async fn resume(
         thread_store: Arc<dyn ThreadStore>,
-        params: ResumeThreadParams,
-    ) -> ThreadStoreResult<Self> {
+        history_mode: ThreadHistoryMode,
+        mut params: ResumeThreadParams,
+        resume_preparation: Option<ThreadStoreResumePreparation>,
+    ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
         let thread_id = params.thread_id;
-        thread_store.resume_thread(params).await?;
-        Ok(Self {
-            thread_id,
-            thread_store,
-        })
+        let metadata = if history_mode == ThreadHistoryMode::Paginated
+            && let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>()
+            && let Some(state_db) = local_store.state_db().await
+        {
+            state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to read thread metadata for {thread_id}: {err}"),
+                })?
+        } else {
+            None
+        };
+        let history = match resume_preparation {
+            Some(preparation) => {
+                thread_store
+                    .resume_thread_with_preparation(params.clone(), preparation)
+                    .await?
+            }
+            None => thread_store.resume_thread(params.clone()).await?,
+        };
+        params.history = Some(Arc::clone(&history));
+        let metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
+        Ok((
+            Self {
+                thread_id,
+                history_mode,
+                thread_store,
+                metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+                persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+            },
+            history,
+        ))
     }
 
-    pub async fn append_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+    #[tracing::instrument(level = "trace", skip_all, fields(item_count = raw_items.len()))]
+    pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let items = self
+            .persist_appended_items(raw_items)
+            .await?
+            .unwrap_or_else(|| persisted_rollout_items(raw_items, self.history_mode));
+        if items.is_empty() {
+            return Ok(());
+        }
+        if self.should_defer_rollout_metadata().await {
+            let _ = self
+                .metadata_sync
+                .lock()
+                .await
+                .observe_appended_items(items.as_slice());
+            return Ok(());
+        }
+        self.observe_appended_metadata(&items).await
+    }
+
+    /// Returns the filtered items if sampling already needed to collect them.
+    async fn persist_appended_items(
+        &self,
+        raw_items: &[RolloutItem],
+    ) -> ThreadStoreResult<Option<Vec<RolloutItem>>> {
+        // Empty appends are intentionally ignored rather than represented as zero-sized batches.
+        if raw_items.is_empty() {
+            return Ok(None);
+        }
+        let measured = self
+            .persistence_telemetry
+            .is_enabled()
+            .then(|| measure_and_filter_rollout_items(raw_items, self.history_mode));
         self.thread_store
             .append_items(AppendThreadItemsParams {
                 thread_id: self.thread_id,
-                items: items.to_vec(),
+                items: raw_items.to_vec(),
             })
-            .await
+            .await?;
+        Ok(measured.map(|(items, measurement)| {
+            self.persistence_telemetry
+                .record_batch(raw_items, &measurement);
+            items
+        }))
     }
 
-    pub async fn persist(&self) -> ThreadStoreResult<()> {
-        self.thread_store.persist_thread(self.thread_id).await
+    async fn should_defer_rollout_metadata(&self) -> bool {
+        if self.history_mode == ThreadHistoryMode::Paginated
+            && let Some(store) = self
+                .thread_store
+                .as_any()
+                .downcast_ref::<LocalThreadStore>()
+        {
+            store.config.sqlite.prefers_rollback_journal().await
+        } else {
+            false
+        }
+    }
+
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        if context.allows_background_persistence() {
+            if self.should_defer_rollout_metadata().await {
+                return self
+                    .thread_store
+                    .persist_thread(self.thread_id, context)
+                    .await;
+            }
+            let update = self
+                .metadata_sync
+                .lock()
+                .await
+                .take_pending_update_for_existing_history();
+            self.apply_pending_metadata_update(update, context).await?;
+        }
+        self.thread_store
+            .persist_thread(self.thread_id, context)
+            .await?;
+        let update = self.metadata_sync.lock().await.take_pending_update();
+        self.apply_pending_metadata_update(update, context).await
+    }
+
+    pub async fn seal_realtime_items(&self, items: Vec<RealtimeItem>) -> ThreadStoreResult<()> {
+        if self.thread_store.uses_separate_realtime_frame_store() {
+            return self
+                .thread_store
+                .seal_realtime_items(self.thread_id, items)
+                .await;
+        }
+        if items.last().is_some_and(|item| {
+            matches!(
+                item.content,
+                codex_protocol::realtime::RealtimeItemContent::SessionInputSaved {
+                    reason: codex_protocol::realtime::SessionInputReason::SessionEnd,
+                    ..
+                }
+            )
+        }) {
+            self.thread_store
+                .seal_realtime_items(self.thread_id, items.clone())
+                .await?;
+            let records = items
+                .into_iter()
+                .map(RolloutItem::RealtimeItem)
+                .collect::<Vec<_>>();
+            self.observe_appended_metadata(&records).await?;
+            return Ok(());
+        }
+        let records: Vec<_> = items.into_iter().map(RolloutItem::RealtimeItem).collect();
+        self.append_items(&records).await?;
+        self.flush().await
+    }
+
+    pub async fn seal_realtime_input(
+        &self,
+        frames: Vec<RealtimeItem>,
+        input: ResponseItemEnvelope,
+    ) -> ThreadStoreResult<()> {
+        let record = RolloutItem::ResponseItem(input.clone());
+        self.thread_store
+            .seal_realtime_input(self.thread_id, frames, input)
+            .await?;
+        // The store owns the idempotent acceptance barrier. Apply append-derived
+        // metadata afterward so retrying a failed metadata update cannot append again.
+        self.observe_appended_metadata(&[record]).await
+    }
+
+    async fn observe_appended_metadata(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let update = self
+            .metadata_sync
+            .lock()
+            .await
+            .observe_appended_items(items);
+        if let Some(update) = update {
+            self.thread_store
+                .record_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: self.thread_id,
+                    patch: update.patch.clone(),
+                    include_archived: true,
+                })
+                .await?;
+            self.metadata_sync
+                .lock()
+                .await
+                .mark_pending_update_applied(&update);
+        }
+        Ok(())
     }
 
     pub async fn flush(&self) -> ThreadStoreResult<()> {
-        self.thread_store.flush_thread(self.thread_id).await
+        self.thread_store.flush_thread(self.thread_id).await?;
+        self.flush_pending_metadata_update_for_existing_history()
+            .await
     }
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        self.thread_store.shutdown_thread(self.thread_id).await
+        let metadata_result = self
+            .flush_pending_metadata_update_for_existing_history()
+            .await;
+        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
+        match (metadata_result, shutdown_result) {
+            (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
+                message: format!(
+                    "thread metadata update failed: {metadata_error}; thread shutdown failed: {shutdown_error}"
+                ),
+            }),
+            (Err(metadata_error), Ok(())) => Err(metadata_error),
+            (Ok(()), result) => result,
+        }
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
@@ -139,11 +421,26 @@ impl LiveThread {
             .await
     }
 
+    pub async fn read_thread(
+        &self,
+        include_archived: bool,
+        include_history: bool,
+    ) -> ThreadStoreResult<StoredThread> {
+        self.thread_store
+            .read_thread(ReadThreadParams {
+                thread_id: self.thread_id,
+                include_archived,
+                include_history,
+            })
+            .await
+    }
+
     pub async fn update_memory_mode(
         &self,
         mode: ThreadMemoryMode,
         include_archived: bool,
     ) -> ThreadStoreResult<()> {
+        self.flush_pending_metadata_update().await?;
         self.thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
@@ -155,6 +452,33 @@ impl LiveThread {
             })
             .await?;
         Ok(())
+    }
+
+    /// Updates metadata while preserving this API's materialized-thread contract.
+    ///
+    /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
+    /// fallback in that case.
+    pub async fn update_metadata(
+        &self,
+        patch: ThreadMetadataPatch,
+        include_archived: bool,
+    ) -> ThreadStoreResult<StoredThread> {
+        self.flush_pending_metadata_update().await?;
+        let updated = self
+            .thread_store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id: self.thread_id,
+                patch,
+                include_archived,
+            })
+            .await?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => {
+                self.read_thread(include_archived, /*include_history*/ false)
+                    .await
+            }
+        }
     }
 
     /// Returns the live local rollout path for legacy local-only callers.
@@ -172,5 +496,58 @@ impl LiveThread {
             .live_rollout_path(self.thread_id)
             .await
             .map(Some)
+    }
+
+    /// Selects a local feedback input only after its writer has materialized it.
+    pub async fn feedback_rollout_path(&self) -> ThreadStoreResult<Option<PathBuf>> {
+        let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return Ok(None);
+        };
+        local_store.feedback_rollout_path(self.thread_id).await
+    }
+
+    async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
+        let update = self.metadata_sync.lock().await.take_pending_update();
+        self.apply_pending_metadata_update(update, PersistContext::Standard)
+            .await
+    }
+
+    async fn flush_pending_metadata_update_for_existing_history(&self) -> ThreadStoreResult<()> {
+        let update = self
+            .metadata_sync
+            .lock()
+            .await
+            .take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(update, PersistContext::Standard)
+            .await
+    }
+
+    async fn apply_pending_metadata_update(
+        &self,
+        update: Option<crate::thread_metadata_sync::PendingThreadMetadataPatch>,
+        context: PersistContext,
+    ) -> ThreadStoreResult<()> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let params = UpdateThreadMetadataParams {
+            thread_id: self.thread_id,
+            patch: update.patch.clone(),
+            include_archived: true,
+        };
+        if context == PersistContext::Standard {
+            self.thread_store.update_thread_metadata(params).await?;
+        } else {
+            self.thread_store.record_thread_metadata(params).await?;
+        }
+        self.metadata_sync
+            .lock()
+            .await
+            .mark_pending_update_applied(&update);
+        Ok(())
     }
 }

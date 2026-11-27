@@ -1,15 +1,18 @@
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
-use codex_app_server_protocol::DynamicToolCallResponse;
+use codex_app_server_protocol::DynamicToolCallResult;
 use codex_core::CodexThread;
-use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
-use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolCallResult as CoreDynamicToolCallResult;
 use codex_protocol::protocol::Op;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
+use crate::image_url::REMOTE_IMAGE_URL_ERROR;
+use crate::image_url::is_remote_image_url;
 use crate::outgoing_message::ClientRequestResult;
 use crate::server_request_error::is_turn_transition_server_request_error;
+
+const INVALID_AUDIO_URL_ERROR: &str = "audio URLs must use an inline data URL";
 
 pub(crate) async fn on_call_response(
     call_id: String,
@@ -17,7 +20,7 @@ pub(crate) async fn on_call_response(
     conversation: Arc<CodexThread>,
 ) {
     let response = receiver.await;
-    let (response, _error) = match response {
+    let response = match response {
         Ok(Ok(value)) => decode_response(value),
         Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
@@ -30,21 +33,10 @@ pub(crate) async fn on_call_response(
         }
     };
 
-    let DynamicToolCallResponse {
-        content_items,
-        success,
-    } = response.clone();
-    let core_response = CoreDynamicToolResponse {
-        content_items: content_items
-            .into_iter()
-            .map(CoreDynamicToolCallOutputContentItem::from)
-            .collect(),
-        success,
-    };
     if let Err(err) = conversation
-        .submit(Op::DynamicToolResponse {
+        .submit(Op::DynamicToolResult {
             id: call_id.clone(),
-            response: core_response,
+            response,
         })
         .await
     {
@@ -52,24 +44,65 @@ pub(crate) async fn on_call_response(
     }
 }
 
-fn decode_response(value: serde_json::Value) -> (DynamicToolCallResponse, Option<String>) {
-    match serde_json::from_value::<DynamicToolCallResponse>(value) {
-        Ok(response) => (response, None),
+fn decode_response(value: serde_json::Value) -> CoreDynamicToolCallResult {
+    let structured =
+        value.get("structuredContent").is_some() || value.get("errorMessage").is_some();
+    match serde_json::from_value::<DynamicToolCallResult>(value) {
+        Ok(DynamicToolCallResult::ContentItems(response))
+            if response.content_items.iter().any(|item| {
+                matches!(
+                    item,
+                    DynamicToolCallOutputContentItem::InputImage { image_url }
+                        if is_remote_image_url(image_url)
+                )
+            }) =>
+        {
+            error!(
+                message = REMOTE_IMAGE_URL_ERROR,
+                "dynamic tool response was invalid"
+            );
+            fallback_response(REMOTE_IMAGE_URL_ERROR)
+        }
+        Ok(DynamicToolCallResult::ContentItems(response))
+            if response.content_items.iter().any(|item| {
+                matches!(
+                    item,
+                    DynamicToolCallOutputContentItem::InputAudio { audio_url }
+                        if !audio_url
+                            .get(.."data:".len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+                )
+            }) =>
+        {
+            error!(
+                message = INVALID_AUDIO_URL_ERROR,
+                "dynamic tool response was invalid"
+            );
+            fallback_response(INVALID_AUDIO_URL_ERROR)
+        }
+        Ok(response) => response.into(),
         Err(err) => {
-            error!("failed to deserialize DynamicToolCallResponse: {err}");
-            fallback_response("dynamic tool response was invalid")
+            error!("failed to deserialize DynamicToolCallResult: {err}");
+            let message = "dynamic tool response was invalid";
+            if structured {
+                CoreDynamicToolCallResult::Error {
+                    error_message: message.to_owned(),
+                }
+            } else {
+                fallback_response(message)
+            }
         }
     }
 }
 
-fn fallback_response(message: &str) -> (DynamicToolCallResponse, Option<String>) {
-    (
-        DynamicToolCallResponse {
-            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+fn fallback_response(message: &str) -> CoreDynamicToolCallResult {
+    // Advertising support does not mean the client selected structured results.
+    CoreDynamicToolCallResult::ContentItems(codex_protocol::dynamic_tools::DynamicToolResponse {
+        content_items: vec![
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
                 text: message.to_string(),
-            }],
-            success: false,
-        },
-        Some(message.to_string()),
-    )
+            },
+        ],
+        success: false,
+    })
 }

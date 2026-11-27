@@ -1,9 +1,21 @@
 load("//:defs.bzl", "codex_rust_crate")
+load("//bazel/rules:runtime_package.bzl", "release_binary")
 
 codex_rust_crate(
     name = "app-server",
     crate_name = "codex_app_server",
+    extra_binaries = [
+        "//codex-rs/bwrap:bwrap",
+        "//codex-rs/cli:codex",
+        "//codex-rs/code-mode-host:codex-code-mode-host",
+        "//codex-rs/linux-sandbox:codex-linux-sandbox",
+        "//codex-rs/message-board-mcp:codex-message-board-mcp",
+        "//codex-rs/rmcp-client:test_stdio_server",
+    ],
+    integration_compile_data_extra = ["//codex-rs/message-board:tests/common/mod.rs"],
     integration_test_timeout = "long",
+    linux_python_tests = ["app-server-all-test"],
+    run_tests_with_wine_exec = True,
     test_shard_counts = {
         # Note app-server-all-test has a large number of integration tests, so
         # even a single shard can be quite slow. When there is a legitimate
@@ -15,4 +27,12 @@ codex_rust_crate(
         "app-server-unit-tests": 8,
     },
     test_tags = ["no-sandbox"],
+    test_threads = select({
+        "@platforms//os:macos": 1,
+        "//conditions:default": 0,
+    }),
+)
+
+release_binary(
+    binary = ":codex-app-server",
 )

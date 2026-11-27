@@ -1,12 +1,15 @@
 //! Helpers for mapping config parse/validation failures to file locations and
 //! rendering them in a user-friendly way.
 
+use crate::CONFIG_TOML_FILE;
 use crate::ConfigLayerEntry;
+use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
-use crate::ConfigLayerStackOrdering;
-use codex_app_server_protocol::ConfigLayerSource;
+use crate::config_toml::ConfigToml;
+use crate::format_config_layer_source;
+use crate::shell_environment_policy::ShellEnvironmentPolicyFilterConfigToml;
+use crate::strict_config::validate_toml_value;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
-use serde::de::DeserializeOwned;
 use serde_path_to_error::Path as SerdePath;
 use serde_path_to_error::Segment as SerdeSegment;
 use std::fmt;
@@ -86,6 +89,21 @@ impl std::error::Error for ConfigLoadError {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ConfigDiagnosticSource<'a> {
+    Path(&'a Path),
+    DisplayName(&'a str),
+}
+
+impl ConfigDiagnosticSource<'_> {
+    pub(crate) fn to_path_buf(self) -> PathBuf {
+        match self {
+            ConfigDiagnosticSource::Path(path) => path.to_path_buf(),
+            ConfigDiagnosticSource::DisplayName(name) => PathBuf::from(name),
+        }
+    }
+}
+
 pub fn io_error_from_config_error(
     kind: io::ErrorKind,
     error: ConfigError,
@@ -99,74 +117,144 @@ pub fn config_error_from_toml(
     contents: &str,
     err: toml::de::Error,
 ) -> ConfigError {
+    config_error_from_toml_for_source(ConfigDiagnosticSource::Path(path.as_ref()), contents, err)
+}
+
+pub(crate) fn config_error_from_toml_for_source(
+    source: ConfigDiagnosticSource<'_>,
+    contents: &str,
+    err: toml::de::Error,
+) -> ConfigError {
     let range = err
         .span()
         .map(|span| text_range_from_span(contents, span))
         .unwrap_or_else(default_range);
-    ConfigError::new(path.as_ref().to_path_buf(), range, err.message())
+    ConfigError::new(source.to_path_buf(), range, err.message())
 }
 
-pub fn config_error_from_typed_toml<T: DeserializeOwned>(
-    path: impl AsRef<Path>,
-    contents: &str,
-) -> Option<ConfigError> {
-    let deserializer = match toml::de::Deserializer::parse(contents) {
-        Ok(deserializer) => deserializer,
-        Err(err) => return Some(config_error_from_toml(path, contents, err)),
-    };
+#[derive(Clone, Copy)]
+enum DiagnosticSchema {
+    Config,
+    ShellEnvironmentFilters,
+}
 
-    let result: Result<T, _> = serde_path_to_error::deserialize(deserializer);
-    match result {
-        Ok(_) => None,
-        Err(err) => {
-            let path_hint = err.path().clone();
-            let toml_err: toml::de::Error = err.into_inner();
-            let range = span_for_config_path(contents, &path_hint)
-                .or_else(|| toml_err.span())
-                .map(|span| text_range_from_span(contents, span))
-                .unwrap_or_else(default_range);
-            Some(ConfigError::new(
-                path.as_ref().to_path_buf(),
-                range,
-                toml_err.message(),
-            ))
+impl DiagnosticSchema {
+    fn deserialize_error<'de, D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Option<serde_path_to_error::Error<D::Error>> {
+        match self {
+            Self::Config => serde_path_to_error::deserialize::<_, ConfigToml>(deserializer).err(),
+            Self::ShellEnvironmentFilters => serde_path_to_error::deserialize::<
+                _,
+                ShellEnvironmentPolicyFilterConfigToml,
+            >(deserializer)
+            .err(),
         }
     }
 }
 
-pub async fn first_layer_config_error<T: DeserializeOwned>(
-    layers: &ConfigLayerStack,
-    config_toml_file: &str,
+pub fn config_error_from_typed_toml(path: &Path, contents: &str) -> Option<ConfigError> {
+    config_error_from_typed_toml_for_source(
+        DiagnosticSchema::Config,
+        ConfigDiagnosticSource::Path(path),
+        contents,
+        /*layer*/ None,
+    )
+}
+
+fn config_error_from_typed_toml_for_source(
+    schema: DiagnosticSchema,
+    source: ConfigDiagnosticSource<'_>,
+    contents: &str,
+    layer: Option<&ConfigLayerSource>,
 ) -> Option<ConfigError> {
+    let deserializer = match toml::de::Deserializer::parse(contents) {
+        Ok(deserializer) => deserializer,
+        Err(err) => return Some(config_error_from_toml_for_source(source, contents, err)),
+    };
+
+    let mut err = schema.deserialize_error(deserializer)?;
+    // Diagnose the same effective fields against the text we just read from disk.
+    if let Some(layer) = layer
+        && let Ok(raw) = toml::from_str(contents)
+        && let std::borrow::Cow::Owned(effective) = layer.effective_values(&raw)
+    {
+        err = match schema {
+            DiagnosticSchema::Config => {
+                validate_toml_value::<ConfigToml>(effective, /*ignored_paths*/ None).err()
+            }
+            DiagnosticSchema::ShellEnvironmentFilters => serde_path_to_error::deserialize::<
+                _,
+                ShellEnvironmentPolicyFilterConfigToml,
+            >(effective)
+            .err(),
+        }?;
+    }
+    let path_hint = err.path().clone();
+    let toml_err: toml::de::Error = err.into_inner();
+    let range = span_for_config_path(contents, &path_hint)
+        .or_else(|| toml_err.span())
+        .map(|span| text_range_from_span(contents, span))
+        .unwrap_or_else(default_range);
+    Some(ConfigError::new(
+        source.to_path_buf(),
+        range,
+        toml_err.message(),
+    ))
+}
+
+pub async fn first_layer_config_error(layers: &ConfigLayerStack) -> Option<ConfigError> {
     // When the merged config fails schema validation, we surface the first concrete
     // per-file error to point users at a specific file and range rather than an
     // opaque merged-layer failure.
-    first_layer_config_error_for_entries::<T, _>(
-        layers.get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ false,
-        ),
-        config_toml_file,
-    )
-    .await
+    first_layer_error(layers.layers_low_to_high(), DiagnosticSchema::Config).await
 }
 
-pub async fn first_layer_config_error_from_entries<T: DeserializeOwned>(
+pub async fn first_layer_config_error_from_entries(
     layers: &[ConfigLayerEntry],
-    config_toml_file: &str,
 ) -> Option<ConfigError> {
-    first_layer_config_error_for_entries::<T, _>(layers.iter(), config_toml_file).await
+    first_layer_error(layers, DiagnosticSchema::Config).await
 }
 
-async fn first_layer_config_error_for_entries<'a, T: DeserializeOwned, I>(
-    layers: I,
-    config_toml_file: &str,
-) -> Option<ConfigError>
-where
-    I: IntoIterator<Item = &'a ConfigLayerEntry>,
-{
+pub(crate) async fn first_layer_shell_environment_filter_error(
+    layers: &[ConfigLayerEntry],
+) -> Option<ConfigError> {
+    first_layer_error(layers, DiagnosticSchema::ShellEnvironmentFilters).await
+}
+
+async fn first_layer_error<'a>(
+    layers: impl IntoIterator<Item = &'a ConfigLayerEntry>,
+    schema: DiagnosticSchema,
+) -> Option<ConfigError> {
     for layer in layers {
-        let Some(path) = config_path_for_layer(layer, config_toml_file) else {
+        if layer.is_disabled() {
+            continue;
+        }
+        if let Some(contents) = layer.raw_toml() {
+            let source_name = format_config_layer_source(&layer.name, CONFIG_TOML_FILE);
+            let Some(base_dir) = layer.raw_toml_base_dir() else {
+                tracing::debug!(
+                    "Skipping raw TOML diagnostics for {source_name} because it has no base directory"
+                );
+                continue;
+            };
+            // Match the base directory used when the raw non-file layer was
+            // parsed into the runtime layer so diagnostics resolve relative
+            // path fields with the same semantics.
+            let _absolute_path_base = AbsolutePathBufGuard::new(base_dir.as_path());
+            if let Some(error) = config_error_from_typed_toml_for_source(
+                schema,
+                ConfigDiagnosticSource::DisplayName(&source_name),
+                contents,
+                Some(&layer.name),
+            ) {
+                return Some(error);
+            }
+            continue;
+        }
+
+        let Some(path) = config_path_for_layer(layer, CONFIG_TOML_FILE) else {
             continue;
         };
         let contents = match tokio::fs::read_to_string(&path).await {
@@ -183,7 +271,12 @@ where
             continue;
         };
         let _guard = AbsolutePathBufGuard::new(parent);
-        if let Some(error) = config_error_from_typed_toml::<T>(&path, &contents) {
+        if let Some(error) = config_error_from_typed_toml_for_source(
+            schema,
+            ConfigDiagnosticSource::Path(&path),
+            &contents,
+            Some(&layer.name),
+        ) {
             return Some(error);
         }
     }
@@ -193,19 +286,21 @@ where
 
 fn config_path_for_layer(layer: &ConfigLayerEntry, config_toml_file: &str) -> Option<PathBuf> {
     match &layer.name {
+        ConfigLayerSource::PackagedDefaults { file } => Some(file.to_path_buf()),
         ConfigLayerSource::System { file } => Some(file.to_path_buf()),
-        ConfigLayerSource::User { file } => Some(file.to_path_buf()),
+        ConfigLayerSource::User { file, .. } => Some(file.to_path_buf()),
         ConfigLayerSource::Project { dot_codex_folder } => {
             Some(dot_codex_folder.as_path().join(config_toml_file))
         }
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.to_path_buf()),
         ConfigLayerSource::Mdm { .. }
+        | ConfigLayerSource::EnterpriseManaged { .. }
         | ConfigLayerSource::SessionFlags
         | ConfigLayerSource::LegacyManagedConfigTomlFromMdm => None,
     }
 }
 
-fn text_range_from_span(contents: &str, span: std::ops::Range<usize>) -> TextRange {
+pub(crate) fn text_range_from_span(contents: &str, span: std::ops::Range<usize>) -> TextRange {
     let start = position_for_offset(contents, span.start);
     let end_index = if span.end > span.start {
         span.end - 1
@@ -290,7 +385,7 @@ fn position_for_offset(contents: &str, index: usize) -> TextPosition {
     }
 }
 
-fn default_range() -> TextRange {
+pub(crate) fn default_range() -> TextRange {
     let position = TextPosition { line: 1, column: 1 };
     TextRange {
         start: position,
@@ -314,13 +409,58 @@ fn span_for_path(contents: &str, path: &SerdePath) -> Option<std::ops::Range<usi
     }
 }
 
-fn span_for_config_path(contents: &str, path: &SerdePath) -> Option<std::ops::Range<usize>> {
+pub(crate) fn span_for_config_path(
+    contents: &str,
+    path: &SerdePath,
+) -> Option<std::ops::Range<usize>> {
     if is_features_table_path(path)
         && let Some(span) = span_for_features_value(contents)
     {
         return Some(span);
     }
     span_for_path(contents, path)
+}
+
+pub(crate) fn span_for_toml_key_path(
+    contents: &str,
+    path: &[String],
+) -> Option<std::ops::Range<usize>> {
+    let doc = contents.parse::<Document<String>>().ok()?;
+    let mut node = TomlNode::Item(doc.as_item());
+    for (index, segment) in path.iter().enumerate() {
+        if index + 1 == path.len() {
+            let key_span = match &node {
+                TomlNode::Item(item) => item
+                    .as_table_like()
+                    .and_then(|table| table.get_key_value(segment))
+                    .and_then(|(key, _)| key.span()),
+                TomlNode::Table(table) => {
+                    table.get_key_value(segment).and_then(|(key, _)| key.span())
+                }
+                TomlNode::Value(Value::InlineTable(table)) => {
+                    table.get_key_value(segment).and_then(|(key, _)| key.span())
+                }
+                _ => None,
+            };
+            if key_span.is_some() {
+                return key_span;
+            }
+        }
+
+        if let Some(next) = map_child(&node, segment) {
+            node = next;
+            continue;
+        }
+
+        let index = segment.parse::<usize>().ok()?;
+        node = seq_child(&node, index)?;
+    }
+
+    match node {
+        TomlNode::Item(item) => item.span(),
+        TomlNode::Table(table) => table.span(),
+        TomlNode::Value(value) => value.span(),
+    }
 }
 
 fn is_features_table_path(path: &SerdePath) -> bool {

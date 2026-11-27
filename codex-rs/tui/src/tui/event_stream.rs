@@ -3,7 +3,8 @@
 //! - [`EventBroker`] holds the shared crossterm stream so multiple callers reuse the same
 //!   input source and can drop/recreate it on pause/resume without rebuilding consumers.
 //! - [`TuiEventStream`] wraps a draw event subscription plus the shared [`EventBroker`] and maps crossterm
-//!   events into [`TuiEvent`].
+//!   events into [`TuiEvent`]. The broker also owns the tmux size monitor; its samples
+//!   wake the draw subscription and become resize events before rendering.
 //! - [`EventSource`] abstracts the underlying event producer; the real implementation is
 //!   [`CrosstermEventSource`] and tests can swap in [`FakeEventSource`].
 //!
@@ -17,6 +18,7 @@
 //!
 //! See https://ratatui.rs/recipes/apps/spawn-vim/ and https://www.reddit.com/r/rust/comments/1f3o33u/myterious_crossterm_input_after_running_vim for more details.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -34,6 +36,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::TuiEvent;
+use super::size_monitor::SizeMonitor;
 
 /// Result type produced by an event source.
 pub type EventResult = std::io::Result<Event>;
@@ -49,8 +52,19 @@ pub trait EventSource: Send + 'static {
 ///
 /// This intermediate layer enables dropping/recreating the underlying EventStream (pause/resume) without rebuilding consumers.
 pub struct EventBroker<S: EventSource = CrosstermEventSource> {
-    state: Mutex<EventBrokerState<S>>,
+    state: Mutex<BrokerInput<S>>,
     resume_events_tx: watch::Sender<()>,
+    pub(super) size_monitor: Option<SizeMonitor>,
+}
+
+struct BrokerInput<S: EventSource> {
+    source: EventBrokerState<S>,
+    // The first non-drag report (or end of input) belongs to the next poll, even
+    // if a different stream takes over the shared terminal.
+    lookahead: Poll<Option<EventResult>>,
+    // Deliver focus changes captured during a thread transition before newer input.
+    pending_focus: VecDeque<Event>,
+    drain_failed: bool,
 }
 
 /// Tracks state of underlying [`EventSource`].
@@ -81,27 +95,58 @@ impl<S: EventSource + Default> EventBroker<S> {
     pub fn new() -> Self {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {
-            state: Mutex::new(EventBrokerState::Start),
+            state: Mutex::new(BrokerInput {
+                source: EventBrokerState::Start,
+                pending_focus: VecDeque::new(),
+                lookahead: Poll::Pending,
+                drain_failed: false,
+            }),
             resume_events_tx,
+            size_monitor: None,
         }
     }
 
     /// Drop the underlying event source
     pub fn pause_events(&self) {
+        if let Some(monitor) = &self.size_monitor {
+            monitor.set_active(/*active*/ false);
+        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = EventBrokerState::Paused;
+        state.source = EventBrokerState::Paused;
+        // Only focus reports survive an input boundary.
+        if let Poll::Ready(Some(Ok(event @ (Event::FocusGained | Event::FocusLost)))) =
+            std::mem::replace(&mut state.lookahead, Poll::Pending)
+        {
+            state.pending_focus.push_back(event);
+        }
+    }
+
+    /// Called with the event source paused. A terminal error must not expose stale keys.
+    pub(super) fn drain_transition_input(&self) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = super::input_boundary::drain_pending_input(Some(&mut state.pending_focus));
+        state.drain_failed = result
+            .as_ref()
+            .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+        result
     }
 
     /// Create a new instance of the underlying event source
     pub fn resume_events(&self) {
+        if let Some(monitor) = &self.size_monitor {
+            monitor.set_active(/*active*/ true);
+        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = EventBrokerState::Start;
+        state.source = EventBrokerState::Start;
         let _ = self.resume_events_tx.send(());
     }
 
@@ -115,18 +160,50 @@ impl<S: EventSource + Default> EventBroker<S> {
 }
 
 /// Real crossterm-backed event source.
-pub struct CrosstermEventSource(pub crossterm::event::EventStream);
+pub struct CrosstermEventSource {
+    #[cfg(not(windows))]
+    events: crossterm::event::EventStream,
+    #[cfg(windows)]
+    events: super::windows_key_sequence::WindowsKeySequence<crossterm::event::EventStream>,
+}
 
 impl Default for CrosstermEventSource {
     fn default() -> Self {
-        Self(crossterm::event::EventStream::new())
+        let events = crossterm::event::EventStream::new();
+        Self {
+            #[cfg(not(windows))]
+            events,
+            #[cfg(windows)]
+            events: super::windows_key_sequence::WindowsKeySequence::new(events),
+        }
     }
 }
 
 impl EventSource for CrosstermEventSource {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
-        Pin::new(&mut self.get_mut().0).poll_next(cx)
+        // Crossterm's Windows backend expects Win32 input records. If VT input is inherited or
+        // restored by another console client, navigation keys arrive as literal escape bytes.
+        #[cfg(windows)]
+        let _ = super::windows_console::ensure_input_record_mode();
+
+        let result = Pin::new(&mut self.get_mut().events).poll_next(cx);
+
+        // EventStream starts its blocking reader before returning Pending, so reassert the mode
+        // after that transition as well.
+        #[cfg(windows)]
+        if result.is_pending() {
+            let _ = super::windows_console::ensure_input_record_mode();
+        }
+
+        result
     }
+}
+
+// Bound the amount of input consumed before the event loop can service a draw or backend event.
+const MAX_DRAG_REPORTS_PER_POLL: usize = 64;
+
+fn is_left_drag(event: &Event) -> bool {
+    matches!(event, Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left))
 }
 
 /// TuiEventStream is a struct for reading TUI events (draws and user input).
@@ -142,6 +219,7 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
+    pub(crate) coalesce_divider_drags: bool,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -163,6 +241,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
+            coalesce_divider_drags: false,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -172,11 +251,11 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
 
     /// Poll the shared crossterm stream for the next mapped `TuiEvent`.
     ///
-    /// This skips events we don't use (mouse events, etc.) and keeps polling until it yields
+    /// This skips events we don't use and keeps polling until it yields
     /// a mapped event, hits `Pending`, or sees EOF/error. When the broker is paused, it drops
     /// the underlying stream and returns `Pending` to fully release stdin.
     pub fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
-        // Some crossterm events map to None (e.g. FocusLost, mouse); loop so we keep polling
+        // Some crossterm events map to None (e.g. mouse); loop so we keep polling
         // until we return a mapped event, hit Pending, or see EOF/error.
         loop {
             let poll_result = {
@@ -185,7 +264,19 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let events = match state.active_event_source_mut() {
+                if !matches!(state.source, EventBrokerState::Paused) {
+                    if state.drain_failed {
+                        return Poll::Ready(None);
+                    }
+                    if let Some(event) = state.pending_focus.pop_front() {
+                        drop(state);
+                        return Poll::Ready(self.map_crossterm_event(event));
+                    }
+                }
+                let BrokerInput {
+                    source, lookahead, ..
+                } = &mut *state;
+                let events = match source.active_event_source_mut() {
                     Some(events) => events,
                     None => {
                         drop(state);
@@ -197,10 +288,31 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                         }
                     }
                 };
-                match Pin::new(events).poll_next(cx) {
-                    Poll::Ready(Some(Ok(event))) => Some(event),
+                let next = match std::mem::replace(lookahead, Poll::Pending) {
+                    Poll::Ready(next) => Poll::Ready(next),
+                    Poll::Pending => Pin::new(&mut *events).poll_next(cx),
+                };
+                match next {
+                    Poll::Ready(Some(Ok(mut event))) => {
+                        if self.coalesce_divider_drags && is_left_drag(&event) {
+                            // Only a captured divider uses absolute positions. Selection and
+                            // scrolling need their full path. Bound work per poll for fairness.
+                            for _ in 1..MAX_DRAG_REPORTS_PER_POLL {
+                                match Pin::new(&mut *events).poll_next(cx) {
+                                    Poll::Ready(Some(Ok(next))) if is_left_drag(&next) => {
+                                        event = next
+                                    }
+                                    boundary => {
+                                        *lookahead = boundary;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(event)
+                    }
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                        *state = EventBrokerState::Start;
+                        state.source = EventBrokerState::Start;
                         return Poll::Ready(None);
                     }
                     Poll::Pending => {
@@ -224,38 +336,62 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// Poll the draw broadcast stream for the next draw event. Draw events are used to trigger a redraw of the TUI.
     pub fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         match Pin::new(&mut self.draw_stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(TuiEvent::Draw)),
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                Poll::Ready(Some(TuiEvent::Draw))
+            Poll::Ready(Some(Ok(())))
+            | Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
+                let event = self
+                    .broker
+                    .size_monitor
+                    .as_ref()
+                    .and_then(SizeMonitor::take_resize)
+                    .map_or(TuiEvent::Draw, TuiEvent::Resize);
+                Poll::Ready(Some(event))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
 
-    /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
+    /// Map a crossterm event to a [`TuiEvent`], preserving mouse coordinates and modifiers.
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
         match event {
             Event::Key(key_event) => {
                 #[cfg(unix)]
                 if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
-                    let _ = self.suspend_context.suspend(&self.alt_screen_active);
-                    return Some(TuiEvent::Draw);
+                    self.broker.pause_events();
+                    let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
+                    self.broker.resume_events();
+                    if let Err(err) = suspend_result {
+                        tracing::warn!(
+                            event = "tui_suspend_failed",
+                            error = %err,
+                            "failed to suspend TUI process"
+                        );
+                    }
+                    return Some(TuiEvent::Resume);
                 }
                 Some(TuiEvent::Key(key_event))
             }
-            Event::Resize(_, _) => Some(TuiEvent::Resize),
+            Event::Resize(width, height) => {
+                let size = ratatui::layout::Size { width, height };
+                if let Some(monitor) = &self.broker.size_monitor {
+                    monitor.observe(size);
+                }
+                Some(TuiEvent::Resize(size))
+            }
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                crate::terminal_palette::requery_default_colors();
-                Some(TuiEvent::Draw)
+                // Keep the startup-cached palette: querying terminal colors here blocks the
+                // input loop, and a direct probe would discard keys typed during the refresh.
+                Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
                 self.terminal_focused.store(false, Ordering::Relaxed);
-                None
+                Some(TuiEvent::FocusLost)
             }
-            _ => None,
+            // A report queued before capture stopped can precede the cleanup draw.
+            Event::Mouse(_) if super::mouse_capture_disabled() => None,
+            Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
         }
     }
 }
@@ -297,6 +433,8 @@ mod tests {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
+    use crossterm::event::MouseEvent;
+    use crossterm::event::MouseEventKind;
     use pretty_assertions::assert_eq;
     use std::task::Context;
     use std::task::Poll;
@@ -340,7 +478,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(source) = state.active_event_source_mut() else {
+            let Some(source) = state.source.active_event_source_mut() else {
                 return;
             };
             let _ = source.tx.send(event);
@@ -380,7 +518,7 @@ mod tests {
     fn setup() -> SetupState {
         let source = FakeEventSource::new();
         let broker = Arc::new(EventBroker::new());
-        *broker.state.lock().unwrap() = EventBrokerState::Running(source);
+        broker.state.lock().unwrap().source = EventBrokerState::Running(source);
         let handle = FakeEventSourceHandle::new(broker.clone());
 
         let (draw_tx, draw_rx) = broadcast::channel(1);
@@ -389,22 +527,116 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn key_event_skips_unmapped() {
+    async fn mouse_events_preserve_coordinates_and_do_not_consume_the_next_key() {
         let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let expected = MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 123,
+            row: 42,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle.send(Ok(Event::Mouse(expected)));
+        match stream.next().await {
+            Some(TuiEvent::Mouse(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected mouse event, got {other:?}"),
+        }
+        let expected = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected)));
+        match stream.next().await {
+            Some(TuiEvent::Key(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected key event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_captured_divider_motion_is_coalesced_and_stops_at_input_boundaries() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let left = crossterm::event::MouseButton::Left;
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = |column| mouse(MouseEventKind::Drag(left), column);
+        for column in [10, 11, 12, 13] {
+            handle.send(Ok(Event::Mouse(drag(column))));
+        }
+        handle.send(Ok(Event::FocusLost));
+        handle.send(Ok(Event::Mouse(drag(14))));
+        let release = mouse(MouseEventKind::Up(left), 15);
+        handle.send(Ok(Event::Mouse(release)));
+        handle.send(Ok(Event::Key(KeyCode::Enter.into())));
+
+        // Outside divider capture, even adjacent selection motions stay distinct.
+        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(m)) if m == drag(10)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(m)) if m == drag(11)));
+        stream.coalesce_divider_drags = true;
+        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(m)) if m == drag(13)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::FocusLost)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(m)) if m == drag(14)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(m)) if m == release));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(k)) if k.code == KeyCode::Enter));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_lost_is_forwarded_and_updates_terminal_state() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused.clone());
 
         handle.send(Ok(Event::FocusLost));
-        handle.send(Ok(Event::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        ))));
 
-        let next = stream.next().await.unwrap();
+        assert!(matches!(stream.next().await, Some(TuiEvent::FocusLost)));
+        assert!(!terminal_focused.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_lost_consumed_by_startup_remains_visible_to_the_tui() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+        tui.terminal_focused = terminal_focused.clone();
+        let mut startup_events = make_stream(broker, draw_rx, terminal_focused);
+
+        assert!(tui.is_terminal_focused());
+        handle.send(Ok(Event::FocusLost));
+
+        assert!(matches!(
+            startup_events.next().await,
+            Some(TuiEvent::FocusLost)
+        ));
+        assert!(!tui.is_terminal_focused());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_gained_preserves_already_queued_key() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        terminal_focused.store(false, Ordering::Relaxed);
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused.clone());
+        let expected_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        handle.send(Ok(Event::FocusGained));
+        handle.send(Ok(Event::Key(expected_key)));
+
+        assert!(matches!(stream.next().await, Some(TuiEvent::FocusGained)));
+        assert!(terminal_focused.load(Ordering::Relaxed));
+        assert!(matches!(
+            &broker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .source,
+            EventBrokerState::Running(_)
+        ));
+
+        let next = timeout(Duration::from_millis(/*millis*/ 100), stream.next())
+            .await
+            .expect("focus handling discarded an already queued key");
+
         match next {
-            TuiEvent::Key(key) => {
-                assert_eq!(key, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-            }
-            other => panic!("expected key event, got {other:?}"),
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected queued key event, got {other:?}"),
         }
     }
 
@@ -459,7 +691,13 @@ mod tests {
         handle.send(Ok(Event::Resize(80, 24)));
 
         let next = stream.next().await;
-        assert!(matches!(next, Some(TuiEvent::Resize)));
+        assert!(matches!(
+            next,
+            Some(TuiEvent::Resize(ratatui::layout::Size {
+                width: 80,
+                height: 24
+            }))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

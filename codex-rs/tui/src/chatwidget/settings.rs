@@ -1,0 +1,842 @@
+//! Runtime settings state and model/collaboration coordination for `ChatWidget`.
+
+use super::*;
+use crate::app_event::AppEvent;
+use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
+
+impl ChatWidget {
+    pub(crate) fn set_daybreak_enabled(&mut self, enabled: bool) {
+        self.daybreak_enabled = enabled && self.daybreak_feature_enabled();
+        self.bottom_pane
+            .set_daybreak_command_description(self.daybreak_command_description());
+    }
+
+    fn daybreak_feature_enabled(&self) -> bool {
+        // Preserve a resumed preference while account state is still unknown. Once an API-key
+        // account is known, both flags must be enabled before using that preference.
+        self.config.features.enabled(Feature::CliDaybreak)
+            && (self.has_chatgpt_account
+                || !matches!(
+                    self.status_account_display,
+                    Some(StatusAccountDisplay::ApiKey)
+                )
+                || self
+                    .config
+                    .features
+                    .enabled(Feature::ApiKeyCyberAccessPrograms))
+    }
+
+    /// UI and turn-selection eligibility; the catalog and server still determine program access.
+    pub(crate) fn daybreak_account_eligible(&self) -> bool {
+        self.daybreak_feature_enabled()
+            && self
+                .config
+                .model_providers
+                .get(&self.config.model_provider_id)
+                .is_some_and(|provider| {
+                    provider.supports_cyber_access_programs(&self.config.model_provider_id)
+                })
+            && (self.has_chatgpt_account
+                || matches!(
+                    self.status_account_display,
+                    Some(StatusAccountDisplay::ApiKey)
+                ))
+    }
+
+    pub(super) fn daybreak_command_description(&self) -> Option<&'static str> {
+        if self.daybreak_enabled {
+            Some("Disable broader access for cybersecurity work")
+        } else if !self.daybreak_account_eligible() {
+            None
+        } else {
+            match crate::daybreak::availability(self.model_catalog.models()) {
+                Some(true) => Some("Enable broader access for cybersecurity work"),
+                Some(false) => Some("Learn about broader access for cybersecurity work"),
+                None => Some("Manage broader access for cybersecurity work"),
+            }
+        }
+    }
+    /// Set the approval policy in the widget's config copy.
+    pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(policy.to_core())
+        {
+            tracing::warn!(%err, "failed to set approval_policy on chat config");
+        } else {
+            self.refresh_status_surfaces();
+        }
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn set_permission_profile_from_session_snapshot(
+        &mut self,
+        snapshot: PermissionProfileSnapshot,
+    ) -> ConstraintResult<()> {
+        self.config
+            .permissions
+            .set_permission_profile_from_session_snapshot(snapshot)?;
+        self.refresh_status_surfaces();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_permission_profile_with_active_profile(
+        &mut self,
+        profile: PermissionProfile,
+        active_permission_profile: Option<ActivePermissionProfile>,
+    ) -> ConstraintResult<()> {
+        self.config
+            .permissions
+            .set_permission_profile_from_session_snapshot(
+                PermissionProfileSnapshot::from_session_snapshot(
+                    profile,
+                    active_permission_profile,
+                ),
+            )?;
+        self.refresh_status_surfaces();
+        Ok(())
+    }
+
+    pub(crate) fn set_permission_network(
+        &mut self,
+        network: Option<crate::legacy_core::config::NetworkProxySpec>,
+    ) {
+        self.config.permissions.network = network;
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn set_windows_sandbox_mode(&mut self, mode: Option<WindowsSandboxSetupMode>) {
+        self.windows_sandbox_config.mode = mode;
+        #[cfg(target_os = "windows")]
+        {
+            let enabled = self.builtin_command_flags().allow_elevate_sandbox;
+            self.bottom_pane
+                .set_windows_degraded_sandbox_active(enabled);
+        }
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn set_feature_enabled(&mut self, feature: Feature, enabled: bool) -> bool {
+        if let Err(err) = self.config.features.set_enabled(feature, enabled) {
+            tracing::warn!(
+                error = %err,
+                feature = feature.key(),
+                "failed to update constrained chat widget feature state"
+            );
+        }
+        let enabled = self.config.features.enabled(feature);
+        if matches!(
+            feature,
+            Feature::CliDaybreak | Feature::ApiKeyCyberAccessPrograms
+        ) {
+            self.set_daybreak_enabled(self.daybreak_enabled);
+            self.refresh_status_surfaces();
+        }
+        if matches!(feature, Feature::FastMode | Feature::UltrafastMode) {
+            self.refresh_effective_service_tier();
+            self.refresh_model_dependent_surfaces();
+        }
+        if feature == Feature::Plugins {
+            self.sync_plugins_command_enabled();
+            self.refresh_plugin_mentions();
+        }
+        if feature == Feature::Goals {
+            self.sync_goal_command_enabled();
+            if !enabled {
+                self.current_goal_status_indicator = None;
+                self.current_goal_status = None;
+                self.turn_lifecycle.goal_status_active_turn_started_at = None;
+                self.turn_lifecycle.budget_limited_turn_ids.clear();
+                self.update_collaboration_mode_indicator();
+            }
+        }
+        if feature == Feature::MentionsV2 {
+            self.sync_mentions_v2_enabled();
+        }
+        if feature == Feature::PreventIdleSleep {
+            self.turn_lifecycle.set_prevent_idle_sleep(enabled);
+        }
+        enabled
+    }
+
+    pub(crate) fn set_approvals_reviewer(&mut self, policy: ApprovalsReviewer) {
+        self.config.approvals_reviewer = policy;
+        self.refresh_status_surfaces();
+    }
+
+    /// Override the reasoning effort used when Plan mode is active.
+    ///
+    /// When the active mask is already Plan, the override is applied immediately
+    /// so the footer reflects it without waiting for the next mode switch.
+    /// Passing `None` resets to the Plan-mode preset default.
+    pub(crate) fn set_plan_mode_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        self.config.plan_mode_reasoning_effort = effort.clone();
+        if self.collaboration_modes_enabled()
+            && let Some(mask) = self.active_collaboration_mask.as_mut()
+            && mask.mode == Some(ModeKind::Plan)
+        {
+            if let Some(effort) = effort {
+                mask.reasoning_effort = Some(Some(effort));
+            } else if let Some(plan_mask) =
+                collaboration_modes::plan_mask(self.model_catalog.as_ref())
+            {
+                mask.reasoning_effort = plan_mask.reasoning_effort;
+            }
+        }
+        self.refresh_model_dependent_surfaces();
+    }
+
+    /// Set the reasoning effort for the non-Plan collaboration mode.
+    ///
+    /// Does not touch the active Plan mask — Plan reasoning is controlled
+    /// exclusively by the Plan preset and `set_plan_mode_reasoning_effort`.
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
+            /*model*/ None,
+            Some(effort.clone()),
+            /*developer_instructions*/ None,
+        );
+        if self.collaboration_modes_enabled()
+            && let Some(mask) = self.active_collaboration_mask.as_mut()
+            && mask.mode != Some(ModeKind::Plan)
+        {
+            // Generic "global default" updates should not mutate the active Plan mask.
+            // Plan reasoning is controlled by the Plan preset and Plan-only override updates.
+            mask.reasoning_effort = Some(effort);
+        }
+        self.refresh_model_dependent_surfaces();
+    }
+
+    pub(crate) fn status_account_display(&self) -> Option<&StatusAccountDisplay> {
+        self.status_account_display.as_ref()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
+        self.model_catalog.clone()
+    }
+
+    pub(crate) fn on_account_email_loaded(
+        &mut self,
+        current_email: Option<String>,
+        current_workspace: Option<String>,
+        plan_type: PlanType,
+    ) {
+        if let Some(StatusAccountDisplay::ChatGpt {
+            email, workspace, ..
+        }) = &mut self.status_account_display
+        {
+            *email = current_email;
+            *workspace = current_workspace;
+            self.account_plan = Some(plan_type);
+            self.refresh_billing_plan();
+            self.refresh_status_surfaces();
+        }
+    }
+
+    pub(crate) fn current_plan_type(&self) -> Option<PlanType> {
+        self.plan_type
+    }
+
+    pub(crate) fn has_chatgpt_account(&self) -> bool {
+        self.has_chatgpt_account
+    }
+
+    pub(crate) fn has_codex_backend_auth(&self) -> bool {
+        self.has_codex_backend_auth
+    }
+
+    pub(crate) fn update_account_state(
+        &mut self,
+        status_account_display: Option<StatusAccountDisplay>,
+        plan_type: Option<PlanType>,
+        has_chatgpt_account: bool,
+        has_codex_backend_auth: bool,
+    ) {
+        // Account-update notifications are the identity boundary. The visible account fields can
+        // be identical across two accounts, so always invalidate account-scoped requests and data.
+        self.dismiss_stale_model_picker();
+        let api_key_changed = self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+            || status_account_display == Some(StatusAccountDisplay::ApiKey);
+        self.invalidate_permission_discovery();
+        self.permission_discovery = None;
+        self.invalidate_connector_scope();
+        self.clear_pending_rate_limit_reset_requests();
+        self.clear_backend_banner();
+        self.luna_reserve_notice_account_id = None;
+        self.automatic_model_switch_state = backend_banners::AutomaticModelSwitchState::default();
+        self.input_queue.rate_limit_recovery_pending = false;
+        self.add_credits_nudge_email_in_flight = None;
+        self.codex_rate_limit_reached_type = None;
+        self.codex_spend_control_reached = None;
+        self.rate_limit_warnings = RateLimitWarningState::default();
+        self.usage_notice_state = usage_notice::UsageNoticeState::default();
+        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        self.bottom_pane
+            .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
+        let had_refreshing_status_outputs = !self.refreshing_status_outputs.is_empty();
+        let now = Local::now();
+        for (_, handle) in self.refreshing_status_outputs.drain(..) {
+            handle.finish_rate_limit_refresh(&[], /*quota_plan*/ None, now);
+        }
+        if had_refreshing_status_outputs {
+            self.request_redraw();
+        }
+        self.status_line_workspace_headline = None;
+        self.status_line_workspace_headline_pending_request_id = None;
+        self.status_line_workspace_headline_last_requested_at = None;
+        self.status_line_workspace_messages_disabled = false;
+        self.clear_thread_usage_state();
+        self.status_account_display = status_account_display;
+        self.account_plan = plan_type;
+        self.quota_plan = None;
+        self.plan_type = plan_type;
+        self.has_chatgpt_account = has_chatgpt_account;
+        if api_key_changed
+            || (self.model_catalog.models().is_empty()
+                && self.thread_params_mode != crate::ThreadParamsMode::Cloud)
+        {
+            self.refresh_account_scoped_models();
+        }
+        self.set_daybreak_enabled(self.daybreak_enabled);
+        self.has_codex_backend_auth = has_codex_backend_auth;
+        self.bottom_pane
+            .set_connectors_enabled(self.connectors_enabled());
+        self.refresh_connector_mentions(/*force_refresh*/ false);
+        self.bottom_pane
+            .set_token_activity_command_enabled(has_codex_backend_auth);
+        self.refresh_status_surfaces();
+    }
+
+    /// Set the syntax theme override in the widget's config copy.
+    pub(crate) fn set_tui_theme(&mut self, theme: Option<String>) {
+        self.config_panel_tui.theme.clone_from(&theme);
+        self.local_settings.tui.theme = theme;
+    }
+
+    /// Set the model in the widget's config copy and stored collaboration mode.
+    pub(crate) fn set_model(&mut self, model: &str) {
+        if model != self.current_model() {
+            self.queue_unavailable_daybreak_disable(model);
+            if self.current_model() == crate::model_catalog::LUNA_RESERVE_MODEL {
+                self.clear_reserve_return();
+            } else {
+                self.automatic_model_switch_state =
+                    backend_banners::AutomaticModelSwitchState::default();
+            }
+        }
+        self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
+            Some(model.to_string()),
+            /*effort*/ None,
+            /*developer_instructions*/ None,
+        );
+        if self.collaboration_modes_enabled()
+            && let Some(mask) = self.active_collaboration_mask.as_mut()
+        {
+            mask.model = Some(model.to_string());
+        }
+        self.refresh_effective_service_tier();
+        self.refresh_model_dependent_surfaces();
+    }
+
+    pub(super) fn queue_unavailable_daybreak_disable(&self, model: &str) {
+        if let Some(thread_id) = self.thread_id
+            && self.should_disable_daybreak(model)
+        {
+            self.app_event_tx
+                .send(AppEvent::DisableUnavailableDaybreak {
+                    thread_id,
+                    model: model.to_owned(),
+                });
+        }
+    }
+
+    pub(crate) fn should_disable_daybreak(&self, model: &str) -> bool {
+        self.daybreak_enabled
+            && self.model_catalog.models().iter().any(|entry| {
+                entry.model == model
+                    && crate::daybreak::availability(std::slice::from_ref(entry)) == Some(false)
+            })
+    }
+
+    pub(crate) fn current_model(&self) -> &str {
+        if !self.collaboration_modes_enabled() {
+            return self.current_collaboration_mode.model();
+        }
+        self.active_collaboration_mask
+            .as_ref()
+            .and_then(|mask| mask.model.as_deref())
+            .unwrap_or_else(|| self.current_collaboration_mode.model())
+    }
+
+    pub(crate) fn set_local_worktree_operations(&mut self, enabled: bool) {
+        self.local_worktree_operations = enabled;
+        self.sync_worktrees_enabled();
+    }
+
+    pub(super) fn sync_worktrees_enabled(&mut self) {
+        self.bottom_pane
+            .set_worktrees_enabled(self.local_worktree_operations);
+    }
+
+    pub(super) fn sync_plugins_command_enabled(&mut self) {
+        self.bottom_pane
+            .set_plugins_command_enabled(self.config.features.enabled(Feature::Plugins));
+    }
+
+    pub(super) fn sync_goal_command_enabled(&mut self) {
+        self.bottom_pane
+            .set_goal_command_enabled(self.config.features.enabled(Feature::Goals));
+    }
+
+    pub(super) fn sync_mentions_v2_enabled(&mut self) {
+        self.bottom_pane
+            .set_mentions_v2_enabled(self.config.features.enabled(Feature::MentionsV2));
+    }
+
+    /// Return whether the effective model currently advertises image-input support.
+    ///
+    /// We intentionally default to `true` when model metadata cannot be read so transient catalog
+    /// failures do not hard-block user input in the UI.
+    pub(super) fn current_model_supports_images(&self) -> bool {
+        let model = self.current_model();
+        self.model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|preset| preset.model == model)
+                    .map(|preset| preset.input_modalities.contains(&InputModality::Image))
+            })
+            .unwrap_or(true)
+    }
+
+    pub(super) fn sync_image_paste_enabled(&mut self) {
+        let enabled = self.current_model_supports_images();
+        self.bottom_pane.set_image_paste_enabled(enabled);
+    }
+
+    pub(super) fn image_inputs_not_supported_message(&self) -> String {
+        format!(
+            "Model {} does not support image inputs. Remove images or switch models.",
+            self.current_model()
+        )
+    }
+
+    pub(crate) fn current_collaboration_mode(&self) -> &CollaborationMode {
+        &self.current_collaboration_mode
+    }
+
+    pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        self.effective_reasoning_effort()
+    }
+
+    pub(crate) fn on_thread_settings_updated(
+        &mut self,
+        notification: ThreadSettingsUpdatedNotification,
+    ) {
+        self.apply_thread_settings(notification, /*replay_kind*/ None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_collaboration_mode_kind(&self) -> ModeKind {
+        self.active_mode_kind()
+    }
+
+    pub(super) fn is_session_configured(&self) -> bool {
+        self.thread_id.is_some()
+    }
+
+    pub(super) fn collaboration_modes_enabled(&self) -> bool {
+        true
+    }
+
+    pub(super) fn initial_collaboration_mask(
+        _config: &Config,
+        model_catalog: &ModelCatalog,
+        model_override: Option<&str>,
+    ) -> Option<CollaborationModeMask> {
+        let mut mask = collaboration_modes::default_mask(model_catalog)?;
+        if let Some(model_override) = model_override {
+            mask.model = Some(model_override.to_string());
+        }
+        Some(mask)
+    }
+
+    pub(super) fn active_mode_kind(&self) -> ModeKind {
+        self.active_collaboration_mask
+            .as_ref()
+            .and_then(|mask| mask.mode)
+            .unwrap_or(ModeKind::Default)
+    }
+
+    pub(super) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        if !self.collaboration_modes_enabled() {
+            return self.current_collaboration_mode.reasoning_effort();
+        }
+        let current_effort = self.current_collaboration_mode.reasoning_effort();
+        self.active_collaboration_mask
+            .as_ref()
+            .and_then(|mask| mask.reasoning_effort.clone())
+            .unwrap_or(current_effort)
+    }
+
+    pub(crate) fn effective_collaboration_mode(&self) -> CollaborationMode {
+        if !self.collaboration_modes_enabled() {
+            return self.current_collaboration_mode.clone();
+        }
+        self.active_collaboration_mask.as_ref().map_or_else(
+            || self.current_collaboration_mode.clone(),
+            |mask| self.current_collaboration_mode.apply_mask(mask),
+        )
+    }
+
+    pub(super) fn refresh_model_display(&mut self) {
+        let effective = self.effective_collaboration_mode();
+        self.bottom_pane
+            .stop_ineligible_sparkle(effective.model(), &self.local_settings.tui);
+        self.session_header.set_model(effective.model());
+        // Keep composer paste affordances aligned with the currently effective model.
+        self.sync_image_paste_enabled();
+        self.sync_service_tier_commands();
+        self.refresh_terminal_title();
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort(effort.as_ref());
+    }
+
+    /// Refresh every UI surface that depends on the effective model, reasoning
+    /// effort, or collaboration mode.
+    ///
+    /// Call this at the end of any setter that mutates `current_collaboration_mode`,
+    /// `active_collaboration_mask`, or per-mode reasoning-effort overrides.
+    /// Consolidating both refreshes here prevents the bug where callers update the
+    /// header/title (`refresh_model_display`) but forget the footer status line
+    /// (`refresh_status_line`).
+    pub(super) fn refresh_model_dependent_surfaces(&mut self) {
+        self.sync_backend_banner_view();
+        self.refresh_model_display();
+        self.refresh_status_line();
+        self.refresh_open_model_picker();
+    }
+
+    pub(super) fn apply_thread_settings(
+        &mut self,
+        notification: ThreadSettingsUpdatedNotification,
+        replay_kind: Option<ReplayKind>,
+    ) {
+        let Ok(thread_id) = ThreadId::from_string(&notification.thread_id) else {
+            tracing::warn!(
+                thread_id = notification.thread_id,
+                "ignoring app-server ThreadSettingsUpdated with invalid thread_id"
+            );
+            return;
+        };
+        if self.thread_id != Some(thread_id) {
+            return;
+        }
+
+        let mut settings = notification.thread_settings;
+        self.invalidate_permission_discovery();
+        if let Some(environments) = &settings.environments {
+            self.primary_environment_cwd =
+                crate::session_state::primary_environment_cwd(environments);
+        }
+        let Ok(cwd) = crate::app_server_session::decode_thread_cwd(
+            &settings.cwd,
+            self.app_server_path_convention,
+        ) else {
+            tracing::warn!("Invalid cwd in thread settings");
+            return;
+        };
+        let permission_profile = match settings.sandbox_policy.permission_profile_for_cwd(&cwd) {
+            Ok(profile) => profile,
+            Err(err) => {
+                tracing::warn!(%err, "Invalid sandbox policy in thread settings");
+                return;
+            }
+        };
+        let cwd_changed = self.current_cwd != cwd;
+        self.status_line_project_root_name_cache = None;
+        if let Ok(local) = cwd.to_abs_path()
+            && local != self.config.cwd
+        {
+            self.config.cwd = local;
+            self.permission_discovery = None;
+        }
+        crate::session_state::retarget_workspace_root(
+            &mut self.current_workspace_roots,
+            &self.current_cwd,
+            &cwd,
+        );
+        crate::session_state::sync_local_workspace_roots(
+            &mut self.config,
+            &self.current_workspace_roots,
+        );
+        self.current_cwd = cwd;
+        self.set_model_provider(&settings.model_provider);
+        self.set_daybreak_enabled(self.daybreak_enabled);
+        self.set_service_tier(settings.service_tier.clone());
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(settings.approval_policy.to_core())
+        {
+            tracing::warn!(%err, "failed to sync approval_policy from ThreadSettingsUpdated");
+            self.config.permissions.approval_policy =
+                Constrained::allow_only(settings.approval_policy.to_core());
+        }
+        self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
+
+        let permission_snapshot = PermissionProfileSnapshot::from_session_snapshot(
+            crate::session_state::display_profile_for_roots(
+                permission_profile,
+                &self.current_workspace_roots,
+            ),
+            settings.active_permission_profile.take().map(Into::into),
+        );
+        if let Err(err) = self
+            .config
+            .permissions
+            .set_permission_profile_from_session_snapshot(permission_snapshot.clone())
+        {
+            tracing::warn!(%err, "failed to sync permissions from ThreadSettingsUpdated");
+            if let Err(replace_err) = self
+                .config
+                .permissions
+                .replace_permission_profile_from_session_snapshot(permission_snapshot)
+            {
+                tracing::error!(
+                    %replace_err,
+                    "failed to replace permissions from ThreadSettingsUpdated after constraint fallback"
+                );
+            }
+        }
+
+        if self.current_model() != settings.model {
+            self.queue_unavailable_daybreak_disable(&settings.model);
+        }
+        settings.collaboration_mode.settings.model = settings.model;
+        // A thread switch replays earlier effort changes after restoring the session.
+        // Establish each replayed tier before refreshing the composer so only live changes animate.
+        if replay_kind.is_some() {
+            self.bottom_pane
+                .set_active_reasoning_effort_baseline(settings.effort.as_ref());
+        }
+        settings.collaboration_mode.settings.reasoning_effort = settings.effort;
+        self.thread_settings_confirmed = true;
+        self.set_effective_collaboration_mode(settings.collaboration_mode);
+        self.refresh_effective_service_tier();
+        self.refresh_status_surfaces();
+        self.sync_service_tier_commands();
+        if cwd_changed {
+            #[cfg(target_os = "windows")]
+            if self.windows_sandbox_local_server
+                && let Some(thread_id) = self.thread_id
+            {
+                self.windows_sandbox_config = Default::default();
+                self.set_windows_sandbox_mode(/*mode*/ None);
+                self.app_event_tx
+                    .send(AppEvent::RefreshWindowsSandbox { thread_id });
+            }
+            self.invalidate_connector_scope();
+            self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+            self.refresh_connector_mentions(/*force_refresh*/ false);
+        }
+        self.refresh_plugin_mentions();
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_effective_collaboration_mode(&mut self, mode: CollaborationMode) {
+        let mode_kind = mode.mode;
+        let settings = mode.settings;
+        if mode_kind == ModeKind::Default {
+            self.current_collaboration_mode = CollaborationMode {
+                mode: ModeKind::Default,
+                settings: settings.clone(),
+            };
+        }
+        self.active_collaboration_mask = Some(CollaborationModeMask {
+            name: mode_kind.display_name().to_string(),
+            mode: Some(mode_kind),
+            model: Some(settings.model.clone()),
+            reasoning_effort: Some(settings.reasoning_effort.clone()),
+            developer_instructions: Some(settings.developer_instructions),
+        });
+        self.update_collaboration_mode_indicator();
+        self.refresh_model_dependent_surfaces();
+    }
+
+    pub(crate) fn model_display_name(&self) -> &str {
+        let model = self.current_model();
+        if model.is_empty() {
+            DEFAULT_MODEL_DISPLAY_NAME
+        } else {
+            self.model_catalog.display_name(model)
+        }
+    }
+
+    /// Get the label for the current collaboration mode.
+    pub(super) fn collaboration_mode_label(&self) -> Option<&'static str> {
+        if !self.collaboration_modes_enabled() {
+            return None;
+        }
+        let active_mode = self.active_mode_kind();
+        active_mode
+            .is_tui_visible()
+            .then_some(active_mode.display_name())
+    }
+
+    fn collaboration_mode_indicator(&self) -> Option<CollaborationModeIndicator> {
+        if !self.collaboration_modes_enabled() {
+            return None;
+        }
+        match self.active_mode_kind() {
+            ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
+            ModeKind::Default => None,
+        }
+    }
+
+    pub(super) fn update_collaboration_mode_indicator(&mut self) {
+        let indicator = self.collaboration_mode_indicator();
+        let goal_indicator = if indicator.is_none() {
+            self.goal_status_indicator(Instant::now())
+        } else {
+            None
+        };
+        self.current_goal_status_indicator = goal_indicator.clone();
+        self.bottom_pane.set_collaboration_mode_indicator(indicator);
+        self.bottom_pane.set_goal_status_indicator(goal_indicator);
+    }
+
+    pub(crate) fn refresh_goal_status_indicator_for_time_tick(&mut self) {
+        if self.collaboration_mode_indicator().is_some() {
+            return;
+        }
+        let goal_indicator = self.goal_status_indicator(Instant::now());
+        if goal_indicator != self.current_goal_status_indicator {
+            self.current_goal_status_indicator = goal_indicator.clone();
+            self.bottom_pane.set_goal_status_indicator(goal_indicator);
+        }
+    }
+
+    fn goal_status_indicator(&self, now: Instant) -> Option<GoalStatusIndicator> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return None;
+        }
+        self.current_goal_status.as_ref().and_then(|state| {
+            state.indicator(now, self.turn_lifecycle.goal_status_active_turn_started_at)
+        })
+    }
+
+    pub(super) fn on_thread_goal_updated(&mut self, goal: AppThreadGoal, turn_id: Option<String>) {
+        if let Some(active_thread_id) = self.thread_id
+            && active_thread_id.to_string() != goal.thread_id
+        {
+            return;
+        }
+        if !self.config.features.enabled(Feature::Goals) {
+            self.current_goal_status_indicator = None;
+            self.current_goal_status = None;
+            self.update_collaboration_mode_indicator();
+            return;
+        }
+        if goal.status == AppThreadGoalStatus::BudgetLimited
+            && let Some(turn_id) = turn_id
+        {
+            self.turn_lifecycle.mark_budget_limited(turn_id);
+        }
+        self.current_goal_status = Some(GoalStatusState::new(goal, Instant::now()));
+        self.update_collaboration_mode_indicator();
+    }
+
+    /// Cycle to the next collaboration mode variant (Plan -> Default -> Plan).
+    pub(super) fn cycle_collaboration_mode(&mut self) {
+        if !self.collaboration_modes_enabled() {
+            return;
+        }
+
+        if let Some(next_mask) = collaboration_modes::next_mask(
+            self.model_catalog.as_ref(),
+            self.active_collaboration_mask.as_ref(),
+        ) {
+            self.set_collaboration_mask_from_user_action(next_mask);
+        }
+    }
+
+    pub(crate) fn set_collaboration_mask_from_user_action(&mut self, mask: CollaborationModeMask) {
+        self.set_collaboration_mask(mask);
+        self.submit_collaboration_mode_settings_update();
+    }
+
+    /// Update the active collaboration mask.
+    ///
+    /// When collaboration modes are enabled and a preset is selected,
+    /// the current mode is attached to submissions as `Op::UserTurn { collaboration_mode: Some(...) }`.
+    pub(crate) fn set_collaboration_mask(&mut self, mut mask: CollaborationModeMask) {
+        if !self.collaboration_modes_enabled() {
+            return;
+        }
+        let previous_mode = self.active_mode_kind();
+        let previous_model = self.current_model().to_string();
+        let previous_effort = self.effective_reasoning_effort();
+        if mask.mode == Some(ModeKind::Plan)
+            && let Some(effort) = self.config.plan_mode_reasoning_effort.clone()
+        {
+            mask.reasoning_effort = Some(Some(effort));
+        }
+        self.active_collaboration_mask = Some(mask);
+        self.update_collaboration_mode_indicator();
+        if previous_model != self.current_model() {
+            self.queue_unavailable_daybreak_disable(self.current_model());
+        }
+        self.refresh_model_dependent_surfaces();
+        let next_mode = self.active_mode_kind();
+        let next_model = self.current_model();
+        let next_effort = self.effective_reasoning_effort();
+        if previous_mode != next_mode
+            && (previous_model != next_model || previous_effort != next_effort)
+        {
+            let mut message = format!("Model changed to {next_model}");
+            if !next_model.starts_with("codex-auto-") {
+                let reasoning_label = match next_effort.as_ref() {
+                    None | Some(ReasoningEffortConfig::None) => "default",
+                    Some(effort) => effort.as_str(),
+                };
+                message.push(' ');
+                message.push_str(reasoning_label);
+            }
+            message.push_str(" for ");
+            message.push_str(next_mode.display_name());
+            message.push_str(" mode.");
+            self.add_info_message(message, /*hint*/ None);
+        }
+        self.request_redraw();
+    }
+
+    fn submit_collaboration_mode_settings_update(&self) {
+        let Some(thread_id) = self.thread_id else {
+            return;
+        };
+        self.app_event_tx.send(AppEvent::SubmitThreadOp {
+            thread_id,
+            op: AppCommand::override_turn_context(
+                /*cwd*/ None,
+                /*approval_policy*/ None,
+                /*approvals_reviewer*/ None,
+                /*permission_profile*/ None,
+                /*active_permission_profile*/ None,
+                /*model*/ None,
+                /*effort*/ None,
+                /*summary*/ None,
+                /*service_tier*/ None,
+                Some(self.effective_collaboration_mode()),
+            ),
+        });
+    }
+}

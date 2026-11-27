@@ -4,7 +4,7 @@ This repository uses Bazel to build the Rust workspace under `codex-rs`.
 Cargo remains the source of truth for crates and features, while Bazel
 provides hermetic builds, toolchains, and cross-platform artifacts.
 
-As of 1/9/2026, this setup is still experimental as we stabilize it.
+As of 6/1/2026, this setup is still experimental as we stabilize it.
 
 ## High-level layout
 
@@ -19,6 +19,19 @@ As of 1/9/2026, this setup is still experimental as we stabilize it.
 - Each crate in `codex-rs/*/BUILD.bazel` typically uses `codex_rust_crate` and
   makes some adjustments if the crate needs additional compile-time or runtime data,
   or other customizations.
+
+## Running Bazel locally
+
+The repository root `justfile` exposes the common Bazel entry points:
+
+```bash
+just bazel-test
+just bazel-clippy
+```
+
+Ordinary local `bazel` and `just` invocations run locally. The checked-in
+Bazel configuration does not define third-party remote cache or execution
+endpoints.
 
 ## Evolving the setup
 

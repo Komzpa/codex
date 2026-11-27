@@ -7,6 +7,14 @@
 use super::*;
 
 impl ChatWidget {
+    pub(crate) fn side_chat_creation_state(&self) -> crate::sidebar_chooser::NewChatState {
+        if self.thread_id.is_some() && self.turn_lifecycle.has_turn_history {
+            crate::sidebar_chooser::NewChatState::Available
+        } else {
+            crate::sidebar_chooser::NewChatState::WaitingForMainMessage
+        }
+    }
+
     pub(crate) fn submit_user_message_as_plain_user_turn(
         &mut self,
         user_message: UserMessage,
@@ -23,6 +31,13 @@ impl ChatWidget {
         };
         self.bottom_pane.set_placeholder_text(placeholder);
         self.bottom_pane.set_side_conversation_active(active);
+        if self.blocks_direct_input && !active {
+            self.bottom_pane.set_parent_owned_thread();
+        }
+    }
+
+    pub(crate) fn side_conversation_active(&self) -> bool {
+        self.active_side_conversation
     }
 
     pub(crate) fn set_side_conversation_context_label(&mut self, label: Option<String>) {

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
 use codex_config::Constrained;
 use codex_config::ConstrainedWithSource;
 use codex_config::ConstraintError;
@@ -9,13 +11,39 @@ use codex_config::RequirementSource;
 use codex_config::Sourced;
 
 use codex_config::config_toml::ConfigToml;
-use codex_config::profile_toml::ConfigProfile;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
+use codex_features::FeatureToml;
 use codex_features::Features;
+use codex_features::RuntimeAuthMode;
 use codex_features::canonical_feature_for_key;
 use codex_features::feature_for_key;
+
+/// A project's explicit opt-in replaces only a strictly lower-priority V1 opt-out.
+pub(super) fn project_overrides_legacy_subagent_opt_out(layers: &ConfigLayerStack) -> bool {
+    let mut project_enabled = false;
+    for layer in layers.layers_high_to_low() {
+        if let Some(features) = layer.config.get("features").and_then(toml::Value::as_table)
+            && features.iter().any(|(key, enabled)| {
+                enabled.as_bool() == Some(false) && feature_for_key(key) == Some(Feature::Collab)
+            })
+        {
+            return project_enabled;
+        }
+        if matches!(layer.name, ConfigLayerSource::Project { .. })
+            && layer
+                .config
+                .get("agents")
+                .and_then(|agents| agents.get("enabled"))
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+        {
+            project_enabled = true;
+        }
+    }
+    false
+}
 
 /// Wrapper around [`Features`] which enforces constraints defined in
 /// `FeatureRequirementsToml` and provides normalization to ensure constraints
@@ -51,7 +79,9 @@ impl ManagedFeatures {
         )
     }
 
-    pub(crate) fn from_configured_with_warnings(
+    /// Applies managed feature requirements and dependency normalization to
+    /// configured features, collecting warnings for unsupported requirements.
+    pub fn from_configured_with_warnings(
         configured_features: Features,
         feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
         startup_warnings: &mut Vec<String>,
@@ -91,6 +121,10 @@ impl ManagedFeatures {
         self.value.get()
     }
 
+    pub(crate) fn required_value(&self, feature: Feature) -> Option<bool> {
+        self.pinned_features.get(&feature).copied()
+    }
+
     fn normalize_and_validate(&self, candidate: Features) -> ConstraintResult<Features> {
         let normalized = normalize_candidate(candidate, &self.pinned_features);
         self.value.can_set(&normalized)?;
@@ -115,6 +149,31 @@ impl ManagedFeatures {
         let mut next = self.get().clone();
         next.set_enabled(feature, enabled);
         self.set(next)
+    }
+
+    /// Refresh ordinary MCP feature values and pins without changing session-static features.
+    pub(crate) fn refresh_mcp_features(&mut self, next: &Self) -> ConstraintResult<()> {
+        let mut refreshed = self.clone();
+        let mut values = self.get().clone();
+        for feature in [
+            Feature::EnableMcpApps,
+            Feature::McpConnectionSharing,
+            Feature::McpSharedReplCwd,
+            Feature::McpLazyStdioStartup,
+            Feature::SecretAuthStorage,
+            Feature::McpOAuthRefreshCoordination,
+        ] {
+            values.set_enabled(feature, next.enabled(feature));
+            if let Some(enabled) = next.required_value(feature) {
+                refreshed.pinned_features.insert(feature, enabled);
+            } else {
+                refreshed.pinned_features.remove(&feature);
+            }
+        }
+        refreshed.value.source = next.value.source.clone().or(refreshed.value.source);
+        refreshed.set(values)?;
+        *self = refreshed;
+        Ok(())
     }
 
     pub fn enable(&mut self, feature: Feature) -> ConstraintResult<()> {
@@ -153,6 +212,12 @@ fn normalize_candidate(
     mut candidate: Features,
     pinned_features: &BTreeMap<Feature, bool>,
 ) -> Features {
+    // Legacy user opt-outs selected the removed shell backend. Only managed
+    // requirements may disable the remaining unified-exec implementation.
+    if !pinned_features.contains_key(&Feature::UnifiedExec) {
+        candidate.enable(Feature::UnifiedExec);
+    }
+
     for (feature, enabled) in pinned_features {
         candidate.set_enabled(*feature, *enabled);
     }
@@ -211,6 +276,36 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
+        if key == Feature::Personality.key() || key == Feature::PluginDiscoveryPrefetch.key() {
+            continue;
+        }
+        if key == Feature::Worktrees.key() || key == Feature::RealtimeConversation.key() {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; availability no longer depends on this feature flag."
+                ),
+            );
+            continue;
+        }
+        if matches!(key.as_str(), "shell_zsh_fork" | "unified_exec_zsh_fork") {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; the patched zsh backend has been removed."
+                ),
+            );
+            continue;
+        }
+        if key == Feature::GuardianThreadContext.key() {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; thread-owned Guardian context is always enabled."
+                ),
+            );
+            continue;
+        }
         if key == "auto_review" {
             pinned_features.insert(Feature::GuardianApproval, enabled);
             continue;
@@ -269,55 +364,45 @@ fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature
             enabled,
         ));
     }
-    if let Some(enabled) = cfg.experimental_use_freeform_apply_patch {
-        explicit_settings.push((
-            "experimental_use_freeform_apply_patch".to_string(),
-            Feature::ApplyPatchFreeform,
-            enabled,
-        ));
-    }
-    for (profile_name, profile) in &cfg.profiles {
-        if let Some(features) = profile.features.as_ref() {
-            for (key, enabled) in features.entries() {
-                if let Some(feature) = feature_for_key(&key) {
-                    explicit_settings.push((
-                        format!("profiles.{profile_name}.features.{key}"),
-                        feature,
-                        enabled,
-                    ));
-                }
-            }
-        }
-        if let Some(enabled) = profile.include_apply_patch_tool {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.include_apply_patch_tool"),
-                Feature::ApplyPatchFreeform,
-                enabled,
-            ));
-        }
-        if let Some(enabled) = profile.experimental_use_unified_exec_tool {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.experimental_use_unified_exec_tool"),
-                Feature::UnifiedExec,
-                enabled,
-            ));
-        }
-        if let Some(enabled) = profile.experimental_use_freeform_apply_patch {
-            explicit_settings.push((
-                format!("profiles.{profile_name}.experimental_use_freeform_apply_patch"),
-                Feature::ApplyPatchFreeform,
-                enabled,
-            ));
-        }
-    }
-
     explicit_settings
+}
+
+pub(crate) fn resolve_runtime_auth_mode(
+    cfg: &ConfigToml,
+    requirements: Option<&Sourced<FeatureRequirementsToml>>,
+) -> std::io::Result<RuntimeAuthMode> {
+    let configured = cfg
+        .features
+        .as_ref()
+        .and_then(|features| features.runtime_agent_instances.as_ref())
+        .and_then(|feature| match feature {
+            FeatureToml::Enabled(_) => None,
+            FeatureToml::Config(config) => config.mode,
+        });
+    if let Some(requirements) = requirements
+        && let Some(required) = requirements.value.runtime_auth_mode
+    {
+        if configured.is_some_and(|mode| mode != required) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                ConstraintError::InvalidValue {
+                    field_name: "features.runtime_agent_instances.mode",
+                    candidate: format!("{:?}", configured.unwrap_or_default()),
+                    allowed: format!("{required:?}"),
+                    requirement_source: requirements.source.clone(),
+                },
+            ));
+        }
+        return Ok(required);
+    }
+    Ok(configured.unwrap_or_default())
 }
 
 pub(crate) fn validate_explicit_feature_settings_in_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<()> {
+    resolve_runtime_auth_mode(cfg, feature_requirements)?;
     let Some(Sourced {
         value: feature_requirements,
         source,
@@ -360,52 +445,13 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<()> {
-    fn validate_profile(
-        cfg: &ConfigToml,
-        profile_name: Option<&str>,
-        profile: &ConfigProfile,
-        feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-    ) -> std::io::Result<()> {
-        let configured_features = Features::from_sources(
-            FeatureConfigSource {
-                features: cfg.features.as_ref(),
-                include_apply_patch_tool: None,
-                experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
-                experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-            },
-            FeatureConfigSource {
-                features: profile.features.as_ref(),
-                include_apply_patch_tool: profile.include_apply_patch_tool,
-                experimental_use_freeform_apply_patch: profile
-                    .experimental_use_freeform_apply_patch,
-                experimental_use_unified_exec_tool: profile.experimental_use_unified_exec_tool,
-            },
-            FeatureOverrides::default(),
-        );
-        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())
-            .map(|_| ())
-            .map_err(|err| {
-                if let Some(profile_name) = profile_name {
-                    std::io::Error::new(
-                        err.kind(),
-                        format!(
-                            "invalid feature configuration for profile `{profile_name}`: {err}"
-                        ),
-                    )
-                } else {
-                    err
-                }
-            })
-    }
-
-    validate_profile(
-        cfg,
-        /*profile_name*/ None,
-        &ConfigProfile::default(),
-        feature_requirements,
-    )?;
-    for (profile_name, profile) in &cfg.profiles {
-        validate_profile(cfg, Some(profile_name), profile, feature_requirements)?;
-    }
-    Ok(())
+    let configured_features = Features::from_sources(
+        FeatureConfigSource {
+            features: cfg.features.as_ref(),
+            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
 }

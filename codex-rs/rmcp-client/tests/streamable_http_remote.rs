@@ -6,7 +6,31 @@
 
 mod streamable_http_test_support;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::OAuthCredentialsStoreMode;
+use codex_exec_server::HttpRedirectPolicy;
+use codex_exec_server::HttpRequestParams;
+use codex_rmcp_client::ElicitationAction;
+use codex_rmcp_client::ElicitationResponse;
+use codex_rmcp_client::McpProtocolMode;
+use codex_rmcp_client::RmcpClient;
+use futures::FutureExt as _;
 use pretty_assertions::assert_eq;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeRequestParams;
+use rmcp::model::ProtocolVersion;
+use serde_json::json;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use streamable_http_test_support::call_echo_tool;
 use streamable_http_test_support::create_remote_client;
@@ -33,5 +57,105 @@ async fn streamable_http_remote_client_round_trips_through_exec_server() -> anyh
     let result = call_echo_tool(&client, "remote").await?;
     assert_eq!(result, expected_echo_result("remote"));
 
+    Ok(())
+}
+
+/// A timed-out MCP handshake must release the remote executor for later requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamable_http_handshake_timeout_unblocks_remote_executor() -> anyhow::Result<()> {
+    stalled_handshake_unblocks_remote_executor(McpProtocolMode::Legacy, "initialize").await
+}
+
+/// MCP 2026 discovery must also release the remote executor when it times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamable_http_discovery_timeout_unblocks_remote_executor() -> anyhow::Result<()> {
+    stalled_handshake_unblocks_remote_executor(McpProtocolMode::V20260728, "server/discover").await
+}
+
+async fn stalled_handshake_unblocks_remote_executor(
+    protocol_mode: McpProtocolMode,
+    expected_method: &str,
+) -> anyhow::Result<()> {
+    let http_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": expected_method })))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .expect(1)
+        .mount(&http_server)
+        .await;
+    let exec_server = spawn_exec_server().await?;
+    let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+        "stalled-remote-http",
+        &format!("{}/mcp", http_server.uri()),
+        Some("test-bearer".to_string()),
+        /*http_headers*/ None,
+        /*env_http_headers*/ None,
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+        Arc::new(exec_server.client.clone()),
+        /*auth_provider*/ None,
+        protocol_mode,
+    )
+    .await?;
+    let params = InitializeRequestParams::new(
+        ClientCapabilities::default(),
+        Implementation::new("codex-test", "0.0.0-test"),
+    )
+    .with_protocol_version(ProtocolVersion::V_2025_06_18);
+    let timeout = if protocol_mode == McpProtocolMode::V20260728 {
+        // Warm up the executor's HTTP connection before starting the discovery deadline.
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&http_server)
+            .await;
+        let ready = exec_server
+            .client
+            .http_request(HttpRequestParams {
+                method: "GET".into(),
+                url: format!("{}/ready", http_server.uri()),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: Some(15_000),
+                redirect_policy: HttpRedirectPolicy::Stop,
+                request_id: "ready".into(),
+                stream_response: false,
+            })
+            .await?;
+        assert_eq!(ready.status, 204);
+        // Time out during discovery, before RMCP falls back to initialize at 10 seconds.
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(15)
+    };
+    let error = client
+        .initialize(
+            params,
+            Some(timeout),
+            Box::new(|_, _| {
+                async {
+                    Ok(ElicitationResponse {
+                        action: ElicitationAction::Accept,
+                        content: None,
+                        meta: None,
+                    })
+                }
+                .boxed()
+            }),
+        )
+        .await
+        .err()
+        .context("the stalled MCP handshake must time out")?;
+    assert!(
+        error.to_string().contains("timed out"),
+        "unexpected MCP handshake error: {error}"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        exec_server.client.environment_status(),
+    )
+    .await
+    .context("a timed-out handshake must not leave the serial executor blocked")??;
     Ok(())
 }

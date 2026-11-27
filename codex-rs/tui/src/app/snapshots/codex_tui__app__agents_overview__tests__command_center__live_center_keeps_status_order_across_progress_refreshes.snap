@@ -1,0 +1,43 @@
+---
+source: tui/src/app/agent_center_tests.rs
+expression: "format!(\"Initial display:\\n{before}\\n\\nAfter subagents fail under Alpha and Ready task:\\n{after}\")"
+---
+Initial display:
+  Agent command center  Group: Status  g
+   All 5   Needs you 1   Working 3   Ready 1   Inactive 0                          tab/⇧tab filter
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+      Tasks                                               │ Task details
+  Needs input  1                                          │
+    ! Needs input                                         │ Alpha
+      Error                                               │ ● Working
+                                                          │
+  Working  3                                              │ Model: Unknown
+    ● Bravo                                               │ Reasoning: Unknown
+      Working                                             │
+    ● Charlie                                             │ Project
+      Working                                             │ /tmp/project
+  › ● Alpha                                               │
+      Working                                             │ Prompt
+                                                          │ Alpha
+  ↓                                                       │
+  ? help · esc back · ↑/↓ move · enter open · n new
+
+After subagents fail under Alpha and Ready task:
+  Agent command center  Group: Status  g
+   All 5   Needs you 1   Working 3   Ready 1   Inactive 0                          tab/⇧tab filter
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+      Tasks                                               │ Task details
+  Needs input  1                                          │
+    ! Needs input                                         │ Alpha
+      Error                                               │ ● Working
+                                                          │
+  Working  3                                              │ Model: Unknown
+    ● 📌  Charlie                                          │ Reasoning: Unknown
+      Working                                             │
+  › ● Alpha                                               │ Project
+      Working                                             │ /tmp/project
+    ● Bravo                                               │
+      Working                                             │ Prompt
+                                                          │ Progress update 3
+  ↓                                                       │
+  ? help · esc back · ↑/↓ move · enter open · n new

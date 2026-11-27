@@ -1,0 +1,13 @@
+---
+source: tui/src/app/tests/realtime_requests.rs
+expression: popup
+---
+  Select voice
+  Applies to your next voice conversation.
+
+
+› 1. Sol (current)
+  2. Xiaoman
+  3. Back
+
+  enter select · esc back

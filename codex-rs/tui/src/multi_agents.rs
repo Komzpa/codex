@@ -1,17 +1,27 @@
 //! Helpers for rendering and navigating multi-agent state in the TUI.
 //!
-//! This module owns the shared presentation contracts for multi-agent history rows, `/agent` picker
-//! entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as deciding
-//! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
+//! This module owns the shared presentation contracts for multi-agent history rows, `/subagents`
+//! picker entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as
+//! deciding which thread becomes active or when a thread closes, stays in [`crate::app::App`].
 
-use crate::history_cell::PlainHistoryCell;
-use crate::render::line_utils::prefix_lines;
+#[path = "multi_agents_history.rs"]
+mod history;
+pub(crate) use history::CollabHistoryCell;
+pub(crate) use history::tool_call_history_cell;
+
+use crate::history_cell::LabeledToolCell;
+use crate::history_cell::WebHyperlinkHistoryCell;
+use crate::style::accent_color;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::TerminalHyperlink;
+use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use crate::text_formatting::truncate_text;
 use codex_app_server_protocol::CollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::SubAgentActivityKind;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use crossterm::event::KeyCode;
@@ -35,8 +45,19 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) agent_nickname: Option<String>,
     /// Agent type shown in brackets when present, for example `worker`.
     pub(crate) agent_role: Option<String>,
+    /// Canonical v2 agent path, when the thread was observed through v2 activity.
+    pub(crate) agent_path: Option<String>,
+    /// Whether the latest liveness refresh says the agent thread is actively working.
+    pub(crate) is_running: bool,
     /// Whether the thread has emitted a close event and should render dimmed.
     pub(crate) is_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubAgentActivityDisplay {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) agent_path: String,
+    pub(crate) is_running_hint: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +66,15 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_nickname: Option<String>,
     /// Agent type shown in brackets when present, for example `worker`.
     pub(crate) agent_role: Option<String>,
+}
+
+impl AgentMetadata {
+    fn nickname(&self) -> Option<&str> {
+        self.agent_nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -173,27 +203,27 @@ fn next_agent_word_motion_fallback(
     false
 }
 
-pub(crate) fn spawn_request_summary(item: &ThreadItem) -> Option<SpawnRequestSummary> {
+pub(crate) fn spawn_request_summary(item: &ThreadItemPayload) -> Option<SpawnRequestSummary> {
     match item {
-        ThreadItem::CollabAgentToolCall {
+        ThreadItemPayload::CollabAgentToolCall {
             tool: CollabAgentTool::SpawnAgent,
             model: Some(model),
             reasoning_effort: Some(reasoning_effort),
             ..
         } => Some(SpawnRequestSummary {
             model: model.clone(),
-            reasoning_effort: *reasoning_effort,
+            reasoning_effort: reasoning_effort.clone(),
         }),
         _ => None,
     }
 }
 
-pub(crate) fn tool_call_history_cell(
-    item: &ThreadItem,
+fn render_tool_call(
+    item: &ThreadItemPayload,
     cached_spawn_request: Option<&SpawnRequestSummary>,
     mut agent_metadata: impl FnMut(ThreadId) -> AgentMetadata,
-) -> Option<PlainHistoryCell> {
-    let ThreadItem::CollabAgentToolCall {
+) -> Option<LabeledToolCell<WebHyperlinkHistoryCell>> {
+    let ThreadItemPayload::CollabAgentToolCall {
         tool,
         status,
         receiver_thread_ids,
@@ -211,6 +241,11 @@ pub(crate) fn tool_call_history_cell(
     let prompt = prompt.as_deref().unwrap_or_default();
 
     match tool {
+        // V2 uses SubAgentActivity for display; these variants are analytics-only.
+        CollabAgentTool::SendMessage
+        | CollabAgentTool::FollowupTask
+        | CollabAgentTool::InterruptAgent
+        | CollabAgentTool::ListAgents => None,
         CollabAgentTool::SpawnAgent => {
             if matches!(status, CollabAgentToolCallStatus::InProgress) {
                 return None;
@@ -245,6 +280,15 @@ pub(crate) fn tool_call_history_cell(
                 )
             }
         }),
+        CollabAgentTool::Wait if receiver_thread_ids.is_empty() && agents_states.is_empty() => {
+            let title = match status {
+                CollabAgentToolCallStatus::InProgress => "Waiting",
+                CollabAgentToolCallStatus::Completed => "Waited",
+                CollabAgentToolCallStatus::Failed => "Failed to wait",
+                CollabAgentToolCallStatus::Interrupted => "Interrupted",
+            };
+            Some(collab_event(title_text(title), Vec::new()))
+        }
         CollabAgentTool::Wait => {
             if matches!(status, CollabAgentToolCallStatus::InProgress) {
                 Some(waiting_begin(receiver_thread_ids, &mut agent_metadata))
@@ -264,6 +308,72 @@ pub(crate) fn tool_call_history_cell(
                 .map(|receiver_thread_id| close_end(receiver_thread_id, &mut agent_metadata))
         }
     }
+    .map(|cell| match (tool, status) {
+        (CollabAgentTool::ResumeAgent, CollabAgentToolCallStatus::Failed) => {
+            cell.with_tool_label("Failed to resume agent".into())
+        }
+        _ => cell.with_tool_header(/*count*/ 1),
+    })
+}
+
+pub(crate) fn sub_agent_activity_display(
+    item: &ThreadItemPayload,
+) -> Option<SubAgentActivityDisplay> {
+    let ThreadItemPayload::SubAgentActivity {
+        kind,
+        agent_thread_id,
+        agent_path,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    let is_running_hint = match kind {
+        SubAgentActivityKind::Started => true,
+        SubAgentActivityKind::Interacted => return None,
+        SubAgentActivityKind::Interrupted | SubAgentActivityKind::Completed => false,
+    };
+    Some(SubAgentActivityDisplay {
+        thread_id: parse_thread_id(agent_thread_id)?,
+        agent_path: agent_path.clone(),
+        is_running_hint,
+    })
+}
+
+pub(crate) fn sub_agent_activity_history_cell(
+    item: &ThreadItemPayload,
+) -> Option<WebHyperlinkHistoryCell> {
+    let ThreadItemPayload::SubAgentActivity {
+        kind,
+        agent_path,
+        agent_thread_id,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    let prefix = match kind {
+        SubAgentActivityKind::Started => "Started",
+        SubAgentActivityKind::Interacted => "Interacted with",
+        SubAgentActivityKind::Interrupted => "Interrupted",
+        SubAgentActivityKind::Completed => "Completed",
+    };
+    let mut title = title_text(format!("{prefix} "));
+    push_agent_label(
+        &mut title,
+        format!("`{agent_path}`").fg(accent_color()),
+        parse_thread_id(agent_thread_id),
+    );
+    Some(collab_event(title, Vec::new()))
+}
+
+fn push_agent_label(line: &mut HyperlinkLine, span: Span<'static>, id: Option<ThreadId>) {
+    let start = line.width();
+    line.line.push_span(span);
+    if let Some(id) = id {
+        line.hyperlinks
+            .push(TerminalHyperlink::agent(start..line.width(), id));
+    }
 }
 
 fn spawn_end(
@@ -271,7 +381,7 @@ fn spawn_end(
     prompt: &str,
     spawn_request: Option<&SpawnRequestSummary>,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     let title = match new_thread_id {
         Some(thread_id) => title_with_agent(
             "Spawned",
@@ -283,7 +393,7 @@ fn spawn_end(
 
     let mut details = Vec::new();
     if let Some(line) = prompt_line(prompt) {
-        details.push(line);
+        details.push(line.into());
     }
     collab_event(title, details)
 }
@@ -292,7 +402,7 @@ fn interaction_end(
     receiver_thread_id: ThreadId,
     prompt: &str,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     let title = title_with_agent(
         "Sent input to",
         agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
@@ -301,7 +411,7 @@ fn interaction_end(
 
     let mut details = Vec::new();
     if let Some(line) = prompt_line(prompt) {
-        details.push(line);
+        details.push(line.into());
     }
     collab_event(title, details)
 }
@@ -309,7 +419,7 @@ fn interaction_end(
 fn waiting_begin(
     receiver_thread_ids: &[String],
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     let receiver_agents = receiver_thread_ids
         .iter()
         .filter_map(|thread_id| parse_thread_id(thread_id))
@@ -342,7 +452,7 @@ fn waiting_end(
     receiver_thread_ids: &[String],
     agents_states: &std::collections::HashMap<String, CollabAgentState>,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     let details = wait_complete_lines(receiver_thread_ids, agents_states, agent_metadata);
     collab_event(title_text("Finished waiting"), details)
 }
@@ -350,7 +460,7 @@ fn waiting_end(
 fn close_end(
     receiver_thread_id: ThreadId,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     collab_event(
         title_with_agent(
             "Closed",
@@ -364,7 +474,7 @@ fn close_end(
 fn resume_begin(
     receiver_thread_id: ThreadId,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     collab_event(
         title_with_agent(
             "Resuming",
@@ -380,45 +490,38 @@ fn resume_end(
     status: Option<&CollabAgentState>,
     fallback_error: &str,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> PlainHistoryCell {
+) -> WebHyperlinkHistoryCell {
     collab_event(
         title_with_agent(
             "Resumed",
             agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
             /*spawn_request*/ None,
         ),
-        vec![status_summary_line(status, fallback_error)],
+        vec![status_summary_line(status, fallback_error).into()],
     )
 }
 
-fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
-    let mut lines: Vec<Line<'static>> = vec![title];
+fn collab_event(title: HyperlinkLine, details: Vec<HyperlinkLine>) -> WebHyperlinkHistoryCell {
+    let mut lines = vec![title];
     if !details.is_empty() {
-        lines.extend(prefix_lines(details, "  └ ".dim(), "    ".into()));
+        lines.extend(prefix_hyperlink_lines(details, "  └ ".dim(), "    ".into()));
     }
-    PlainHistoryCell::new(lines)
+    WebHyperlinkHistoryCell::new_hyperlink_lines(lines)
 }
 
-fn title_text(title: impl Into<String>) -> Line<'static> {
-    title_spans_line(vec![Span::from(title.into()).bold()])
+fn title_text(title: impl Into<String>) -> HyperlinkLine {
+    Line::from(vec!["• ".dim(), title.into().bold()]).into()
 }
 
 fn title_with_agent(
     prefix: &str,
     agent: AgentLabel<'_>,
     spawn_request: Option<&SpawnRequestSummary>,
-) -> Line<'static> {
-    let mut spans = vec![Span::from(format!("{prefix} ")).bold()];
-    spans.extend(agent_label_spans(agent));
-    spans.extend(spawn_request_spans(spawn_request));
-    title_spans_line(spans)
-}
-
-fn title_spans_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
-    let mut title = Vec::with_capacity(spans.len() + 1);
-    title.push(Span::from("• ").dim());
-    title.append(&mut spans);
-    title.into()
+) -> HyperlinkLine {
+    let mut title = title_text(format!("{prefix} "));
+    append_agent(&mut title, agent);
+    title.line.spans.extend(spawn_request_spans(spawn_request));
+    title
 }
 
 fn parse_thread_id(thread_id: &str) -> Option<ThreadId> {
@@ -428,37 +531,30 @@ fn parse_thread_id(thread_id: &str) -> Option<ThreadId> {
 fn agent_label(thread_id: ThreadId, metadata: &AgentMetadata) -> AgentLabel<'_> {
     AgentLabel {
         thread_id: Some(thread_id),
-        nickname: metadata.agent_nickname.as_deref(),
+        nickname: metadata.nickname(),
         role: metadata.agent_role.as_deref(),
     }
 }
 
-fn agent_label_line(agent: AgentLabel<'_>) -> Line<'static> {
-    agent_label_spans(agent).into()
+fn agent_label_line(agent: AgentLabel<'_>) -> HyperlinkLine {
+    let mut line = HyperlinkLine::new(Line::default());
+    append_agent(&mut line, agent);
+    line
 }
 
-fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let nickname = agent
-        .nickname
-        .map(str::trim)
-        .filter(|nickname| !nickname.is_empty());
-    let role = agent.role.map(str::trim).filter(|role| !role.is_empty());
-
-    if let Some(nickname) = nickname {
-        spans.push(Span::from(nickname.to_string()).cyan().bold());
-    } else if let Some(thread_id) = agent.thread_id {
-        spans.push(Span::from(thread_id.to_string()).cyan());
+fn append_agent(line: &mut HyperlinkLine, agent: AgentLabel<'_>) {
+    let name = if let Some(nickname) = agent.nickname {
+        nickname.to_string().bold()
+    } else if let Some(id) = agent.thread_id {
+        Span::from(id.to_string())
     } else {
-        spans.push(Span::from("agent").cyan());
+        Span::from("agent")
+    };
+    push_agent_label(line, name.fg(accent_color()), agent.thread_id);
+    if let Some(role) = agent.role.map(str::trim).filter(|r| !r.is_empty()) {
+        line.line.push_span(" ".dim());
+        line.line.push_span(format!("[{role}]"));
     }
-
-    if let Some(role) = role {
-        spans.push(Span::from(" ").dim());
-        spans.push(Span::from(format!("[{role}]")));
-    }
-
-    spans
 }
 
 fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<'static>> {
@@ -496,7 +592,7 @@ fn wait_complete_lines(
     receiver_thread_ids: &[String],
     agents_states: &std::collections::HashMap<String, CollabAgentState>,
     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
-) -> Vec<Line<'static>> {
+) -> Vec<HyperlinkLine> {
     let mut seen = HashSet::new();
     let mut entries = receiver_thread_ids
         .iter()
@@ -516,19 +612,19 @@ fn wait_complete_lines(
                 .then(|| (parsed_thread_id, agent_metadata(parsed_thread_id), status))
         })
         .collect::<Vec<_>>();
-    extras.sort_by(|left, right| left.0.to_string().cmp(&right.0.to_string()));
+    extras.sort_by_key(|entry| entry.0.to_string());
     entries.extend(extras);
 
     if entries.is_empty() {
-        vec![Line::from(Span::from("No agents completed yet"))]
+        vec!["No agents completed yet".into()]
     } else {
         entries
             .into_iter()
             .map(|(thread_id, metadata, status)| {
-                let mut spans = agent_label_spans(agent_label(thread_id, &metadata));
-                spans.push(Span::from(": ").dim());
-                spans.extend(status_summary_spans(status));
-                spans.into()
+                let mut line = agent_label_line(agent_label(thread_id, &metadata));
+                line.line.push_span(": ".dim());
+                line.line.spans.extend(status_summary_spans(status));
+                line
             })
             .collect()
     }
@@ -558,8 +654,8 @@ fn status_summary_line(status: Option<&CollabAgentState>, fallback_error: &str) 
 
 fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>> {
     match status.status {
-        CollabAgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
-        CollabAgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        CollabAgentStatus::PendingInit => vec![Span::from("Pending init").fg(accent_color())],
+        CollabAgentStatus::Running => vec![Span::from("Running").fg(accent_color()).bold()],
         // Allow `.yellow()`
         #[allow(clippy::disallowed_methods)]
         CollabAgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
@@ -613,6 +709,42 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn interacted_sub_agent_activity_does_not_change_liveness() {
+        let item = ThreadItemPayload::SubAgentActivity {
+            model: None,
+            reasoning_effort: None,
+            id: "activity-1".to_string(),
+            kind: SubAgentActivityKind::Interacted,
+            agent_thread_id: ThreadId::new().to_string(),
+            agent_path: "/root/child".to_string(),
+        };
+
+        assert_eq!(sub_agent_activity_display(&item), None);
+    }
+
+    #[test]
+    fn completed_sub_agent_activity_stops_running_liveness() {
+        let thread_id = ThreadId::new();
+        let item = ThreadItemPayload::SubAgentActivity {
+            model: None,
+            reasoning_effort: None,
+            id: "activity-1".to_string(),
+            kind: SubAgentActivityKind::Completed,
+            agent_thread_id: thread_id.to_string(),
+            agent_path: "/root/child".to_string(),
+        };
+
+        assert_eq!(
+            sub_agent_activity_display(&item),
+            Some(SubAgentActivityDisplay {
+                thread_id,
+                agent_path: "/root/child".to_string(),
+                is_running_hint: false,
+            })
+        );
+    }
+
+    #[test]
     fn collab_events_snapshot() {
         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
             .expect("valid sender thread id");
@@ -622,7 +754,7 @@ mod tests {
             .expect("valid bob thread id");
 
         let spawn = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-spawn".to_string(),
                 tool: CollabAgentTool::SpawnAgent,
                 status: CollabAgentToolCallStatus::Completed,
@@ -642,7 +774,7 @@ mod tests {
         .expect("spawn item renders");
 
         let send = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-send".to_string(),
                 tool: CollabAgentTool::SendInput,
                 status: CollabAgentToolCallStatus::Completed,
@@ -662,7 +794,7 @@ mod tests {
         .expect("send-input item renders");
 
         let waiting = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-wait".to_string(),
                 tool: CollabAgentTool::Wait,
                 status: CollabAgentToolCallStatus::InProgress,
@@ -679,7 +811,7 @@ mod tests {
         .expect("wait begin item renders");
 
         let finished = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-wait".to_string(),
                 tool: CollabAgentTool::Wait,
                 status: CollabAgentToolCallStatus::Completed,
@@ -704,8 +836,15 @@ mod tests {
         )
         .expect("wait end item renders");
 
+        let targets: Vec<_> = finished
+            .transcript_hyperlink_lines(/*width*/ 200)
+            .into_iter()
+            .flat_map(|row| row.hyperlinks)
+            .map(|link| (link.agent_id(), link.terminal_destination()))
+            .collect();
+        assert_eq!(targets, vec![(Some(robie_id), None), (Some(bob_id), None)]);
         let close = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-close".to_string(),
                 tool: CollabAgentTool::CloseAgent,
                 status: CollabAgentToolCallStatus::Completed,
@@ -724,8 +863,33 @@ mod tests {
         )
         .expect("close item renders");
 
+        let waits_without_targets = [
+            CollabAgentToolCallStatus::InProgress,
+            CollabAgentToolCallStatus::Completed,
+            CollabAgentToolCallStatus::Failed,
+            CollabAgentToolCallStatus::Interrupted,
+        ]
+        .map(|status| {
+            tool_call_history_cell(
+                &ThreadItemPayload::CollabAgentToolCall {
+                    id: "wait-without-targets".to_string(),
+                    tool: CollabAgentTool::Wait,
+                    status,
+                    sender_thread_id: sender_thread_id.to_string(),
+                    receiver_thread_ids: Vec::new(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: HashMap::new(),
+                },
+                /*cached_spawn_request*/ None,
+                |thread_id| metadata_for(thread_id, robie_id, bob_id),
+            )
+            .expect("wait without targets renders")
+        });
         let snapshot = [spawn, send, waiting, finished, close]
             .iter()
+            .chain(&waits_without_targets)
             .map(cell_to_text)
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -789,7 +953,7 @@ mod tests {
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
             .expect("valid robie thread id");
         let cell = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-spawn".to_string(),
                 tool: CollabAgentTool::SpawnAgent,
                 status: CollabAgentToolCallStatus::Completed,
@@ -811,7 +975,7 @@ mod tests {
         let lines = cell.display_lines(/*width*/ 200);
         let title = &lines[0];
         assert_eq!(title.spans[2].content.as_ref(), "Robie");
-        assert_eq!(title.spans[2].style.fg, Some(Color::Cyan));
+        assert_eq!(title.spans[2].style.fg, Some(accent_color()));
         assert!(title.spans[2].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
         assert_eq!(title.spans[4].style.fg, None);
@@ -822,16 +986,28 @@ mod tests {
 
     #[test]
     fn collab_resume_interrupted_snapshot() {
+        use CollabAgentToolCallStatus::Completed;
+        use CollabAgentToolCallStatus::Failed;
+        let cell = resume_cell(Completed, CollabAgentStatus::Interrupted);
+        assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
+        let missing = resume_cell(Failed, CollabAgentStatus::NotFound);
+        assert_eq!(missing.tool_call_labels(), ["Failed to resume agent"]);
+    }
+
+    fn resume_cell(
+        status: CollabAgentToolCallStatus,
+        agent_status: CollabAgentStatus,
+    ) -> CollabHistoryCell {
         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
             .expect("valid sender thread id");
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
             .expect("valid robie thread id");
 
-        let cell = tool_call_history_cell(
-            &ThreadItem::CollabAgentToolCall {
+        tool_call_history_cell(
+            &ThreadItemPayload::CollabAgentToolCall {
                 id: "call-resume".to_string(),
                 tool: CollabAgentTool::ResumeAgent,
-                status: CollabAgentToolCallStatus::Completed,
+                status,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
                 prompt: None,
@@ -839,15 +1015,13 @@ mod tests {
                 reasoning_effort: None,
                 agents_states: HashMap::from([(
                     robie_id.to_string(),
-                    agent_state(CollabAgentStatus::Interrupted, /*message*/ None),
+                    agent_state(agent_status, /*message*/ None),
                 )]),
             },
             /*cached_spawn_request*/ None,
             |thread_id| metadata_for(thread_id, robie_id, ThreadId::new()),
         )
-        .expect("resume item renders");
-
-        assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
+        .expect("resume item renders")
     }
 
     fn agent_state(status: CollabAgentStatus, message: Option<&str>) -> CollabAgentState {
@@ -873,7 +1047,7 @@ mod tests {
         }
     }
 
-    fn cell_to_text(cell: &PlainHistoryCell) -> String {
+    fn cell_to_text(cell: &impl HistoryCell) -> String {
         cell.display_lines(/*width*/ 200)
             .iter()
             .map(line_to_text)

@@ -25,10 +25,13 @@ pub(crate) const TRANSCRIPT_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75
 /// final rebuild instead of assuming the latest observed size has already been repaired.
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptReflowState {
+    /// Latest replay time for older pages buffered while another page is fetched.
+    pub(crate) refill_deadline: Option<Instant>,
     last_observed_width: Option<u16>,
     last_reflow_width: Option<u16>,
     pending_reflow_width: Option<u16>,
     pending_until: Option<Instant>,
+    visible_history_rows: Option<u16>,
     ran_during_stream: bool,
     resize_requested_during_stream: bool,
 }
@@ -36,11 +39,21 @@ pub(crate) struct TranscriptReflowState {
 impl TranscriptReflowState {
     /// Reset all width, pending deadline, and stream repair state.
     ///
-    /// Call this when resize reflow is disabled or when the app discards the transcript state that
-    /// pending reflow work would have rebuilt. Leaving stale deadlines behind would make a later
-    /// draw attempt to rebuild history from unrelated cells.
+    /// Call this when the app discards the transcript state that pending reflow work would have
+    /// rebuilt. Leaving stale deadlines behind would make a later draw attempt to rebuild history
+    /// from unrelated cells.
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Cache the history rows left above the composer for the current terminal size.
+    pub(crate) fn set_visible_history_rows(&mut self, rows: u16) {
+        self.visible_history_rows = Some(rows.max(/*other*/ 1));
+    }
+
+    /// Return the last viewport budget without querying the terminal during cell replay.
+    pub(crate) fn visible_history_rows(&self) -> Option<u16> {
+        self.visible_history_rows
     }
 
     /// Record the width observed during a draw and report whether it is new or changed.
@@ -177,6 +190,24 @@ pub(crate) struct TranscriptWidthChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_history_rows_are_cached_for_resize_replay() {
+        let mut state = TranscriptReflowState::default();
+
+        state.set_visible_history_rows(/*rows*/ 19);
+
+        assert_eq!(state.visible_history_rows(), Some(19));
+    }
+
+    #[test]
+    fn visible_history_rows_keep_one_row_for_a_full_height_composer() {
+        let mut state = TranscriptReflowState::default();
+
+        state.set_visible_history_rows(/*rows*/ 0);
+
+        assert_eq!(state.visible_history_rows(), Some(1));
+    }
 
     #[test]
     fn schedule_debounced_postpones_existing_reflow() {

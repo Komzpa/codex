@@ -20,14 +20,24 @@ use ratatui::layout::Size;
 /// - getting the cursor position
 pub struct VT100Backend {
     crossterm_backend: CrosstermBackend<vt100::Parser>,
+    pub(crate) newline_writes: usize,
 }
 
 impl VT100Backend {
     /// Creates a new `TestBackend` with the specified width and height.
     pub fn new(width: u16, height: u16) -> Self {
+        Self::with_scrollback(width, height, /*scrollback_len*/ 0)
+    }
+
+    pub fn with_scrollback(width: u16, height: u16, scrollback_len: usize) -> Self {
         crossterm::style::force_color_output(true);
         Self {
-            crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, 0)),
+            newline_writes: 0,
+            crossterm_backend: CrosstermBackend::new(vt100::Parser::new(
+                height,
+                width,
+                scrollback_len,
+            )),
         }
     }
 
@@ -38,6 +48,9 @@ impl VT100Backend {
 
 impl Write for VT100Backend {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.contains(&b'\n') {
+            self.newline_writes += 1;
+        }
         self.crossterm_backend.writer_mut().write(buf)
     }
 
@@ -53,6 +66,8 @@ impl fmt::Display for VT100Backend {
 }
 
 impl Backend for VT100Backend {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,

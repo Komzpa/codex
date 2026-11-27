@@ -14,7 +14,6 @@ use codex_protocol::models::SearchToolCallParams;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use tracing::warn;
 
 use crate::model::AgentThreadId;
 use crate::model::CodeModeRuntimeToolId;
@@ -25,25 +24,18 @@ use crate::model::ToolCallId;
 use crate::model::ToolCallKind;
 use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
-use crate::payload::RawPayloadRef;
 use crate::raw_event::RawToolCallRequester;
 use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
 
-/// No-op capable trace handle for one resolved tool dispatch.
-#[derive(Clone, Debug)]
+/// Records one tool dispatch, closing it as aborted if dropped before a result.
+#[derive(Debug)]
 pub struct ToolDispatchTraceContext {
-    state: ToolDispatchTraceContextState,
+    active: Option<EnabledToolDispatchTraceContext>,
 }
 
-#[derive(Clone, Debug)]
-enum ToolDispatchTraceContextState {
-    Disabled,
-    Enabled(EnabledToolDispatchTraceContext),
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct EnabledToolDispatchTraceContext {
     writer: Arc<TraceWriter>,
     thread_id: AgentThreadId,
@@ -93,11 +85,6 @@ pub enum ToolDispatchPayload {
         additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
     },
-    Mcp {
-        server: String,
-        tool: String,
-        raw_arguments: String,
-    },
 }
 
 /// Result data returned from a dispatch-level tool call.
@@ -116,43 +103,24 @@ struct DispatchedToolTraceRequest<'a> {
     payload: &'a JsonValue,
 }
 
-/// Raw response payload for dispatch-level tool trace events.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum DispatchedToolTraceResponse<'a> {
-    DirectResponse {
-        response_item: &'a ResponseInputItem,
-    },
-    CodeModeResponse {
-        value: &'a JsonValue,
-    },
-    Error {
-        error: String,
-    },
-}
-
 impl ToolDispatchTraceContext {
     /// Builds a context that accepts trace calls and records nothing.
     pub(crate) fn disabled() -> Self {
-        Self {
-            state: ToolDispatchTraceContextState::Disabled,
-        }
+        Self { active: None }
     }
 
     /// Returns whether caller-side result conversion would be recorded.
     ///
     /// Core uses this to avoid formatting or cloning tool outputs when the
-    /// dispatch lifecycle is suppressed or tracing is disabled.
+    /// dispatch lifecycle is disabled.
     pub fn is_enabled(&self) -> bool {
-        matches!(self.state, ToolDispatchTraceContextState::Enabled(_))
+        self.active.is_some()
     }
 
     /// Starts one dispatch-level lifecycle and returns the handle for its result.
     pub(crate) fn start(writer: Arc<TraceWriter>, invocation: ToolDispatchInvocation) -> Self {
-        if suppresses_tool_dispatch_trace(&invocation) {
-            return Self::disabled();
-        }
-
+        // An exec request can fail before a CodeCellStarted event. Record the
+        // dispatch independently so its caller-facing error survives in that case.
         let context = EnabledToolDispatchTraceContext {
             writer,
             thread_id: invocation.thread_id.clone(),
@@ -161,45 +129,44 @@ impl ToolDispatchTraceContext {
         };
         record_started(&context, invocation);
         Self {
-            state: ToolDispatchTraceContextState::Enabled(context),
+            active: Some(context),
         }
     }
 
     /// Records the caller-facing successful or failed tool result.
-    pub fn record_completed(&self, status: ExecutionStatus, result: ToolDispatchResult) {
-        let ToolDispatchTraceContextState::Enabled(context) = &self.state else {
+    pub fn record_completed(mut self, status: ExecutionStatus, result: ToolDispatchResult) {
+        let Some(context) = self.active.take() else {
             return;
         };
-        let response = match &result {
-            ToolDispatchResult::DirectResponse { response_item } => {
-                DispatchedToolTraceResponse::DirectResponse { response_item }
-            }
-            ToolDispatchResult::CodeModeResponse { value } => {
-                DispatchedToolTraceResponse::CodeModeResponse { value }
-            }
-        };
-        append_tool_call_ended(context, status, &response);
+        append_tool_call_ended(&context, status, &result);
     }
 
     /// Records a dispatch failure before the tool produced a normal result payload.
-    pub fn record_failed(&self, error: impl Display) {
-        let ToolDispatchTraceContextState::Enabled(context) = &self.state else {
+    pub fn record_failed(mut self, error: impl Display) {
+        let Some(context) = self.active.take() else {
             return;
         };
         append_tool_call_ended(
-            context,
+            &context,
             ExecutionStatus::Failed,
-            &DispatchedToolTraceResponse::Error {
-                error: error.to_string(),
-            },
+            &json!({"type": "error", "error": error.to_string()}),
         );
     }
 }
 
-fn suppresses_tool_dispatch_trace(invocation: &ToolDispatchInvocation) -> bool {
-    matches!(invocation.payload, ToolDispatchPayload::Custom { .. })
-        && invocation.tool_namespace.is_none()
-        && invocation.tool_name == codex_code_mode::PUBLIC_TOOL_NAME
+impl Drop for ToolDispatchTraceContext {
+    fn drop(&mut self) {
+        if let Some(context) = self.active.take() {
+            let _ = context.writer.enqueue_event(
+                RawTraceEventContext::turn(&context.thread_id, &context.codex_turn_id),
+                RawTraceEventPayload::ToolCallEnded {
+                    tool_call_id: context.tool_call_id,
+                    status: ExecutionStatus::Aborted,
+                    result_payload: None,
+                },
+            );
+        }
+    }
 }
 
 fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDispatchInvocation) {
@@ -214,15 +181,16 @@ fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDis
         tool_namespace: tool_namespace.as_deref(),
         payload: &payload,
     };
-    let request_payload =
-        write_json_payload_best_effort(&context.writer, RawPayloadKind::ToolInvocation, &request);
     let (model_visible_call_id, code_mode_runtime_tool_id, requester) =
         requester_fields(invocation.requester);
 
-    append_with_context_best_effort(
-        context,
-        RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: context.tool_call_id.clone(),
+    let tool_call_id = context.tool_call_id.clone();
+    let _ = context.writer.event_with_payload(
+        RawTraceEventContext::turn(&context.thread_id, &context.codex_turn_id),
+        RawPayloadKind::ToolInvocation,
+        &request,
+        move |reference| RawTraceEventPayload::ToolCallStarted {
+            tool_call_id,
             model_visible_call_id,
             code_mode_runtime_tool_id,
             requester,
@@ -232,7 +200,7 @@ fn record_started(context: &EnabledToolDispatchTraceContext, invocation: ToolDis
                 input_preview,
                 output_preview: None,
             },
-            invocation_payload: request_payload,
+            invocation_payload: Some(reference),
         },
     );
 }
@@ -263,25 +231,18 @@ fn requester_fields(
     }
 }
 
-fn dispatched_tool_kind(tool_name: &str, payload: &ToolDispatchPayload) -> ToolCallKind {
-    if let ToolDispatchPayload::Mcp { server, tool, .. } = payload {
-        return ToolCallKind::Mcp {
-            server: server.clone(),
-            tool: tool.clone(),
-        };
-    }
-
+fn dispatched_tool_kind(tool_name: &str, _payload: &ToolDispatchPayload) -> ToolCallKind {
     match tool_name {
         "exec_command" | "local_shell" | "shell" | "shell_command" => ToolCallKind::ExecCommand,
         "write_stdin" => ToolCallKind::WriteStdin,
         "apply_patch" => ToolCallKind::ApplyPatch,
         "web_search" | "web_search_preview" => ToolCallKind::Web,
-        "image_generation" | "image_query" => ToolCallKind::ImageGeneration,
+        "image_generation" | "image_query" | "imagegen" => ToolCallKind::ImageGeneration,
         "spawn_agent" => ToolCallKind::SpawnAgent,
         "send_message" => ToolCallKind::SendMessage,
-        "followup_task" => ToolCallKind::AssignAgentTask,
+        "followup_task" | "assign_task" => ToolCallKind::AssignAgentTask,
         "wait_agent" => ToolCallKind::WaitAgent,
-        "close_agent" => ToolCallKind::CloseAgent,
+        "close_agent" | "interrupt_agent" => ToolCallKind::CloseAgent,
         other => ToolCallKind::Other {
             name: other.to_string(),
         },
@@ -291,12 +252,8 @@ fn dispatched_tool_kind(tool_name: &str, payload: &ToolDispatchPayload) -> ToolC
 fn dispatched_tool_label(
     tool_name: &str,
     tool_namespace: Option<&str>,
-    payload: &ToolDispatchPayload,
+    _payload: &ToolDispatchPayload,
 ) -> String {
-    if let ToolDispatchPayload::Mcp { server, tool, .. } = payload {
-        return format!("mcp:{server}:{tool}");
-    }
-
     match tool_namespace {
         Some(namespace) => format!("{namespace}.{tool_name}"),
         None => tool_name.to_string(),
@@ -310,7 +267,6 @@ impl ToolDispatchPayload {
             ToolDispatchPayload::ToolSearch { arguments } => truncate_preview(&arguments.query),
             ToolDispatchPayload::Custom { input } => truncate_preview(input),
             ToolDispatchPayload::LocalShell { command, .. } => truncate_preview(&command.join(" ")),
-            ToolDispatchPayload::Mcp { raw_arguments, .. } => truncate_preview(raw_arguments),
         }
     }
 
@@ -346,16 +302,6 @@ impl ToolDispatchPayload {
                 "additional_permissions": additional_permissions,
                 "justification": justification,
             }),
-            ToolDispatchPayload::Mcp {
-                server,
-                tool,
-                raw_arguments,
-            } => json!({
-                "type": "mcp",
-                "server": server,
-                "tool": tool,
-                "raw_arguments": raw_arguments,
-            }),
         }
     }
 }
@@ -373,45 +319,19 @@ fn truncate_preview(value: &str) -> String {
 fn append_tool_call_ended(
     context: &EnabledToolDispatchTraceContext,
     status: ExecutionStatus,
-    response: &DispatchedToolTraceResponse<'_>,
+    response: &impl Serialize,
 ) {
-    let response_payload =
-        write_json_payload_best_effort(&context.writer, RawPayloadKind::ToolResult, response);
-    append_with_context_best_effort(
-        context,
-        RawTraceEventPayload::ToolCallEnded {
-            tool_call_id: context.tool_call_id.clone(),
+    let tool_call_id = context.tool_call_id.clone();
+    let _ = context.writer.event_with_payload(
+        RawTraceEventContext::turn(&context.thread_id, &context.codex_turn_id),
+        RawPayloadKind::ToolResult,
+        response,
+        move |reference| RawTraceEventPayload::ToolCallEnded {
+            tool_call_id,
             status,
-            result_payload: response_payload,
+            result_payload: Some(reference),
         },
     );
-}
-
-fn write_json_payload_best_effort(
-    writer: &TraceWriter,
-    kind: RawPayloadKind,
-    payload: &impl Serialize,
-) -> Option<RawPayloadRef> {
-    match writer.write_json_payload(kind, payload) {
-        Ok(payload_ref) => Some(payload_ref),
-        Err(err) => {
-            warn!("failed to write rollout trace payload: {err:#}");
-            None
-        }
-    }
-}
-
-fn append_with_context_best_effort(
-    context: &EnabledToolDispatchTraceContext,
-    payload: RawTraceEventPayload,
-) {
-    let event_context = RawTraceEventContext {
-        thread_id: Some(context.thread_id.clone()),
-        codex_turn_id: Some(context.codex_turn_id.clone()),
-    };
-    if let Err(err) = context.writer.append_with_context(event_context, payload) {
-        warn!("failed to append rollout trace event: {err:#}");
-    }
 }
 
 #[cfg(test)]
@@ -419,53 +339,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn suppresses_only_noncanonical_dispatch_boundaries() {
-        assert!(suppresses_tool_dispatch_trace(&invocation(
-            codex_code_mode::PUBLIC_TOOL_NAME,
-            /*tool_namespace*/ None,
-            ToolDispatchRequester::Model {
-                model_visible_call_id: "call-exec".to_string(),
-            },
-            ToolDispatchPayload::Custom {
-                input: "1 + 1".to_string(),
-            },
-        )));
-        assert!(!suppresses_tool_dispatch_trace(&invocation(
-            "custom_tool",
-            /*tool_namespace*/ None,
-            ToolDispatchRequester::Model {
-                model_visible_call_id: "call-custom".to_string(),
-            },
-            ToolDispatchPayload::Custom {
-                input: "payload".to_string(),
-            },
-        )));
-        assert!(!suppresses_tool_dispatch_trace(&invocation(
-            codex_code_mode::PUBLIC_TOOL_NAME,
-            Some("mcp__server".to_string()),
-            ToolDispatchRequester::Model {
-                model_visible_call_id: "call-namespaced".to_string(),
-            },
-            ToolDispatchPayload::Custom {
-                input: "payload".to_string(),
-            },
-        )));
+    fn classifies_interrupt_agent_as_close_agent() {
+        assert_eq!(
+            dispatched_tool_kind(
+                "interrupt_agent",
+                &ToolDispatchPayload::Function {
+                    arguments: r#"{"target":"/root/child"}"#.to_string(),
+                },
+            ),
+            ToolCallKind::CloseAgent
+        );
     }
 
-    fn invocation(
-        tool_name: &str,
-        tool_namespace: Option<String>,
-        requester: ToolDispatchRequester,
-        payload: ToolDispatchPayload,
-    ) -> ToolDispatchInvocation {
-        ToolDispatchInvocation {
-            thread_id: "thread-1".to_string(),
-            codex_turn_id: "turn-1".to_string(),
-            tool_call_id: "tool-call-1".to_string(),
-            tool_name: tool_name.to_string(),
-            tool_namespace,
-            requester,
-            payload,
-        }
+    #[test]
+    fn classifies_imagegen_as_image_generation() {
+        assert_eq!(
+            dispatched_tool_kind(
+                "imagegen",
+                &ToolDispatchPayload::Function {
+                    arguments: String::new(),
+                },
+            ),
+            ToolCallKind::ImageGeneration
+        );
     }
 }

@@ -1,43 +1,37 @@
 load("@crates//:data.bzl", "DEP_DATA")
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_platform//platform_data:defs.bzl", "platform_data")
+load("@rules_python//python:py_runtime_info.bzl", "PyRuntimeInfo")
 load("@rules_rust//cargo/private:cargo_build_script_wrapper.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
+load("//bazel/rules/testing:foreign_platform_binary.bzl", "foreign_platform_binary")
+load("//bazel/rules/testing/wine:wine_runtime.bzl", "WINE_TEST_TARGET_COMPATIBLE_WITH", "wine_test_runtime")
 
-PLATFORMS = [
-    "linux_arm64_musl",
-    "linux_amd64_musl",
-    "macos_amd64",
-    "macos_arm64",
-    "windows_amd64",
-    "windows_arm64",
+# Reserve 8 MiB of stack on Windows and statically link the CRT on MSVC.
+# V8's x64 allocator shim defines malloc/free; importing them from dynamic UCRT
+# as well replaces the import thunks during linking.
+WINDOWS_GNULLVM_RUSTC_LINK_FLAGS = [
+    "-C",
+    "link-arg=-Wl,--stack,8388608",  # 8 MiB
 ]
 
-# Match Cargo's Windows linker behavior so Bazel-built binaries and tests use
-# the same stack reserve on both Windows ABIs and resolve UCRT imports on MSVC.
 WINDOWS_RUSTC_LINK_FLAGS = select({
-    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": [
-        "-C",
-        "link-arg=-Wl,--stack,8388608",  # 8 MiB
-    ],
-    "@rules_rs//rs/experimental/platforms/constraints:windows_msvc": [
+    "@llvm//constraints/windows/abi:gnullvm": WINDOWS_GNULLVM_RUSTC_LINK_FLAGS,
+    "@llvm//constraints/windows/abi:msvc": [
         "-C",
         "link-arg=/STACK:8388608",  # 8 MiB
         "-C",
-        "link-arg=/NODEFAULTLIB:libucrt.lib",
-        "-C",
-        "link-arg=ucrt.lib",
+        "target-feature=+crt-static",
     ],
     "//conditions:default": [],
 })
 
 WINDOWS_GNULLVM_INCOMPATIBLE = select({
-    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": ["@platforms//:incompatible"],
+    "@llvm//constraints/windows/abi:gnullvm": ["@platforms//:incompatible"],
     "//conditions:default": [],
 })
 
 WINDOWS_GNULLVM_ONLY = select({
-    "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm": [],
+    "@llvm//constraints/windows/abi:gnullvm": [],
     "//conditions:default": ["@platforms//:incompatible"],
 })
 
@@ -52,21 +46,6 @@ MACOS_WEBRTC_RUSTC_LINK_FLAGS = select({
     ],
     "//conditions:default": [],
 })
-
-def multiplatform_binaries(name, platforms = PLATFORMS):
-    for platform in platforms:
-        platform_data(
-            name = name + "_" + platform,
-            platform = "@llvm//platforms:" + platform,
-            target = name,
-            tags = ["manual"],
-        )
-
-    native.filegroup(
-        name = "release_binaries",
-        srcs = [name + "_" + platform for platform in platforms],
-        tags = ["manual"],
-    )
 
 def _workspace_root_test_impl(ctx):
     is_windows = ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo])
@@ -89,25 +68,33 @@ def _workspace_root_test_impl(ctx):
     )
 
     runfiles = ctx.runfiles(files = [test_bin, workspace_root_marker]).merge(ctx.attr.test_bin[DefaultInfo].default_runfiles)
+    if ctx.attr.python_runtime:
+        python = ctx.attr.python_runtime[PyRuntimeInfo]
+        runfiles = runfiles.merge(ctx.runfiles(files = [python.interpreter], transitive_files = python.files))
     for data_dep in ctx.attr.data:
         runfiles = runfiles.merge(ctx.runfiles(files = data_dep[DefaultInfo].files.to_list()))
         runfiles = runfiles.merge(data_dep[DefaultInfo].default_runfiles)
     for runfile_dep in ctx.attr.runfile_env:
-        executable = runfile_dep[DefaultInfo].files_to_run.executable
-        if executable == None:
-            fail("{} does not provide an executable for runfile_env".format(runfile_dep.label))
-        runfiles = runfiles.merge(ctx.runfiles(files = [executable]))
+        runfile = _runfile_env_file(runfile_dep)
+        runfiles = runfiles.merge(ctx.runfiles(files = [runfile]))
         runfiles = runfiles.merge(runfile_dep[DefaultInfo].default_runfiles)
 
-    location_targets = (
+    if ctx.file.windows_runtime:
+        runfiles = runfiles.merge(ctx.runfiles(files = [ctx.file.windows_runtime]))
+
+    location_targets = {}
+    for target in (
         ctx.attr.data +
         [ctx.attr.test_bin, ctx.attr.workspace_root_marker] +
         ctx.attr.runfile_env.keys()
-    )
+    ):
+        location_targets[target.label] = target
     env = {
-        key: ctx.expand_location(value, targets = location_targets)
+        key: ctx.expand_location(value, targets = location_targets.values())
         for key, value in ctx.attr.env.items()
     }
+    if ctx.attr.test_threads:
+        env["RUST_TEST_THREADS"] = str(ctx.attr.test_threads)
 
     return [
         DefaultInfo(
@@ -117,38 +104,62 @@ def _workspace_root_test_impl(ctx):
         ),
         RunEnvironmentInfo(
             environment = env,
+            inherited_environment = ctx.attr.env_inherit,
         ),
     ]
 
 def _bash_runfile_env_exports(ctx):
     lines = []
+    if ctx.attr.python_runtime:
+        interpreter = ctx.attr.python_runtime[PyRuntimeInfo].interpreter
+        lines.extend([
+            'python="$(resolve_runfile "{}")"'.format(_runfile_logical_path(interpreter)),
+            'export PATH="${python%/*}:$PATH"',
+        ])
     for runfile_dep, env_var in ctx.attr.runfile_env.items():
-        executable = runfile_dep[DefaultInfo].files_to_run.executable
-        if executable == None:
-            fail("{} does not provide an executable for runfile_env".format(runfile_dep.label))
-        lines.append('RUNFILE_ENV_ARGS+=("{}=$(resolve_runfile "{}")")'.format(env_var, executable.short_path))
+        runfile = _runfile_env_file(runfile_dep)
+        lines.append('RUNFILE_ENV_ARGS+=("{}=$(resolve_runfile "{}")")'.format(env_var, _runfile_logical_path(runfile)))
     return "\n".join(lines)
 
 def _windows_runfile_env_exports(ctx):
     lines = []
     for runfile_dep, env_var in ctx.attr.runfile_env.items():
-        executable = runfile_dep[DefaultInfo].files_to_run.executable
-        if executable == None:
-            fail("{} does not provide an executable for runfile_env".format(runfile_dep.label))
-        lines.append('call :resolve_runfile {} "{}"'.format(env_var, executable.short_path))
+        runfile = _runfile_env_file(runfile_dep)
+        lines.append('call :resolve_runfile "{}"'.format(_runfile_logical_path(runfile)))
         lines.append("if errorlevel 1 exit /b 1")
+        lines.append('set "{}=!resolve_runfile_result!"'.format(env_var))
+    if ctx.file.windows_runtime:
+        lines.extend([
+            'call :resolve_runfile "{}"'.format(_runfile_logical_path(ctx.file.windows_runtime)),
+            "if errorlevel 1 exit /b 1",
+            'set "PATH=!resolve_runfile_result!\\bin;!PATH!"',
+        ])
     return "\n".join(lines)
 
+def _runfile_env_file(target):
+    executable = target[DefaultInfo].files_to_run.executable
+    if executable != None:
+        return executable
+
+    files = target[DefaultInfo].files.to_list()
+    if len(files) != 1:
+        fail("{} must provide an executable or exactly one file for runfile_env".format(target.label))
+    return files[0]
+
+def _runfile_logical_path(file):
+    return file.short_path.removeprefix("../")
+
 def _bash_workspace_root_setup(ctx):
-    if not ctx.attr.chdir_workspace_root:
-        return ""
-    return 'export INSTA_WORKSPACE_ROOT="${workspace_root}"\ncd "${workspace_root}"'
+    setup = 'export INSTA_WORKSPACE_ROOT="${workspace_root}"'
+    if ctx.attr.chdir_workspace_root:
+        setup += '\ncd "${workspace_root}"'
+    return setup
 
 def _windows_workspace_root_setup(ctx):
-    if not ctx.attr.chdir_workspace_root:
-        return ""
-    return """set "INSTA_WORKSPACE_ROOT=%workspace_root%"
-cd /d "%workspace_root%" || exit /b 1"""
+    setup = 'set "INSTA_WORKSPACE_ROOT=%workspace_root%"'
+    if ctx.attr.chdir_workspace_root:
+        setup += '\ncd /d "%workspace_root%" || exit /b 1'
+    return setup
 
 workspace_root_test = rule(
     implementation = _workspace_root_test_impl,
@@ -162,7 +173,10 @@ workspace_root_test = rule(
             allow_files = True,
         ),
         "env": attr.string_dict(),
+        "env_inherit": attr.string_list(),
+        "python_runtime": attr.label(cfg = "exec", providers = [PyRuntimeInfo]),
         "runfile_env": attr.label_keyed_string_dict(
+            allow_files = True,
             cfg = "target",
         ),
         "test_bin": attr.label(
@@ -170,6 +184,8 @@ workspace_root_test = rule(
             executable = True,
             mandatory = True,
         ),
+        "test_threads": attr.int(),
+        "windows_runtime": attr.label(allow_single_file = True),
         "workspace_root_marker": attr.label(
             allow_single_file = True,
             mandatory = True,
@@ -194,23 +210,39 @@ def codex_rust_crate(
         crate_name,
         crate_features = [],
         crate_srcs = None,
+        unit_test_srcs = [],
         crate_edition = None,
         proc_macro = False,
         build_script_enabled = True,
         build_script_data = [],
         compile_data = [],
+        binary_compile_data_extra = {},
+        test_only_binaries = [],
         lib_data_extra = [],
         rustc_flags_extra = [],
+        binary_rustc_flags_extra = {},
+        binaries_with_build_commit = [],
         rustc_env = {},
+        rustc_env_files = [],
         deps_extra = [],
         integration_compile_data_extra = [],
         integration_test_args = [],
+        unit_test_args = [],
+        unit_test_env = {},
+        binary_test_target_compatible_with = [],
+        binary_unit_test_windows_runtime = None,
         integration_test_timeout = None,
         test_data_extra = [],
+        linux_python_tests = [],
         test_shard_counts = {},
         test_tags = [],
+        test_threads = 0,
         unit_test_timeout = None,
-        extra_binaries = []):
+        extra_binaries = [],
+        extra_binaries_non_windows = [],
+        run_tests_with_wine_exec = False,
+        integration_test_tags = {},
+        local_linux_cases = {}):
     """Defines a Rust crate with library, binaries, and tests wired for Bazel + Cargo parity.
 
     The macro mirrors Cargo conventions: it builds a library when `src/` exists,
@@ -227,32 +259,63 @@ def codex_rust_crate(
             Crates are only compiled in a single configuration across the workspace, i.e.
             with all features in this list enabled. So use sparingly, and prefer to refactor
             optional functionality to a separate crate.
-        crate_srcs: Optional explicit srcs; defaults to `src/**/*.rs`.
+        crate_srcs: Optional explicit library srcs; [] disables the library target.
+            Defaults to `src/**/*.rs` excluding binary entrypoints.
+        unit_test_srcs: Rust modules loaded only under cfg(test). Excluded from
+            library and binary sources, but available when compiling unit tests.
         crate_edition: Rust edition override, if not default.
             You probably don't want this, it's only here for a single caller.
         proc_macro: Whether this crate builds a proc-macro library.
         build_script_data: Data files exposed to the build script at runtime.
         compile_data: Non-Rust compile-time data for the library target.
+        binary_compile_data_extra: Mapping from binary names to extra non-Rust
+            compile-time data for those binary targets.
+        test_only_binaries: Binary names used only as test fixtures.
         lib_data_extra: Extra runtime data for the library target.
+        binary_rustc_flags_extra: Mapping from binary names to extra rustc
+            flags for those binary targets.
+        binaries_with_build_commit: Binary names that embed STABLE_GIT_COMMIT from the
+            generated build-commit environment file. Other workspace status is
+            excluded from their compilation inputs.
         rustc_env: Extra rustc_env entries to merge with defaults.
+        rustc_env_files: Generated compiler environment files for the library target.
         deps_extra: Extra normal deps beyond @crates resolution.
             Typically only needed when features add additional deps.
-        integration_compile_data_extra: Extra compile_data for integration tests.
+        integration_compile_data_extra: Additional compile-time inputs for integration
+            tests, including resources embedded with include_str! or include_bytes!.
         integration_test_args: Optional args for integration test binaries.
+        unit_test_args: Optional args for the unit test binary.
+        unit_test_env: Extra runtime environment entries for library unit tests.
+        binary_test_target_compatible_with: Platform constraints for binary unit tests.
+        binary_unit_test_windows_runtime: Runtime directory containing bin/ DLLs for Windows binary unit tests.
         integration_test_timeout: Optional Bazel timeout for integration test
             targets generated from `tests/*.rs`.
         test_data_extra: Extra runtime data for tests.
         test_shard_counts: Mapping from generated test target name to Bazel
-            shard count. Matching tests use native Bazel sharding on the
-            original test label, while rules_rust assigns each Rust test case
-            to a stable bucket by hashing the test name. Matching tests are
-            also marked flaky, which gives them Bazel's default three attempts.
+            shard count. Matching tests use native Bazel sharding on the outer
+            workspace-root launcher, not rules_rust's inner sharding wrapper.
+            The launcher resolves the real Rust test binary through runfiles
+            and then assigns each libtest case to a stable bucket by hashing
+            the test name. Matching tests are also marked flaky, which gives
+            them Bazel's default three attempts.
+        linux_python_tests: Unit and integration test names that run python3 on Linux.
+        local_linux_cases: Exact libtest names keyed by test launcher. On Linux,
+            run these cases in a companion launcher with no-remote-exec.
         test_tags: Tags applied to unit + integration test targets.
             Typically used to disable the sandbox, but see https://bazel.build/reference/be/common-definitions#common.tags
+        integration_test_tags: Extra execution tags keyed by native integration
+            test name. Compilation, Wine and Windows cross tests are unaffected.
+        test_threads: Optional Rust test thread limit for sharded integration tests.
         unit_test_timeout: Optional Bazel timeout for the unit-test target
             generated from `src/**/*.rs`.
         extra_binaries: Additional binary labels to surface as test data and
             `CARGO_BIN_EXE_*` environment variables. These are only needed for binaries from a different crate.
+        extra_binaries_non_windows: Like `extra_binaries`, but omitted from
+            Windows test data and environment variables. Tests using these
+            binaries must be excluded when targeting Windows.
+        run_tests_with_wine_exec: Boolean, defaults to False. Whether to emit a
+            Wine-exec variant for each integration test. Variants inherit the
+            native test's timeout, tags, and shard count.
     """
     test_env = {
         # The launcher resolves an absolute workspace root at runtime so
@@ -276,29 +339,37 @@ def codex_rust_crate(
         visibility = ["//visibility:public"],
     )
 
+    package_data = DEP_DATA.get(native.package_name())
     rustc_env = {
         "BAZEL_PACKAGE": native.package_name(),
+        "CARGO_PKG_NAME": package_data["package_name"],
     } | rustc_env
+
+    # Insta also reads this during macro expansion. Match the test launcher's
+    # workspace-relative root instead of embedding CARGO_MANIFEST_DIR.
+    test_rustc_env = rustc_env | {"INSTA_WORKSPACE_ROOT": "."}
 
     manifest_relpath = native.package_name()
     if manifest_relpath.startswith("codex-rs/"):
         manifest_relpath = manifest_relpath[len("codex-rs/"):]
     manifest_path = manifest_relpath + "/Cargo.toml"
 
-    binaries = DEP_DATA.get(native.package_name())["binaries"]
+    crate_version = package_data["version"]
+    binaries = package_data["binaries"]
 
-    lib_srcs = crate_srcs or native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
+    lib_srcs = crate_srcs if crate_srcs != None else native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
+    lib_srcs = [src for src in lib_srcs if src not in unit_test_srcs]
 
     maybe_deps = []
 
     if build_script_enabled and native.glob(["build.rs"], allow_empty = True):
         cargo_build_script(
             name = name + "-build-script",
+            pkg_name = package_data["package_name"],
             srcs = ["build.rs"],
             deps = all_crate_deps(build = True),
             data = build_script_data,
-            # Some build script deps sniff version-related env vars...
-            version = "0.0.0",
+            version = crate_version,
         )
 
         maybe_deps += [name + "-build-script"]
@@ -316,6 +387,8 @@ def codex_rust_crate(
             edition = crate_edition,
             rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
+            rustc_env_files = rustc_env_files,
+            version = crate_version,
             visibility = ["//visibility:public"],
         )
 
@@ -329,6 +402,8 @@ def codex_rust_crate(
         rust_test(
             name = unit_test_binary,
             crate = name,
+            crate_features = crate_features,
+            compile_data = unit_test_srcs,
             deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
             # Unit tests also compile to standalone Windows executables, so
             # keep their stack reserve aligned with binaries and integration
@@ -341,21 +416,30 @@ def codex_rust_crate(
                 "--remap-path-prefix=../codex-rs=",
                 "--remap-path-prefix=codex-rs=",
             ],
-            rustc_env = rustc_env,
-            data = test_data_extra,
+            rustc_env = test_rustc_env,
+            data = test_data_extra + [binary for binary in extra_binaries if binary not in test_data_extra],
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         unit_test_kwargs = {}
+        if unit_test_args:
+            unit_test_kwargs["args"] = unit_test_args
         if unit_test_timeout:
             unit_test_kwargs["timeout"] = unit_test_timeout
         if unit_test_shard_count:
             unit_test_kwargs["shard_count"] = unit_test_shard_count
             unit_test_kwargs["flaky"] = True
 
-        workspace_root_test(
+        _partitioned_workspace_test(
             name = unit_test_name,
-            env = test_env,
+            local_cases = local_linux_cases.get(unit_test_name, []),
+            env = test_env | unit_test_env,
+            python_runtime = _test_python_runtime(linux_python_tests, unit_test_name),
+            runfile_env = {
+                binary: "CARGO_BIN_EXE_" + Label(binary).name
+                for binary in extra_binaries
+            },
             test_bin = ":" + unit_test_binary,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
             tags = test_tags,
@@ -372,16 +456,78 @@ def codex_rust_crate(
         sanitized_binaries.append(binary)
         cargo_env_runfiles[":" + binary] = "CARGO_BIN_EXE_" + binary
         cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath :%s)" % binary
-
         rust_binary(
             name = binary,
             crate_name = binary.replace("-", "_"),
             crate_root = main,
             deps = all_crate_deps() + maybe_deps + deps_extra,
             edition = crate_edition,
-            rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS,
-            srcs = native.glob(["src/**/*.rs"]),
+            # Scope each binary's compile data and linker flags to its generated
+            # rust_binary so they do not affect sibling binaries.
+            compile_data = binary_compile_data_extra.get(binary, []) + select({
+                "@platforms//os:macos": ["//bazel/tools:dsymutil"],
+                "//conditions:default": [],
+            }),
+            rustc_flags = rustc_flags_extra + binary_rustc_flags_extra.get(binary, []) + WINDOWS_RUSTC_LINK_FLAGS,
+            rustc_env = select({
+                "@platforms//os:macos": rustc_env | {"PATH": "$${pwd}/bazel/tools:/bin:/usr/bin:/usr/local/bin"},
+                "//conditions:default": rustc_env,
+            }),
+            # Keep stamp = 0: rules_rust otherwise makes stable-status.txt and
+            # volatile-status.txt compiler inputs, even though we only consume
+            # STABLE_GIT_COMMIT. BUILD_USER and BUILD_HOST vary across developers
+            # and CI workers, while BUILD_TIMESTAMP varies across builds; these
+            # unrelated values prevent remote cache reuse for the same commit.
+            # Isolate status inputs in build-commit-env's cheap action so its
+            # output, and hence this compiler input, changes only with the commit.
+            rustc_env_files = ["//bazel/build-info:build-commit-env"] if binary in binaries_with_build_commit else [],
+            srcs = native.glob(["src/**/*.rs"], exclude = [main] + unit_test_srcs, allow_empty = True) + [main],
+            testonly = binary in test_only_binaries,
+            stamp = 0,
+            version = crate_version,
             visibility = ["//visibility:public"],
+        )
+
+        binary_unit_test_name = binary + "-bin-unit-tests"
+        binary_unit_test_binary = binary_unit_test_name + "-bin"
+        binary_unit_test_shard_count = _test_shard_count(test_shard_counts, binary_unit_test_name)
+
+        # Keep the Rust test manual so the repo-root wrapper owns filtering and
+        # sharding while Clippy can still discover the underlying test crate.
+        rust_test(
+            name = binary_unit_test_binary,
+            crate = ":" + binary,
+            crate_features = crate_features,
+            compile_data = unit_test_srcs,
+            deps = all_crate_deps(normal_dev = True),
+            rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
+                "--remap-path-prefix=../codex-rs=",
+                "--remap-path-prefix=codex-rs=",
+            ],
+            rustc_env = test_rustc_env,
+            data = test_data_extra,
+            tags = test_tags + ["manual"],
+            version = crate_version,
+        )
+
+        binary_unit_test_kwargs = {}
+        if unit_test_args:
+            binary_unit_test_kwargs["args"] = unit_test_args
+        if unit_test_timeout:
+            binary_unit_test_kwargs["timeout"] = unit_test_timeout
+        if binary_unit_test_shard_count:
+            binary_unit_test_kwargs["shard_count"] = binary_unit_test_shard_count
+            binary_unit_test_kwargs["flaky"] = True
+
+        workspace_root_test(
+            name = binary_unit_test_name,
+            env = test_env,
+            windows_runtime = binary_unit_test_windows_runtime,
+            test_bin = ":" + binary_unit_test_binary,
+            workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+            target_compatible_with = binary_test_target_compatible_with,
+            tags = test_tags,
+            **binary_unit_test_kwargs
         )
 
     for binary_label in extra_binaries:
@@ -389,6 +535,47 @@ def codex_rust_crate(
         binary = Label(binary_label).name
         cargo_env_runfiles[binary_label] = "CARGO_BIN_EXE_" + binary
         cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath %s)" % binary_label
+
+    integration_test_binaries = sanitized_binaries
+    integration_test_cargo_env = cargo_env
+    integration_test_cargo_env_runfiles = cargo_env_runfiles
+    integration_test_files = native.glob(["tests/**"], allow_empty = True)
+
+    # Fixtures and snapshots are runtime data. Only Rust modules and explicitly
+    # embedded resources should invalidate integration-test compilation.
+    integration_compile_files = native.glob(["tests/**/*.rs"], allow_empty = True)
+    integration_test_data_extra = [
+        data
+        for data in test_data_extra
+        if data not in cargo_env_runfiles and data not in integration_test_files
+    ]
+    non_windows_sanitized_binaries = []
+    non_windows_cargo_env = {}
+    non_windows_cargo_env_runfiles = {}
+    if extra_binaries_non_windows:
+        for binary_label in extra_binaries_non_windows:
+            non_windows_sanitized_binaries.append(binary_label)
+            binary = Label(binary_label).name
+            non_windows_cargo_env_runfiles[binary_label] = "CARGO_BIN_EXE_" + binary
+            non_windows_cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath %s)" % binary_label
+
+        integration_test_binaries = sanitized_binaries + select({
+            "@platforms//os:windows": [],
+            "//conditions:default": non_windows_sanitized_binaries,
+        })
+        integration_test_cargo_env = select({
+            "@platforms//os:windows": cargo_env,
+            "//conditions:default": cargo_env | non_windows_cargo_env,
+        })
+        integration_test_cargo_env_runfiles = select({
+            "@platforms//os:windows": cargo_env_runfiles,
+            "//conditions:default": cargo_env_runfiles | non_windows_cargo_env_runfiles,
+        })
+
+    wine_host_binaries = {
+        env_var.removeprefix("CARGO_BIN_EXE_"): binary_label
+        for binary_label, env_var in (cargo_env_runfiles | non_windows_cargo_env_runfiles).items()
+    }
 
     integration_test_kwargs = {}
     if integration_test_args:
@@ -408,34 +595,156 @@ def codex_rust_crate(
         test_kwargs.update(integration_test_kwargs)
         test_shard_count = _test_shard_count(test_shard_counts, test_name)
         if test_shard_count:
-            test_kwargs["experimental_enable_sharding"] = True
+            # Put Bazel sharding on the label users/CI invoke. Do not set
+            # rules_rust's experimental_enable_sharding on the Rust test
+            # binary: that creates an intermediate wrapper that expects a
+            # symlink runfiles tree, while this repo intentionally runs with
+            # --noenable_runfiles and usually has only a runfiles manifest.
             test_kwargs["shard_count"] = test_shard_count
             test_kwargs["flaky"] = True
 
-        # Keep the existing integration test shape on non-gnullvm platforms.
-        # Windows cross tests need workspace_root_test so runfile env vars
-        # resolve to Windows-native absolute paths before the test starts.
-        rust_test(
-            name = test_name,
-            crate_name = test_crate_name,
-            crate_root = test,
-            srcs = [test],
-            data = native.glob(["tests/**"], allow_empty = True) + sanitized_binaries + test_data_extra,
-            compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
-            deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
-            # Bazel has emitted both `codex-rs/<crate>/...` and
-            # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
-            # prefix so Insta records Cargo-like metadata such as `core/tests/...`.
-            rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
-                "--remap-path-prefix=../codex-rs=",
-                "--remap-path-prefix=codex-rs=",
-            ],
-            rustc_env = rustc_env,
-            env = cargo_env,
-            target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
-            tags = test_tags,
-            **test_kwargs
-        )
+        integration_test_binary = test_name + "-bin"
+        execution_tags = integration_test_tags.get(test_name, [])
+        use_test_launcher = test_shard_count or execution_tags or test_name in linux_python_tests or test_name in local_linux_cases
+
+        # There are four generated integration-test shapes:
+        #
+        # 1. Unsharded native tests keep the plain rust_test label for minimal
+        #    churn and the usual rules_rust Cargo-like environment.
+        # 2. Tests with shards, execution tags, or Python use a manual rust_test
+        #    binary plus an outer workspace_root_test. The launcher resolves
+        #    the binary through runfiles, handles sharding, and keeps test
+        #    execution tags off compilation and lint actions.
+        # 3. Windows cross tests always use the workspace_root_test wrapper so
+        #    runfile env vars become Windows-native absolute paths before the
+        #    Rust process starts.
+        # 4. Wine-exec tests reuse the native Rust test binary behind a shared
+        #    Linux runner. The runner starts the cross-built Windows exec server
+        #    under pinned Wine, injects its URL into the test environment, and
+        #    owns cleanup. The outer workspace_root_test resolves the runner,
+        #    test, and server from runfiles, sets a Cargo-like cwd, and applies
+        #    the native test's shard count.
+        if use_test_launcher:
+            # This target is intentionally a binary-like helper, not the public
+            # test target. The wrapper below owns cwd setup, runfile env
+            # materialization, sharding, and flaky retry behavior.
+            rust_test(
+                name = integration_test_binary,
+                crate_name = test_crate_name,
+                crate_root = test,
+                srcs = [test],
+                data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+                compile_data = integration_compile_files + integration_compile_data_extra,
+                deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
+                # Bazel has emitted both `codex-rs/<crate>/...` and
+                # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
+                # prefix so Insta records Cargo-like metadata such as `core/tests/...`.
+                rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
+                    "--remap-path-prefix=../codex-rs=",
+                    "--remap-path-prefix=codex-rs=",
+                ],
+                rustc_env = test_rustc_env,
+                target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
+                tags = test_tags + ["manual"],
+                version = crate_version,
+            )
+
+            _partitioned_workspace_test(
+                name = test_name,
+                local_cases = local_linux_cases.get(test_name, []),
+                # Unsharded rust_test binaries can embed paths relative to
+                # Bazel's runfiles workspace. Preserve that working directory.
+                chdir_workspace_root = bool(test_shard_count),
+                env = test_env,
+                python_runtime = _test_python_runtime(linux_python_tests, test_name),
+                # CARGO_BIN_EXE_* values are rlocation paths at analysis time.
+                # The launcher rewrites them to absolute paths at execution
+                # time so tests keep working after chdir_workspace_root and on
+                # manifest-only platforms.
+                runfile_env = integration_test_cargo_env_runfiles,
+                test_bin = ":" + integration_test_binary,
+                test_threads = test_threads,
+                workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+                target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
+                tags = test_tags + execution_tags,
+                **test_kwargs
+            )
+        else:
+            # For unsharded tests, the direct rust_test rule is still fine:
+            # there is no rules_rust sharding wrapper to bypass, and env can
+            # use rlocation paths directly because the test starts under
+            # Bazel's normal test environment.
+            rust_test(
+                name = test_name,
+                crate_name = test_crate_name,
+                crate_root = test,
+                srcs = [test],
+                data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+                compile_data = integration_compile_files + integration_compile_data_extra,
+                deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
+                # Bazel has emitted both `codex-rs/<crate>/...` and
+                # `../codex-rs/<crate>/...` paths for `file!()`. Strip either
+                # prefix so Insta records Cargo-like metadata such as `core/tests/...`.
+                rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
+                    "--remap-path-prefix=../codex-rs=",
+                    "--remap-path-prefix=codex-rs=",
+                ],
+                rustc_env = test_rustc_env,
+                env = integration_test_cargo_env,
+                target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
+                tags = test_tags,
+                version = crate_version,
+                **test_kwargs
+            )
+
+        if run_tests_with_wine_exec:
+            wine_test_name = test_name.removesuffix("-test") + "-wine-exec-test"
+            native_test_binary = ":" + (integration_test_binary if use_test_launcher else test_name)
+            wine_test_binaries = dict(wine_host_binaries)
+
+            wine_exec_server = wine_test_name + "-windows-exec-server"
+            foreign_platform_binary(
+                name = wine_exec_server,
+                binary = "//codex-rs/exec-server/testing:exec-server",
+                extra_rustc_flags = WINDOWS_GNULLVM_RUSTC_LINK_FLAGS,
+                platform = "//:windows_x86_64_gnullvm",
+                tags = ["manual"],
+                target_compatible_with = [
+                    "@platforms//cpu:x86_64",
+                    "@platforms//os:linux",
+                ],
+                testonly = True,
+                visibility = ["//visibility:private"],
+            )
+            wine_test_binaries["wine-windows-exec-server"] = ":" + wine_exec_server
+            wine_runtime = wine_test_runtime(wine_test_binaries)
+            wine_runfile_env = dict(wine_runtime.runfile_env)
+            wine_runfile_env[native_test_binary] = "CODEX_WINE_EXEC_TEST_BINARY"
+
+            wine_test_kwargs = {}
+            wine_test_kwargs.update(integration_test_kwargs)
+            if test_shard_count:
+                wine_test_kwargs["shard_count"] = test_shard_count
+                wine_test_kwargs["flaky"] = True
+
+            # The Wine runner is a binary rather than a rust_test, but it still
+            # needs a Cargo-like cwd, Bazel sharding, and absolute runfile paths.
+            # `workspace_root_test` establishes all three before Wine starts.
+            _partitioned_workspace_test(
+                name = wine_test_name,
+                local_cases = local_linux_cases.get(wine_test_name, []),
+                data = wine_runtime.data,
+                env = test_env,
+                python_runtime = _test_python_runtime(linux_python_tests, test_name),
+                runfile_env = wine_runfile_env,
+                test_bin = "//codex-rs/exec-server/testing:wine-exec-test-runner",
+                workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
+                target_compatible_with = WINE_TEST_TARGET_COMPATIBLE_WITH,
+                # This wrapper has no Rust sources and transitions a data
+                # dependency to a Windows toolchain the lint does not register.
+                tags = test_tags + ["no-argument-comment-lint"],
+                **wine_test_kwargs
+            )
 
         windows_cross_test_kwargs = {}
         windows_cross_test_kwargs.update(integration_test_kwargs)
@@ -448,30 +757,72 @@ def codex_rust_crate(
             crate_name = test_crate_name,
             crate_root = test,
             srcs = [test],
-            data = native.glob(["tests/**"], allow_empty = True) + sanitized_binaries + test_data_extra,
-            compile_data = native.glob(["tests/**"], allow_empty = True) + integration_compile_data_extra,
+            data = integration_test_files + integration_test_binaries + integration_test_data_extra,
+            compile_data = integration_compile_files + integration_compile_data_extra,
             deps = all_crate_deps(normal = True, normal_dev = True) + maybe_deps + deps_extra,
             rustc_flags = rustc_flags_extra + WINDOWS_RUSTC_LINK_FLAGS + [
                 "--remap-path-prefix=../codex-rs=",
                 "--remap-path-prefix=codex-rs=",
             ],
-            rustc_env = rustc_env,
-            env = cargo_env,
+            rustc_env = test_rustc_env,
+            env = integration_test_cargo_env,
             target_compatible_with = WINDOWS_GNULLVM_ONLY,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         workspace_root_test(
             name = test_name + "-windows-cross",
             chdir_workspace_root = False,
-            env = cargo_env,
-            runfile_env = cargo_env_runfiles,
+            env = integration_test_cargo_env,
+            runfile_env = integration_test_cargo_env_runfiles,
             test_bin = ":" + windows_cross_test_binary,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
             target_compatible_with = WINDOWS_GNULLVM_ONLY,
             tags = test_tags,
             **windows_cross_test_kwargs
         )
+
+def _partitioned_workspace_test(name, local_cases, env, tags, **kwargs):
+    """Share one binary between complementary Linux test launchers."""
+    if not local_cases:
+        workspace_root_test(name = name, env = env, tags = tags, **kwargs)
+        return
+
+    cases = ",".join(local_cases)
+    workspace_root_test(
+        name = name,
+        env = select({
+            "@platforms//os:linux": env | {"CODEX_BAZEL_EXCLUDE_CASES": cases},
+            "//conditions:default": env,
+        }),
+        tags = tags,
+        **kwargs
+    )
+
+    # Keep the Wine constraints and any runtime arguments. The local subset
+    # is small enough to run in one action instead of duplicating all shards.
+    local_kwargs = dict(kwargs)
+    local_kwargs.pop("shard_count", None)
+    if name.endswith("-wine-exec-test"):
+        compatible = WINE_TEST_TARGET_COMPATIBLE_WITH
+    else:
+        compatible = ["@platforms//os:linux"]
+    local_kwargs["target_compatible_with"] = compatible
+    workspace_root_test(
+        name = name + "-linux-local",
+        env = env | {"CODEX_BAZEL_INCLUDE_CASES": cases},
+        tags = tags + ["no-remote-exec"],
+        **local_kwargs
+    )
+
+def _test_python_runtime(linux_python_tests, test_name):
+    if test_name not in linux_python_tests:
+        return None
+    return select({
+        "@platforms//os:linux": "@python_3_12//:py3_runtime",
+        "//conditions:default": None,
+    })
 
 def _test_shard_count(test_shard_counts, test_name):
     shard_count = test_shard_counts.get(test_name)

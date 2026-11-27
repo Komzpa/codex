@@ -1,14 +1,16 @@
 //! Conversation reduction from model-facing payload snapshots.
 //!
-//! Inference request inputs and response outputs are both part of the logical
-//! conversation because they are the payloads exchanged with the model. Runtime
-//! observations, such as local tool output, stay outside the transcript until a
-//! later model-facing payload carries their content.
+//! Replay retains all observed items, then selects accepted history using
+//! request inputs, compaction checkpoints, and harness acceptance events.
+//! Tool messages use the content sent to the model in subsequent requests.
+
+use std::collections::HashSet;
 
 use anyhow::Context;
 use anyhow::Ok;
 use anyhow::Result;
 use anyhow::bail;
+use codex_protocol::ResponseItemId;
 use serde_json::Value;
 
 use self::normalize::NormalizedConversationItem;
@@ -16,21 +18,67 @@ use super::TraceReducer;
 use crate::model::CompactionId;
 use crate::model::ConversationBody;
 use crate::model::ConversationItem;
+use crate::model::ConversationItemId;
 use crate::model::ConversationItemKind;
 use crate::model::ConversationPart;
 use crate::model::ConversationRole;
 use crate::model::InferenceCallId;
 use crate::model::ProducerRef;
 use crate::payload::RawPayloadRef;
+use crate::shard::ObservedJson;
 
 mod normalize;
 
 impl TraceReducer {
+    pub(super) fn record_accepted_item(
+        &mut self,
+        thread_id: &str,
+        turn_id: Option<String>,
+        at_unix_ms: i64,
+        wire_id: &ResponseItemId,
+        payload: &RawPayloadRef,
+    ) -> Result<()> {
+        // A snapshot can arrive first, or the recorder can repeat a notification.
+        let key = (thread_id.to_owned(), wire_id.clone());
+        if self.receivable_ids.contains_key(&key) {
+            return Ok(());
+        }
+        let ObservedJson { mut value, missing } = self.payload_reader.observed_json(payload)?;
+        let item = normalize::normalize_model_item(&mut value, payload, &missing)?;
+        if !item.is_delivery_or_tool_output()
+            || item.responses_item_id.as_deref() != Some(wire_id.as_str())
+        {
+            bail!("accepted item payload does not match {wire_id}");
+        }
+        let is_delivery = item.agent_message.is_some();
+        let produced_by = if let Some(call_id) = &item.call_id
+            && let Some(tool_call_id) = self.single_tool_for_model_visible_call(call_id)?
+        {
+            vec![ProducerRef::Tool { tool_call_id }]
+        } else {
+            Vec::new()
+        };
+        let id = self.create_conversation_item(thread_id, turn_id, at_unix_ms, item, produced_by);
+        self.thread_mut(thread_id)?
+            .conversation_item_ids
+            .push(id.clone());
+        if is_delivery {
+            self.resolve_pending_agent_edges_for_item(&id)?;
+        }
+        self.receivable_ids.insert(
+            key,
+            super::ReceivableItem {
+                item_id: id,
+                awaiting_snapshot: true,
+            },
+        );
+        Ok(())
+    }
+
     /// Reduces an inference request input snapshot into model-visible conversation items.
     ///
-    /// Request snapshots are reconciled by position against the previous model-visible
-    /// snapshot for the thread so repeated history reuses ids while newly inserted
-    /// items remain distinct.
+    /// Full snapshots reuse matching items even if the prompt builder reorders them.
+    /// Incremental requests append to the referenced response's context.
     pub(super) fn reduce_inference_request(
         &mut self,
         wall_time_unix_ms: i64,
@@ -38,22 +86,51 @@ impl TraceReducer {
         thread_id: &str,
         codex_turn_id: &str,
         request_payload: &RawPayloadRef,
-    ) -> Result<Vec<String>> {
-        let payload = self.read_payload_json(request_payload)?;
-        let Some(input) = payload.get("input") else {
+        stripped_tool_output_ids: Vec<(usize, String)>,
+    ) -> Result<Vec<ConversationItemId>> {
+        if !request_payload.capture.is_complete() {
+            return Ok(Vec::new());
+        }
+        let ObservedJson {
+            value: mut payload,
+            missing,
+        } = self.payload_reader.observed_json(request_payload)?;
+        let Some(input) = payload.get_mut("input") else {
             bail!(
                 "inference request payload {} did not contain input",
                 request_payload.raw_payload_id
             );
         };
-        let Some(request_items) = input.as_array() else {
+        let Some(request_items) = input.as_array_mut() else {
             bail!(
                 "inference request payload {} had non-array input",
                 request_payload.raw_payload_id
             );
         };
 
-        let items = normalize::normalize_model_items(request_items, request_payload)?;
+        // The wire payload stays intact on disk. Resolve accepted history by its native ID,
+        // even for two identical named outputs or a trimmed result in a websocket delta.
+        for (index, history_id) in stripped_tool_output_ids {
+            let item = request_items
+                .get_mut(index)
+                .context("stripped tool output index outside request")?;
+            if missing["input"][index].is_string() {
+                continue; // The captured request has no item to attach the history ID to.
+            }
+            if item.get("id").is_some()
+                || !matches!(
+                    item["type"].as_str(),
+                    Some("function_call_output" | "custom_tool_call_output")
+                )
+            {
+                bail!(
+                    "stripped tool output ID does not refer to an ID-less output at input {index}"
+                );
+            }
+            item["id"] = Value::String(history_id);
+        }
+        let items =
+            normalize::normalize_model_items(request_items, request_payload, &missing["input"])?;
 
         let previous_response_id = payload.get("previous_response_id").and_then(Value::as_str);
         // After compaction, the next full request is compared against the installed replacement
@@ -82,9 +159,12 @@ impl TraceReducer {
                 .map(|inference| {
                     let mut ids = inference.request_item_ids.clone();
                     ids.extend(inference.response_item_ids.clone());
-                    ids
+                    let incomplete = std::iter::once(&inference.raw_request_payload_id)
+                        .chain(inference.raw_response_payload_id.as_ref())
+                        .any(|id| !self.rollout.raw_payloads[id].is_complete());
+                    (ids, incomplete)
                 });
-            let Some(mut item_ids) = previous_items else {
+            let Some((mut item_ids, incomplete)) = previous_items else {
                 bail!(
                     "incremental inference request {inference_call_id} referenced unknown previous_response_id {previous_response_id}"
                 );
@@ -98,7 +178,9 @@ impl TraceReducer {
                     produced_by: Vec::new(),
                     start_index: item_ids.len(),
                     mode: ReconcileMode::AppendOnly,
-                    snapshot_override: None,
+                    // After a capture gap, the number of known prefix items is not
+                    // a position in the thread's last fully observed snapshot.
+                    snapshot_override: incomplete.then_some(item_ids.as_slice()),
                 },
             )?;
             item_ids.extend(delta_item_ids);
@@ -134,8 +216,14 @@ impl TraceReducer {
         wall_time_unix_ms: i64,
         inference_call_id: &InferenceCallId,
         response_payload: &RawPayloadRef,
-    ) -> Result<Vec<String>> {
-        let payload = self.read_payload_json(response_payload)?;
+    ) -> Result<Vec<ConversationItemId>> {
+        if !response_payload.capture.is_complete() {
+            return Ok(Vec::new());
+        }
+        let ObservedJson {
+            value: payload,
+            missing,
+        } = self.payload_reader.observed_json(response_payload)?;
         let Some(output_items) = payload.get("output_items").and_then(Value::as_array) else {
             bail!(
                 "inference response payload {} did not contain output_items",
@@ -152,32 +240,56 @@ impl TraceReducer {
             bail!("inference response referenced unknown call {inference_call_id}");
         };
 
-        let items = normalize::normalize_model_items(output_items, response_payload)?;
-        // Response output is appended immediately: it was produced by the model,
-        // so it is conversation even before a later request carries it forward.
-        let append_at = self
-            .thread_conversation_snapshots
-            .get(&thread_id)
-            .map_or(0, Vec::len);
-        let response_item_ids = self.reconcile_conversation_items(
+        let items = normalize::normalize_model_items(
+            output_items,
+            response_payload,
+            &missing["output_items"],
+        )?;
+        // A later request or compaction can be recorded before this response.
+        // Only match items with source IDs, so retries with identical text stay distinct.
+        let candidates = self.rollout.threads[&thread_id]
+            .conversation_item_ids
+            .iter()
+            .filter(|id| {
+                let source_id = &self.rollout.conversation_items[*id].responses_item_id;
+                source_id.is_some()
+                    && items
+                        .iter()
+                        .any(|item| &item.responses_item_id == source_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let response_item_ids = self.reconcile_detached_conversation_items(
             items,
-            ReconcileItems {
+            DetachedReconcileItems {
                 thread_id: &thread_id,
                 codex_turn_id: &codex_turn_id,
                 wall_time_unix_ms,
                 produced_by: vec![ProducerRef::Inference {
                     inference_call_id: inference_call_id.clone(),
                 }],
-                start_index: append_at,
-                mode: ReconcileMode::AppendOnly,
-                snapshot_override: None,
+                candidates,
             },
         )?;
         self.append_thread_conversation_items(&thread_id, &response_item_ids)?;
-        self.thread_conversation_snapshots
-            .entry(thread_id)
-            .or_default()
-            .extend(response_item_ids.clone());
+        let inference = &self.rollout.inference_calls[inference_call_id];
+        let latest = self
+            .rollout
+            .inference_calls
+            .values()
+            .filter(|call| call.thread_id == thread_id)
+            .max_by_key(|call| call.execution.started_seq);
+        // A late response must not replace a newer request or compaction snapshot.
+        if latest.is_some_and(|call| call.inference_call_id == *inference_call_id)
+            && !self
+                .pending_compaction_replacement_item_ids
+                .contains_key(&thread_id)
+        {
+            let mut snapshot = inference.request_item_ids.clone();
+            snapshot.extend(response_item_ids.clone());
+            self.thread_conversation_snapshots
+                .insert(thread_id, snapshot);
+        }
 
         if let Some(usage) = payload
             .get("token_usage")
@@ -194,7 +306,7 @@ impl TraceReducer {
         &mut self,
         items: Vec<NormalizedConversationItem>,
         context: ReconcileItems<'_>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ConversationItemId>> {
         let previous_snapshot = context.snapshot_override.map_or_else(
             || {
                 self.thread_conversation_snapshots
@@ -205,16 +317,19 @@ impl TraceReducer {
             <[_]>::to_vec,
         );
         let mut item_ids = Vec::with_capacity(items.len());
+        let mut used_item_ids = HashSet::with_capacity(items.len());
 
         for (offset, item) in items.into_iter().enumerate() {
             let index = context.start_index + offset;
             let tool_link_item = item.clone();
             self.ensure_call_id_consistency(context.thread_id, &item)?;
             let item_id = if let Some(previous_item_id) = previous_snapshot.get(index) {
-                if self.item_matches(previous_item_id, &item) {
+                if !used_item_ids.contains(previous_item_id)
+                    && self.item_matches(previous_item_id, &item)
+                {
                     previous_item_id.clone()
                 } else if matches!(context.mode, ReconcileMode::FullSnapshot) {
-                    self.find_matching_snapshot_item(&previous_snapshot, &item_ids, &item)
+                    self.find_matching_snapshot_item(&previous_snapshot, &used_item_ids, &item)
                         .unwrap_or_else(|| {
                             self.create_conversation_item(
                                 context.thread_id,
@@ -234,7 +349,7 @@ impl TraceReducer {
                     );
                 }
             } else if matches!(context.mode, ReconcileMode::FullSnapshot) {
-                self.find_matching_snapshot_item(&previous_snapshot, &item_ids, &item)
+                self.find_matching_snapshot_item(&previous_snapshot, &used_item_ids, &item)
                     .unwrap_or_else(|| {
                         self.create_conversation_item(
                             context.thread_id,
@@ -269,10 +384,10 @@ impl TraceReducer {
                 &tool_link_item.kind,
             )?;
             self.resolve_pending_agent_edges_for_item(&item_id)?;
+            used_item_ids.insert(item_id.clone());
             item_ids.push(item_id);
         }
 
-        self.flush_pending_code_cell_starts()?;
         Ok(item_ids)
     }
 
@@ -288,14 +403,29 @@ impl TraceReducer {
         compaction_id: &CompactionId,
         checkpoint_payload: &RawPayloadRef,
     ) -> Result<ReducedCompactionCheckpoint> {
-        let payload = self.read_payload_json(checkpoint_payload)?;
-        let input_history = required_array(&payload, "input_history", checkpoint_payload)?;
-        let replacement_history =
-            required_array(&payload, "replacement_history", checkpoint_payload)?;
-
-        let input_items = normalize::normalize_model_items(input_history, checkpoint_payload)?;
-        let replacement_items =
-            normalize::normalize_model_items(replacement_history, checkpoint_payload)?;
+        let (input_items, replacement_items) = if checkpoint_payload.capture.is_complete() {
+            let ObservedJson {
+                value: payload,
+                missing,
+            } = self.payload_reader.observed_json(checkpoint_payload)?;
+            let input = required_array(&payload, "input_history", checkpoint_payload)?;
+            let replacement = required_array(&payload, "replacement_history", checkpoint_payload)?;
+            (
+                normalize::normalize_model_items(
+                    input,
+                    checkpoint_payload,
+                    &missing["input_history"],
+                )?,
+                normalize::normalize_model_items(
+                    replacement,
+                    checkpoint_payload,
+                    &missing["replacement_history"],
+                )?,
+            )
+        } else {
+            // The install event still establishes a compaction boundary.
+            (Vec::new(), Vec::new())
+        };
         let input_candidates = self
             .thread_conversation_snapshots
             .get(thread_id)
@@ -319,9 +449,12 @@ impl TraceReducer {
             Some(codex_turn_id.to_string()),
             wall_time_unix_ms,
             NormalizedConversationItem {
+                structured_output_hash: None,
+                responses_item_id: None,
                 role: ConversationRole::Assistant,
                 channel: None,
                 kind: ConversationItemKind::CompactionMarker,
+                agent_message: None,
                 // The summary is a separate model/provider-visible item. Keep the marker body
                 // empty so transcript renderers cannot mistake the boundary for prompt content.
                 body: ConversationBody { parts: Vec::new() },
@@ -360,14 +493,15 @@ impl TraceReducer {
         &mut self,
         items: Vec<NormalizedConversationItem>,
         context: DetachedReconcileItems<'_>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ConversationItemId>> {
         let mut item_ids = Vec::with_capacity(items.len());
+        let mut used_item_ids = HashSet::with_capacity(items.len());
 
         for item in items {
             let tool_link_item = item.clone();
             self.ensure_call_id_consistency(context.thread_id, &item)?;
             let item_id = self
-                .find_matching_snapshot_item(&context.candidates, &item_ids, &item)
+                .find_matching_snapshot_item(&context.candidates, &used_item_ids, &item)
                 .unwrap_or_else(|| {
                     self.create_conversation_item(
                         context.thread_id,
@@ -393,10 +527,10 @@ impl TraceReducer {
                 &tool_link_item.kind,
             )?;
             self.resolve_pending_agent_edges_for_item(&item_id)?;
+            used_item_ids.insert(item_id.clone());
             item_ids.push(item_id);
         }
 
-        self.flush_pending_code_cell_starts()?;
         Ok(item_ids)
     }
 
@@ -407,18 +541,40 @@ impl TraceReducer {
         first_seen_at_unix_ms: i64,
         item: NormalizedConversationItem,
         produced_by: Vec<ProducerRef>,
-    ) -> String {
+    ) -> ConversationItemId {
+        // A request or checkpoint can contain a trimmed version of an accepted item.
+        // Reuse its graph ID and retain the representation actually seen by the model.
+        if item.is_delivery_or_tool_output()
+            && let Some(wire_id) = &item.responses_item_id
+        {
+            let key = (
+                thread_id.to_owned(),
+                ResponseItemId::from_server(wire_id.clone()),
+            );
+            if let Some(receipt) = self.receivable_ids.get(&key)
+                && receipt.awaiting_snapshot
+            {
+                return receipt.item_id.clone();
+            }
+        }
         let item_id = self.next_conversation_item_id();
+        if let Some(hash) = item.structured_output_hash {
+            self.structured_output_hashes.insert(item_id.clone(), hash);
+        }
         self.rollout.conversation_items.insert(
             item_id.clone(),
             ConversationItem {
                 item_id: item_id.clone(),
+                responses_item_id: item.responses_item_id,
+                accepted_at_unix_ms: None,
+                accepted_seq: None,
                 thread_id: thread_id.to_string(),
                 codex_turn_id,
                 first_seen_at_unix_ms,
                 role: item.role,
                 channel: item.channel,
                 kind: item.kind,
+                agent_message: item.agent_message,
                 body: item.body,
                 call_id: item.call_id,
                 produced_by,
@@ -429,7 +585,7 @@ impl TraceReducer {
 
     fn update_conversation_item_from_sighting(
         &mut self,
-        item_id: &str,
+        item_id: &ConversationItemId,
         normalized: &NormalizedConversationItem,
         produced_by: &[ProducerRef],
     ) -> Result<()> {
@@ -437,8 +593,41 @@ impl TraceReducer {
             bail!("conversation item {item_id} was referenced before it was created");
         };
 
+        if item.responses_item_id.is_none() {
+            item.responses_item_id
+                .clone_from(&normalized.responses_item_id);
+        }
         if item.kind == ConversationItemKind::Reasoning {
             merge_reasoning_body(&mut item.body, &normalized.body)?;
+        }
+        // Replace the accepted body on its first snapshot only. Later snapshots may reference
+        // the same content through a different raw payload.
+        if normalized.is_delivery_or_tool_output()
+            && let Some(wire_id) = &normalized.responses_item_id
+        {
+            let key = (
+                item.thread_id.clone(),
+                ResponseItemId::from_server(wire_id.clone()),
+            );
+            let receipt = self
+                .receivable_ids
+                .entry(key)
+                .or_insert_with(|| super::ReceivableItem {
+                    item_id: item_id.clone(),
+                    awaiting_snapshot: false,
+                });
+            if receipt.awaiting_snapshot && &receipt.item_id == item_id {
+                receipt.awaiting_snapshot = false;
+                item.body.clone_from(&normalized.body);
+                if let Some(hash) = normalized.structured_output_hash {
+                    self.structured_output_hashes.insert(item_id.clone(), hash);
+                } else {
+                    self.structured_output_hashes.remove(item_id);
+                }
+                if normalized.agent_message.is_none() {
+                    self.snapshot_output_anchors.insert(item_id.clone());
+                }
+            }
         }
         for producer in produced_by {
             if !item.produced_by.contains(producer) {
@@ -451,12 +640,30 @@ impl TraceReducer {
     fn append_thread_conversation_items(
         &mut self,
         thread_id: &str,
-        item_ids: &[String],
+        item_ids: &[ConversationItemId],
     ) -> Result<()> {
-        let thread = self.thread_mut(thread_id)?;
-        for item_id in item_ids {
-            if !thread.conversation_item_ids.contains(item_id) {
-                thread.conversation_item_ids.push(item_id.clone());
+        let history = &mut self
+            .rollout
+            .threads
+            .get_mut(thread_id)
+            .context("unknown thread")?
+            .conversation_item_ids;
+        let mut new_prefix = history.len();
+        for id in item_ids {
+            if self.snapshot_output_anchors.remove(id) {
+                // This output already has its acceptance position. Insert any newly exposed
+                // context immediately before it, preserving deliveries recorded in between.
+                if new_prefix < history.len() {
+                    let prefix = history.split_off(new_prefix);
+                    let anchor = history
+                        .iter()
+                        .position(|known| known == id)
+                        .context("missing accepted output")?;
+                    history.splice(anchor..anchor, prefix);
+                }
+                new_prefix = history.len();
+            } else if !history.contains(id) {
+                history.push(id.clone());
             }
         }
         Ok(())
@@ -464,14 +671,14 @@ impl TraceReducer {
 
     fn find_matching_snapshot_item(
         &self,
-        previous_snapshot: &[String],
-        used_item_ids: &[String],
+        previous_snapshot: &[ConversationItemId],
+        used_item_ids: &HashSet<ConversationItemId>,
         normalized: &NormalizedConversationItem,
-    ) -> Option<String> {
+    ) -> Option<ConversationItemId> {
         previous_snapshot
             .iter()
             .find(|item_id| {
-                !used_item_ids.contains(item_id) && self.item_matches(item_id, normalized)
+                !used_item_ids.contains(*item_id) && self.item_matches(item_id, normalized)
             })
             .cloned()
     }
@@ -481,6 +688,15 @@ impl TraceReducer {
         thread_id: &str,
         normalized: &NormalizedConversationItem,
     ) -> Result<()> {
+        // One call can emit several outputs, and history trimming can rewrite
+        // them. Keep distinct outputs as separate items; only the invocation
+        // itself must remain consistent.
+        if !matches!(
+            normalized.kind,
+            ConversationItemKind::FunctionCall | ConversationItemKind::CustomToolCall
+        ) {
+            return Ok(());
+        }
         let Some(call_id) = normalized.call_id.as_deref() else {
             return Ok(());
         };
@@ -496,17 +712,31 @@ impl TraceReducer {
         Ok(())
     }
 
-    fn item_matches(&self, item_id: &str, normalized: &NormalizedConversationItem) -> bool {
+    fn item_matches(
+        &self,
+        item_id: &ConversationItemId,
+        normalized: &NormalizedConversationItem,
+    ) -> bool {
         let Some(item) = self.rollout.conversation_items.get(item_id) else {
             return false;
         };
+        if let (Some(existing), Some(incoming)) =
+            (&item.responses_item_id, &normalized.responses_item_id)
+            && existing != incoming
+        {
+            return false;
+        }
+        let existing_hash = self.structured_output_hashes.get(item_id);
+        if existing_hash.is_some() || normalized.structured_output_hash.is_some() {
+            return existing_hash == normalized.structured_output_hash.as_ref();
+        }
         conversation_item_matches(item, normalized)
     }
 
-    fn next_conversation_item_id(&mut self) -> String {
+    fn next_conversation_item_id(&mut self) -> ConversationItemId {
         let ordinal = self.next_conversation_item_ordinal;
         self.next_conversation_item_ordinal += 1;
-        format!("conversation_item:{ordinal}")
+        ConversationItemId::from_ordinal(ordinal)
     }
 }
 
@@ -514,10 +744,10 @@ impl TraceReducer {
 enum ReconcileMode {
     /// Full model requests are authoritative snapshots of the live context. The
     /// prompt builder can reorder already-observed items or replace history
-    /// with synthetic summary messages, so item identity is "same content,
-    /// reused at most once in this snapshot" rather than "same position only".
+    /// with synthetic summary messages. Reuse matching content at most once
+    /// per snapshot, respecting supplied item IDs without requiring the same position.
     FullSnapshot,
-    /// Incremental request deltas and response outputs append to a known prefix.
+    /// Incremental request deltas append to a known prefix.
     /// A mismatch at an occupied position means our reconstructed prefix is
     /// wrong and should fail replay.
     AppendOnly,
@@ -530,7 +760,7 @@ struct ReconcileItems<'a> {
     produced_by: Vec<ProducerRef>,
     start_index: usize,
     mode: ReconcileMode,
-    snapshot_override: Option<&'a [String]>,
+    snapshot_override: Option<&'a [ConversationItemId]>,
 }
 
 struct DetachedReconcileItems<'a> {
@@ -538,7 +768,7 @@ struct DetachedReconcileItems<'a> {
     codex_turn_id: &'a str,
     wall_time_unix_ms: i64,
     produced_by: Vec<ProducerRef>,
-    candidates: Vec<String>,
+    candidates: Vec<ConversationItemId>,
 }
 
 /// Conversation ids produced when a compaction checkpoint is installed.
@@ -546,9 +776,9 @@ struct DetachedReconcileItems<'a> {
 /// The marker item records the boundary, while replacement items are the live
 /// history that subsequent full requests should treat as their baseline.
 pub(super) struct ReducedCompactionCheckpoint {
-    pub(super) input_item_ids: Vec<String>,
-    pub(super) marker_item_id: String,
-    pub(super) replacement_item_ids: Vec<String>,
+    pub(super) input_item_ids: Vec<ConversationItemId>,
+    pub(super) marker_item_id: ConversationItemId,
+    pub(super) replacement_item_ids: Vec<ConversationItemId>,
 }
 
 fn required_array<'a>(
@@ -579,6 +809,7 @@ fn conversation_item_matches(
     item.role == normalized.role
         && item.channel == normalized.channel
         && item.kind == normalized.kind
+        && item.agent_message == normalized.agent_message
         && body_matches
         && item.call_id == normalized.call_id
 }
@@ -600,6 +831,16 @@ fn conversation_body_matches(left: &ConversationBody, right: &ConversationBody) 
                         raw_payload_id: _,
                     },
                 ) => left_summary == right_summary,
+                (
+                    ConversationPart::PayloadRef {
+                        content_sha256: Some(left_hash),
+                        ..
+                    },
+                    ConversationPart::PayloadRef {
+                        content_sha256: Some(right_hash),
+                        ..
+                    },
+                ) => left_hash == right_hash,
                 _ => left == right,
             })
 }

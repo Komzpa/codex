@@ -6,7 +6,7 @@ import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 export type PluginInterface = { displayName: string | null, shortDescription: string | null, longDescription: string | null, developerName: string | null, category: string | null, capabilities: Array<string>, websiteUrl: string | null, privacyPolicyUrl: string | null, termsOfServiceUrl: string | null,
 /**
  * Starter prompts for the plugin. Capped at 3 entries with a maximum of
- * 128 characters per entry.
+ * 512 characters per entry.
  */
 defaultPrompt: Array<string> | null, brandColor: string | null,
 /**
@@ -22,9 +22,17 @@ composerIconUrl: string | null,
  */
 logo: AbsolutePathBuf | null,
 /**
+ * Local dark-mode logo path, resolved from the installed plugin package.
+ */
+logoDark: AbsolutePathBuf | null,
+/**
  * Remote logo URL from the plugin catalog.
  */
 logoUrl: string | null,
+/**
+ * Remote dark-mode logo URL from the plugin catalog.
+ */
+logoUrlDark: string | null,
 /**
  * Local screenshot paths, resolved from the installed plugin package.
  */

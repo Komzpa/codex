@@ -7,15 +7,15 @@ expression: "render_lines(&view, 72)"
   Select which items to display in the status line.                     
                                                                         
   Type to search                                                        
-  >                                                                     
+                                                                        
 › [x] Use theme colors      Apply colors from the active /theme         
   ───────────────────────                                               
   [x] model                 Current model name                          
   [x] current-dir           Current working directory                   
-  [x] git-branch            Current Git branch (omitted when unavaila…  
+  [x] git-branch            Current Git branch (omitted when unavailabl…
   [ ] model-with-reasoning  Current model name with reasoning level     
+  [ ] reasoning             Current reasoning level                     
   [ ] project-name          Project name (omitted when unavailable)     
-  [ ] run-state             Compact session run-state text (Ready, Wo…  
-                                                                        
+↓                                                                       
   gpt-5-codex · ~/codex-rs · jif/statusline-preview                     
-  Use ↑↓ to navigate, ←→ to move, space to select, enter to confirm, esc
+  space toggle · ←/→ reorder · enter save · esc cancel

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
 use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -44,15 +44,17 @@ shell_snapshot = false
     )
 }
 
-async fn initialized_mcp(codex_home: &TempDir) -> Result<McpProcess> {
+async fn initialized_mcp(codex_home: &TempDir) -> Result<TestAppServer> {
     create_config_toml(codex_home.path())?;
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    Ok(mcp)
+    TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await
 }
 
 async fn wait_for_session_updated(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     session_id: &str,
     query: &str,
     file_expectation: FileExpectation,
@@ -99,7 +101,7 @@ async fn wait_for_session_updated(
 }
 
 async fn wait_for_session_completed(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     session_id: &str,
 ) -> Result<FuzzyFileSearchSessionCompletedNotification> {
     let description = format!("session completion for sessionId={session_id}");
@@ -140,7 +142,7 @@ async fn wait_for_session_completed(
 }
 
 async fn assert_update_request_fails_for_missing_session(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     session_id: &str,
     query: &str,
 ) -> Result<()> {
@@ -161,7 +163,7 @@ async fn assert_update_request_fails_for_missing_session(
 }
 
 async fn assert_no_session_updates_for(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     session_id: &str,
     grace_period: std::time::Duration,
     duration: std::time::Duration,
@@ -226,7 +228,7 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
     std::fs::write(root.path().join("abcde"), "x")?;
     std::fs::write(root.path().join("abexy"), "x")?;
     std::fs::write(root.path().join("zzz.txt"), "x")?;
-    let sub_dir = root.path().join("sub");
+    let sub_dir = root.path().join("👩‍💻");
     std::fs::create_dir_all(&sub_dir)?;
     let sub_abce_path = sub_dir.join("abce");
     std::fs::write(&sub_abce_path, "x")?;
@@ -236,8 +238,11 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
         .to_string();
 
     // Start MCP server and initialize.
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let root_path = root.path().to_string_lossy().to_string();
     // Send fuzzyFileSearch request.
@@ -257,7 +262,8 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
     .await??;
 
     let value = resp.result;
-    let expected_score = 72;
+    // Each basename matches, so its score includes one filename priority bonus.
+    let filename_bonus = u32::from(u16::MAX) + 1;
 
     assert_eq!(
         value,
@@ -268,7 +274,7 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
                     "path": "abexy",
                     "match_type": "file",
                     "file_name": "abexy",
-                    "score": 84,
+                    "score": filename_bonus + 84,
                     "indices": [0, 1, 2],
                 },
                 {
@@ -276,15 +282,15 @@ async fn test_fuzzy_file_search_sorts_and_includes_indices() -> Result<()> {
                     "path": sub_abce_rel,
                     "match_type": "file",
                     "file_name": "abce",
-                    "score": expected_score,
-                    "indices": [4, 5, 7],
+                    "score": filename_bonus + 72,
+                    "indices": [2, 3, 5],
                 },
                 {
                     "root": root_path.clone(),
                     "path": "abcde",
                     "match_type": "file",
                     "file_name": "abcde",
-                    "score": 71,
+                    "score": filename_bonus + 71,
                     "indices": [0, 1, 4],
                 },
             ]
@@ -302,8 +308,11 @@ async fn test_fuzzy_file_search_accepts_cancellation_token() -> Result<()> {
 
     std::fs::write(root.path().join("alpha.txt"), "contents")?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let root_path = root.path().to_string_lossy().to_string();
     let request_id = mcp
@@ -347,7 +356,7 @@ async fn test_fuzzy_file_search_accepts_cancellation_token() -> Result<()> {
 async fn test_fuzzy_file_search_session_streams_updates() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;
-    std::fs::write(root.path().join("alpha.txt"), "contents")?;
+    std::fs::write(root.path().join("👩‍💻alpha.txt"), "contents")?;
     let mut mcp = initialized_mcp(&codex_home).await?;
 
     let root_path = root.path().to_string_lossy().to_string();
@@ -362,7 +371,8 @@ async fn test_fuzzy_file_search_session_streams_updates() -> Result<()> {
         wait_for_session_updated(&mut mcp, session_id, "alp", FileExpectation::NonEmpty).await?;
     assert_eq!(payload.files.len(), 1);
     assert_eq!(payload.files[0].root, root_path);
-    assert_eq!(payload.files[0].path, "alpha.txt");
+    assert_eq!(payload.files[0].path, "👩‍💻alpha.txt");
+    assert_eq!(payload.files[0].indices, Some(vec![1, 2, 3]));
     let completed = wait_for_session_completed(&mut mcp, session_id).await?;
     assert_eq!(completed.session_id, session_id);
 

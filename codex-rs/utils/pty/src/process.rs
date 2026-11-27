@@ -2,9 +2,10 @@ use core::fmt;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::RawFd;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
 
 use anyhow::anyhow;
 use portable_pty::MasterPty;
@@ -17,7 +18,39 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessSignal {
+    Interrupt,
+}
+
+pub(crate) fn unsupported_signal(signal: ProcessSignal) -> io::Error {
+    match signal {
+        ProcessSignal::Interrupt => io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process interrupt is not supported by this process backend",
+        ),
+    }
+}
+
+pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    -1
+}
+
 pub(crate) trait ChildTerminator: Send + Sync {
+    fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
+
     fn kill(&mut self) -> io::Result<()>;
 }
 
@@ -78,12 +111,11 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 pub struct ProcessHandle {
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
-    reader_handle: StdMutex<Option<JoinHandle<()>>>,
-    reader_abort_handles: StdMutex<Vec<AbortHandle>>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
     wait_handle: StdMutex<Option<JoinHandle<()>>>,
-    exit_status: Arc<AtomicBool>,
-    exit_code: Arc<StdMutex<Option<i32>>>,
+    exit_code: Arc<OnceLock<i32>>,
     // PtyHandles must be preserved because the process will receive Control+C if the
     // slave is closed
     _pty_handles: StdMutex<Option<PtyHandles>>,
@@ -103,27 +135,33 @@ impl ProcessHandle {
     pub(crate) fn new(
         writer_tx: mpsc::Sender<Vec<u8>>,
         killer: Box<dyn ChildTerminator>,
-        reader_handle: JoinHandle<()>,
-        reader_abort_handles: Vec<AbortHandle>,
+        stdout_reader: Option<JoinHandle<()>>,
+        stderr_reader: Option<JoinHandle<()>>,
         writer_handle: JoinHandle<()>,
         wait_handle: JoinHandle<()>,
-        exit_status: Arc<AtomicBool>,
-        exit_code: Arc<StdMutex<Option<i32>>>,
+        exit_code: Arc<OnceLock<i32>>,
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
-            reader_handle: StdMutex::new(Some(reader_handle)),
-            reader_abort_handles: StdMutex::new(reader_abort_handles),
+            stdout_reader,
+            stderr_reader,
             writer_handle: StdMutex::new(Some(writer_handle)),
             wait_handle: StdMutex::new(Some(wait_handle)),
-            exit_status,
             exit_code,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
         }
+    }
+
+    pub fn stdout_reader(&self) -> Option<AbortHandle> {
+        self.stdout_reader.as_ref().map(JoinHandle::abort_handle)
+    }
+
+    pub fn stderr_reader(&self) -> Option<AbortHandle> {
+        self.stderr_reader.as_ref().map(JoinHandle::abort_handle)
     }
 
     /// Returns a channel sender for writing raw bytes to the child stdin.
@@ -139,14 +177,14 @@ impl ProcessHandle {
         writer_tx
     }
 
-    /// True if the child process has exited.
+    /// Once this returns true, the exit code is available.
     pub fn has_exited(&self) -> bool {
-        self.exit_status.load(std::sync::atomic::Ordering::SeqCst)
+        self.exit_code.get().is_some()
     }
 
     /// Returns the exit code if known.
     pub fn exit_code(&self) -> Option<i32> {
-        self.exit_code.lock().ok().and_then(|guard| *guard)
+        self.exit_code.get().copied()
     }
 
     /// Resize the PTY in character cells.
@@ -193,19 +231,31 @@ impl ProcessHandle {
         }
     }
 
-    /// Attempts to kill the child and abort helper tasks.
+    pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
+        let Ok(mut killer_opt) = self.killer.lock() else {
+            return Ok(());
+        };
+        let Some(killer) = killer_opt.as_mut() else {
+            return Ok(());
+        };
+
+        let result = killer.signal(signal);
+        #[cfg(windows)]
+        if result.is_ok() {
+            killer_opt.take();
+        }
+        result
+    }
+
+    /// Attempts to kill the child and abort I/O helper tasks.
     pub fn terminate(&self) {
         self.request_terminate();
 
-        if let Ok(mut h) = self.reader_handle.lock()
-            && let Some(handle) = h.take()
+        for reader in [&self.stdout_reader, &self.stderr_reader]
+            .into_iter()
+            .flatten()
         {
-            handle.abort();
-        }
-        if let Ok(mut handles) = self.reader_abort_handles.lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
+            reader.abort();
         }
         if let Ok(mut h) = self.writer_handle.lock()
             && let Some(handle) = h.take()
@@ -215,7 +265,8 @@ impl ProcessHandle {
         if let Ok(mut h) = self.wait_handle.lock()
             && let Some(handle) = h.take()
         {
-            handle.abort();
+            // Even a queued PTY waiter must run to reap the terminated child.
+            drop(handle);
         }
     }
 }
@@ -229,9 +280,20 @@ impl Drop for ProcessHandle {
 /// Adapts a closure into a `ChildTerminator` implementation.
 struct ClosureTerminator {
     inner: Option<Box<dyn FnMut() + Send + Sync>>,
+    #[cfg(windows)]
+    interrupt_terminates: bool,
 }
 
 impl ChildTerminator for ClosureTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
+        #[cfg(windows)]
+        if self.interrupt_terminates {
+            return self.kill();
+        }
+
+        Err(unsupported_signal(signal))
+    }
+
     fn kill(&mut self) -> io::Result<()> {
         if let Some(inner) = self.inner.as_mut() {
             (inner)();
@@ -308,6 +370,9 @@ pub struct ProcessDriver {
     pub terminator: Option<Box<dyn FnMut() + Send + Sync>>,
     pub writer_handle: Option<JoinHandle<()>>,
     pub resizer: Option<ResizeFn>,
+    /// Whether this Windows process is attached to a pseudo-console.
+    #[cfg(windows)]
+    pub tty: bool,
 }
 
 /// Build a `SpawnedProcess` from a driver that supplies stdin/output/exit channels.
@@ -320,7 +385,12 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         terminator,
         writer_handle,
         resizer,
+        #[cfg(windows)]
+        tty,
     } = driver;
+
+    #[cfg(windows)]
+    let interrupt_terminates = terminator.is_some() && !tty;
 
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -369,31 +439,26 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let writer_handle = writer_handle.unwrap_or_else(|| tokio::spawn(async {}));
 
     let (exit_tx, exit_rx_out) = oneshot::channel::<i32>();
-    let exit_status = Arc::new(AtomicBool::new(false));
-    let wait_exit_status = Arc::clone(&exit_status);
-    let exit_code = Arc::new(StdMutex::new(None));
+    let exit_code = Arc::new(OnceLock::new());
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle = tokio::spawn(async move {
         let code = exit_rx.await.unwrap_or(-1);
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = wait_exit_code.lock() {
-            *guard = Some(code);
-        }
+        let _ = wait_exit_code.set(code);
         let _ = exit_seen_tx.send(true);
         let _ = exit_tx.send(code);
     });
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(ClosureTerminator { inner: terminator }),
-        reader_handle,
-        stderr_reader_handle
-            .map(|handle| handle.abort_handle())
-            .into_iter()
-            .collect(),
+        Box::new(ClosureTerminator {
+            inner: terminator,
+            #[cfg(windows)]
+            interrupt_terminates,
+        }),
+        Some(reader_handle),
+        stderr_reader_handle,
         writer_handle,
         wait_handle,
-        exit_status,
         exit_code,
         /*pty_handles*/ None,
         resizer,

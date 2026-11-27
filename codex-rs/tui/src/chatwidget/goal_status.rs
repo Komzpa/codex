@@ -50,6 +50,8 @@ pub(super) fn goal_status_indicator_from_app_goal(
             usage: active_goal_usage(goal.token_budget, goal.tokens_used, goal.time_used_seconds),
         }),
         AppThreadGoalStatus::Paused => Some(GoalStatusIndicator::Paused),
+        AppThreadGoalStatus::Blocked => Some(GoalStatusIndicator::Blocked),
+        AppThreadGoalStatus::UsageLimited => Some(GoalStatusIndicator::UsageLimited),
         AppThreadGoalStatus::BudgetLimited => Some(GoalStatusIndicator::BudgetLimited {
             usage: stopped_goal_budget_usage(goal.token_budget, goal.tokens_used),
         }),
@@ -219,6 +221,10 @@ mod tests {
                 time_used_seconds,
                 created_at: 1,
                 updated_at: 1,
+                timezone: None,
+                stages: Vec::new(),
+                initial_quota_snapshots: Vec::new(),
+                initial_token_budget: None,
             },
             observed_at,
         )

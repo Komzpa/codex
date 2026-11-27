@@ -1,6 +1,7 @@
 use crate::metrics::Result;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
+use codex_utils_string::sanitize_metric_tag_value;
 
 pub const APP_VERSION_TAG: &str = "app.version";
 pub const AUTH_MODE_TAG: &str = "auth_mode";
@@ -8,6 +9,31 @@ pub const MODEL_TAG: &str = "model";
 pub const ORIGINATOR_TAG: &str = "originator";
 pub const SERVICE_NAME_TAG: &str = "service_name";
 pub const SESSION_SOURCE_TAG: &str = "session_source";
+
+const OTHER_ORIGINATOR_TAG_VALUE: &str = "other";
+const KNOWN_ORIGINATOR_TAG_VALUES: &[&str] = &[
+    "codex_desktop",
+    "codex-app-server",
+    "codex_mcp_server",
+    "codex_cli_rs",
+    "codex-tui",
+    "codex_vscode",
+    "none",
+    "codex_exec",
+    "codex-cli",
+    "codex_sdk_ts",
+    "codex-app-server-sdk",
+];
+
+/// Return a known low-cardinality originator tag value, or `other`.
+pub fn bounded_originator_tag_value(originator: &str) -> &'static str {
+    let sanitized = sanitize_metric_tag_value(originator);
+    KNOWN_ORIGINATOR_TAG_VALUES
+        .iter()
+        .copied()
+        .find(|known| *known == sanitized.as_str())
+        .unwrap_or(OTHER_ORIGINATOR_TAG_VALUE)
+}
 
 pub struct SessionMetricTagValues<'a> {
     pub auth_mode: Option<&'a str>,
@@ -58,28 +84,30 @@ mod tests {
 
     #[test]
     fn session_metric_tags_include_expected_tags_in_order() {
-        let tags = SessionMetricTagValues {
-            auth_mode: Some("api_key"),
-            session_source: "cli",
-            originator: "codex_cli",
-            service_name: Some("desktop_app"),
-            model: "gpt-5.1",
-            app_version: "1.2.3",
-        }
-        .into_tags()
-        .expect("tags");
+        for app_version in ["1.2.3", "0.164.0-alpha.1+internal"] {
+            let tags = SessionMetricTagValues {
+                auth_mode: Some("api_key"),
+                session_source: "cli",
+                originator: "codex_cli",
+                service_name: Some("desktop_app"),
+                model: "gpt-5.1",
+                app_version,
+            }
+            .into_tags()
+            .expect("tags");
 
-        assert_eq!(
-            tags,
-            vec![
-                (AUTH_MODE_TAG, "api_key"),
-                (SESSION_SOURCE_TAG, "cli"),
-                (ORIGINATOR_TAG, "codex_cli"),
-                (SERVICE_NAME_TAG, "desktop_app"),
-                (MODEL_TAG, "gpt-5.1"),
-                (APP_VERSION_TAG, "1.2.3"),
-            ]
-        );
+            assert_eq!(
+                tags,
+                vec![
+                    (AUTH_MODE_TAG, "api_key"),
+                    (SESSION_SOURCE_TAG, "cli"),
+                    (ORIGINATOR_TAG, "codex_cli"),
+                    (SERVICE_NAME_TAG, "desktop_app"),
+                    (MODEL_TAG, "gpt-5.1"),
+                    (APP_VERSION_TAG, app_version),
+                ]
+            );
+        }
     }
 
     #[test]

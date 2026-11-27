@@ -1,0 +1,112 @@
+//! Turn lifecycle inputs and scheduling phases for host-owned contributors.
+
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnAbortReason;
+
+use crate::ExtensionData;
+
+/// Runs before task registration or during cancellable regular-task startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnStartPhase {
+    BeforeTaskRegistration,
+    RegularTaskStart,
+}
+
+/// Input supplied when the host starts a turn.
+pub struct TurnStartInput<'a> {
+    /// Stable host-owned turn identifier.
+    pub turn_id: &'a str,
+    /// Effective collaboration mode for this turn.
+    pub collaboration_mode: &'a CollaborationMode,
+    /// Total token usage snapshot captured when the turn started.
+    /// Present before task registration; absent during regular-task preparation.
+    /// Token-accounting contributors must remain in `BeforeTaskRegistration`.
+    pub token_usage_at_turn_start: Option<&'a TokenUsage>,
+    /// Store scoped to the host session runtime.
+    pub session_store: &'a ExtensionData,
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+}
+
+/// Inputs for refreshing catalogs before a model step.
+#[derive(Clone, Copy)]
+pub struct CatalogRefreshInput<'a> {
+    pub turn_id: &'a str,
+    pub session_store: &'a ExtensionData,
+    pub thread_store: &'a ExtensionData,
+    pub turn_store: &'a ExtensionData,
+}
+
+/// Inputs for explicit cloud discovery, including before a thread has any turns.
+#[derive(Clone, Copy)]
+pub struct CloudCatalogRefreshInput<'a> {
+    pub session_store: &'a ExtensionData,
+    pub thread_store: &'a ExtensionData,
+}
+
+impl<'a> From<CatalogRefreshInput<'a>> for CloudCatalogRefreshInput<'a> {
+    fn from(input: CatalogRefreshInput<'a>) -> Self {
+        Self {
+            session_store: input.session_store,
+            thread_store: input.thread_store,
+        }
+    }
+}
+
+/// Result of explicit discovery and its effect on the thread's MCP servers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudCatalogRefreshOutcome {
+    pub result: Result<(), String>,
+    /// Also true when discovery failed after clearing a stale plugin catalog.
+    pub needs_mcp_refresh: bool,
+}
+
+impl CloudCatalogRefreshOutcome {
+    pub const UNCHANGED: Self = Self {
+        result: Ok(()),
+        needs_mcp_refresh: false,
+    };
+}
+
+/// Input supplied when the host completes a turn.
+pub struct TurnStopInput<'a> {
+    /// Store scoped to the host session runtime.
+    pub session_store: &'a ExtensionData,
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+}
+
+/// Input supplied when the host aborts a turn.
+pub struct TurnAbortInput<'a> {
+    /// Reason the host aborted the turn.
+    pub reason: TurnAbortReason,
+    /// Store scoped to the host session runtime.
+    pub session_store: &'a ExtensionData,
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+}
+
+/// Input supplied when the host observes an error for a turn.
+pub struct TurnErrorInput<'a> {
+    /// Stable host-owned turn identifier.
+    pub turn_id: &'a str,
+    /// Error surfaced by the host for this turn.
+    pub error: CodexErrorInfo,
+    /// Original error details, including backend metadata omitted from the public category.
+    pub error_details: &'a CodexErrorDetails,
+    /// Store scoped to the host session runtime.
+    pub session_store: &'a ExtensionData,
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// Store scoped to this turn runtime.
+    pub turn_store: &'a ExtensionData,
+}

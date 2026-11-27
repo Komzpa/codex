@@ -17,7 +17,7 @@ if [[ -n "${APT_INSTALL_ARGS:-}" ]]; then
 fi
 
 sudo apt-get update "${apt_update_args[@]}"
-sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils
+sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils perl make
 
 case "${TARGET}" in
   x86_64-unknown-linux-musl)
@@ -35,7 +35,8 @@ esac
 libcap_version="2.75"
 libcap_sha256="de4e7e064c9ba451d5234dd46e897d7c71c96a9ebf9a0c445bc04f4742d83632"
 libcap_tarball_name="libcap-${libcap_version}.tar.xz"
-libcap_download_url="https://mirrors.edge.kernel.org/pub/linux/libs/security/linux-privs/libcap2/${libcap_tarball_name}"
+libcap_download_url="https://github.com/openai/codex/releases/download/libcap-v${libcap_version}/${libcap_tarball_name}"
+libcap_debian_url="https://deb.debian.org/debian/pool/main/libc/libcap2/libcap2_${libcap_version}.orig.tar.xz"
 
 # Use the musl toolchain as the Rust linker to avoid Zig injecting its own CRT.
 if command -v "${arch}-linux-musl-gcc" >/dev/null; then
@@ -46,6 +47,8 @@ else
   echo "musl gcc not found after install; arch=${arch}" >&2
   exit 1
 fi
+
+OPENSSL_CC="${musl_linker}" bash "$(dirname "${BASH_SOURCE[0]}")/install-musl-openssl.sh"
 
 zig_target="${TARGET/-unknown-linux-musl/-linux-musl}"
 runner_temp="${RUNNER_TEMP:-/tmp}"
@@ -61,7 +64,9 @@ if [[ ! -f "${libcap_prefix}/lib/libcap.a" ]]; then
   mkdir -p "${libcap_src_root}" "${libcap_prefix}/lib" "${libcap_prefix}/include/sys" "${libcap_prefix}/include/linux" "${libcap_pkgconfig_dir}"
   libcap_tarball="${libcap_root}/${libcap_tarball_name}"
 
-  curl -fsSL "${libcap_download_url}" -o "${libcap_tarball}"
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 "${libcap_download_url}" -o "${libcap_tarball}"; then
+    curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 "${libcap_debian_url}" -o "${libcap_tarball}"
+  fi
   echo "${libcap_sha256}  ${libcap_tarball}" | sha256sum -c -
 
   tar -xJf "${libcap_tarball}" -C "${libcap_src_root}"
@@ -150,7 +155,9 @@ for arg in "\$@"; do
   args+=("\${arg}")
 done
 
-exec "${zig_bin}" cc -target "${zig_target}" "\${args[@]}"
+# Zig enables UBSan for debug C builds by default. Rust links these objects
+# without Zig's sanitizer runtime, so keep native dependencies uninstrumented.
+exec "${zig_bin}" cc -target "${zig_target}" "\${args[@]}" -fno-sanitize=undefined
 EOF
   cat >"${cxx}" <<EOF
 #!/usr/bin/env bash
@@ -207,7 +214,9 @@ for arg in "\$@"; do
   args+=("\${arg}")
 done
 
-exec "${zig_bin}" c++ -target "${zig_target}" "\${args[@]}"
+# Zig enables UBSan for debug C++ builds by default. Rust links these objects
+# without Zig's sanitizer runtime, so keep native dependencies uninstrumented.
+exec "${zig_bin}" c++ -target "${zig_target}" "\${args[@]}" -fno-sanitize=undefined
 EOF
   chmod +x "${cc}" "${cxx}"
 
@@ -252,6 +261,12 @@ target_cxx_var="CXX_${TARGET}"
 target_cxx_var="${target_cxx_var//-/_}"
 echo "${target_cxx_var}=${cxx}" >> "$GITHUB_ENV"
 
+# Fold identical code and pack relocations for x86-64 musl release packages.
+if [[ "${TARGET}" == "x86_64-unknown-linux-musl" && "${CODEX_MUSL_RELEASE_LINK_FLAGS:-}" == "1" ]]; then
+  link_flags=(-Cllvm-args=--addrsig -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--icf=safe,-z,pack-relative-relocs)
+  echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }${link_flags[*]}" >> "$GITHUB_ENV"
+fi
+
 cargo_linker_var="CARGO_TARGET_${TARGET^^}_LINKER"
 cargo_linker_var="${cargo_linker_var//-/_}"
 echo "${cargo_linker_var}=${musl_linker}" >> "$GITHUB_ENV"
@@ -270,6 +285,11 @@ echo "PKG_CONFIG_PATH=${pkg_config_path}" >> "$GITHUB_ENV"
 pkg_config_path_var="PKG_CONFIG_PATH_${TARGET}"
 pkg_config_path_var="${pkg_config_path_var//-/_}"
 echo "${pkg_config_path_var}=${libcap_pkgconfig_dir}" >> "$GITHUB_ENV"
+pkg_config_libdir_var="PKG_CONFIG_LIBDIR_${TARGET}"
+pkg_config_libdir_var="${pkg_config_libdir_var//-/_}"
+# Do not let musl cross-builds resolve native libraries from the host glibc
+# pkg-config directories. libcap is the only target package provided here.
+echo "${pkg_config_libdir_var}=${libcap_pkgconfig_dir}" >> "$GITHUB_ENV"
 
 if [[ -n "${sysroot}" && "${sysroot}" != "/" ]]; then
   echo "PKG_CONFIG_SYSROOT_DIR=${sysroot}" >> "$GITHUB_ENV"

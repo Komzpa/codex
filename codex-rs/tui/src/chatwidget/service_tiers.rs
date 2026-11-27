@@ -1,0 +1,159 @@
+//! Service-tier selection and model-catalog helpers for `ChatWidget`.
+
+use super::ChatWidget;
+use crate::app_command::AppCommand;
+use crate::app_event::AppEvent;
+use crate::app_server_session::ThreadSettingsOwner;
+use crate::bottom_pane::slash_commands::ServiceTierCommand;
+use crate::service_tier_resolution;
+use codex_features::Feature;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::openai_models::SPEED_TIER_FAST;
+
+impl ChatWidget {
+    pub(crate) fn set_service_tier(&mut self, service_tier: Option<String>) {
+        self.config.service_tier = service_tier;
+        self.refresh_effective_service_tier();
+        self.refresh_model_dependent_surfaces();
+    }
+
+    pub(crate) fn current_service_tier(&self) -> Option<&str> {
+        self.effective_service_tier.as_deref()
+    }
+
+    pub(crate) fn configured_service_tier(&self) -> Option<String> {
+        self.config.service_tier.clone()
+    }
+
+    pub(crate) fn service_tier_update_for_core(&self) -> Option<Option<String>> {
+        service_tier_resolution::service_tier_update_for_core(
+            &self.config,
+            &self.local_settings.notices,
+            self.current_model(),
+            &self.model_catalog.try_list_models().unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn fast_mode_enabled(&self) -> bool {
+        self.config.features.enabled(Feature::FastMode)
+    }
+
+    pub(crate) fn can_toggle_fast_mode_from_keybinding(&self) -> bool {
+        self.fast_mode_enabled()
+            && self.current_model_fast_service_tier().is_some()
+            && !self.is_user_turn_pending_or_running()
+            && self.bottom_pane.no_modal_or_popup_active()
+    }
+
+    pub(crate) fn toggle_fast_mode_from_ui(&mut self) {
+        let Some(fast_tier) = self.current_model_fast_service_tier() else {
+            return;
+        };
+        self.toggle_service_tier_from_ui(fast_tier);
+    }
+
+    pub(crate) fn toggle_service_tier_from_ui(&mut self, command: ServiceTierCommand) {
+        if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Server {
+            if let Some(thread_id) = self.thread_id {
+                self.app_event_tx.send(AppEvent::ToggleCloudServiceTier {
+                    thread_id,
+                    tier: command.id,
+                });
+            } else {
+                self.add_error_message(
+                    "Open the Cloud conversation before choosing a speed.".into(),
+                );
+            }
+            return;
+        }
+        let next_tier = if self.current_service_tier() == Some(command.id.as_str()) {
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+        } else {
+            Some(command.id)
+        };
+        self.set_service_tier_selection(next_tier);
+    }
+
+    pub(crate) fn sync_service_tier_commands(&mut self) {
+        let commands = self.current_model_service_tier_commands();
+        self.bottom_pane
+            .set_service_tier_commands_enabled(!commands.is_empty());
+        self.bottom_pane.set_service_tier_commands(commands);
+    }
+
+    pub(crate) fn current_model_service_tier_commands(&self) -> Vec<ServiceTierCommand> {
+        let pending_model = self
+            .thread_id
+            .and_then(|id| self.pending_cloud_turn_settings.as_ref()?.model(id));
+        let model = pending_model
+            .as_deref()
+            .unwrap_or_else(|| self.selected_model());
+        self.model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|preset| preset.model == model)
+                    .map(|preset| {
+                        preset
+                            .service_tiers
+                            .into_iter()
+                            .filter(|tier| self.config.features.service_tier_enabled(&tier.id))
+                            .map(|tier| ServiceTierCommand {
+                                id: tier.id,
+                                name: tier.name.to_lowercase(),
+                                description: tier.description,
+                            })
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_service_tier_selection(&mut self, service_tier: Option<String>) {
+        self.set_service_tier(service_tier.clone());
+        self.app_event_tx
+            .send(AppEvent::CodexOp(AppCommand::override_turn_context(
+                /*cwd*/ None,
+                /*approval_policy*/ None,
+                /*approvals_reviewer*/ None,
+                /*permission_profile*/ None,
+                /*active_permission_profile*/ None,
+                /*model*/ None,
+                /*effort*/ None,
+                /*summary*/ None,
+                Some(service_tier.clone()),
+                /*collaboration_mode*/ None,
+            )));
+        self.app_event_tx
+            .send(AppEvent::PersistServiceTierSelection { service_tier });
+    }
+
+    fn current_model_fast_service_tier(&self) -> Option<ServiceTierCommand> {
+        self.current_model_service_tier_commands()
+            .into_iter()
+            .find(|tier| tier.name.eq_ignore_ascii_case(SPEED_TIER_FAST))
+    }
+
+    pub(super) fn selected_model(&self) -> &str {
+        self.cloud_picker_selection.as_ref().map_or_else(
+            || self.current_model(),
+            |selection| selection.model.as_str(),
+        )
+    }
+
+    pub(super) fn refresh_effective_service_tier(&mut self) {
+        if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Server {
+            self.effective_service_tier
+                .clone_from(&self.config.service_tier);
+            return;
+        }
+        self.effective_service_tier = service_tier_resolution::effective_service_tier(
+            &self.config,
+            &self.local_settings.notices,
+            self.selected_model(),
+            &self.model_catalog.try_list_models().unwrap_or_default(),
+        );
+    }
+}

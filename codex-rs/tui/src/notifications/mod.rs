@@ -1,18 +1,17 @@
 mod bel;
-mod osc9;
+mod osc;
 
 use std::io;
 
+use crate::terminal_capabilities::NotificationCapabilities;
 use bel::BelBackend;
 use codex_config::types::NotificationMethod;
-use codex_terminal_detection::TerminalInfo;
-use codex_terminal_detection::TerminalName;
-use codex_terminal_detection::terminal_info;
-use osc9::Osc9Backend;
+use osc::OscBackend;
+use osc::OscProtocol;
 
 #[derive(Debug)]
 pub enum DesktopNotificationBackend {
-    Osc9(Osc9Backend),
+    Osc(OscBackend),
     Bel(BelBackend),
 }
 
@@ -20,27 +19,31 @@ impl DesktopNotificationBackend {
     pub fn for_method(method: NotificationMethod) -> Self {
         match method {
             NotificationMethod::Auto => {
-                if supports_osc9(&terminal_info()) {
-                    Self::Osc9(Osc9Backend::new())
+                if NotificationCapabilities::detect().osc9 {
+                    Self::Osc(OscBackend::new(OscProtocol::Osc9))
                 } else {
                     Self::Bel(BelBackend)
                 }
             }
-            NotificationMethod::Osc9 => Self::Osc9(Osc9Backend::new()),
+            NotificationMethod::Osc9 => Self::Osc(OscBackend::new(OscProtocol::Osc9)),
+            NotificationMethod::Osc777 => Self::Osc(OscBackend::new(OscProtocol::Osc777)),
             NotificationMethod::Bel => Self::Bel(BelBackend),
         }
     }
 
     pub fn method(&self) -> NotificationMethod {
         match self {
-            DesktopNotificationBackend::Osc9(_) => NotificationMethod::Osc9,
+            DesktopNotificationBackend::Osc(backend) => match backend.protocol {
+                OscProtocol::Osc9 => NotificationMethod::Osc9,
+                OscProtocol::Osc777 => NotificationMethod::Osc777,
+            },
             DesktopNotificationBackend::Bel(_) => NotificationMethod::Bel,
         }
     }
 
     pub fn notify(&mut self, message: &str) -> io::Result<()> {
         match self {
-            DesktopNotificationBackend::Osc9(backend) => backend.notify(message),
+            DesktopNotificationBackend::Osc(backend) => backend.notify(message),
             DesktopNotificationBackend::Bel(backend) => backend.notify(message),
         }
     }
@@ -50,21 +53,10 @@ pub fn detect_backend(method: NotificationMethod) -> DesktopNotificationBackend 
     DesktopNotificationBackend::for_method(method)
 }
 
-fn supports_osc9(terminal: &TerminalInfo) -> bool {
-    matches!(
-        terminal.name,
-        TerminalName::Ghostty
-            | TerminalName::Iterm2
-            | TerminalName::Kitty
-            | TerminalName::WarpTerminal
-            | TerminalName::WezTerm
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::detect_backend;
-    use super::supports_osc9;
+    use crate::terminal_capabilities::NotificationCapabilities;
     use codex_config::types::NotificationMethod;
     use codex_terminal_detection::TerminalInfo;
     use codex_terminal_detection::TerminalName;
@@ -72,6 +64,7 @@ mod tests {
 
     fn test_terminal(name: TerminalName) -> TerminalInfo {
         TerminalInfo {
+            backend: None,
             name,
             term_program: None,
             version: None,
@@ -81,34 +74,27 @@ mod tests {
     }
 
     #[test]
-    fn selects_osc9_method() {
-        assert!(matches!(
-            detect_backend(NotificationMethod::Osc9),
-            super::DesktopNotificationBackend::Osc9(_)
-        ));
-    }
-
-    #[test]
-    fn selects_bel_method() {
-        assert!(matches!(
-            detect_backend(NotificationMethod::Bel),
-            super::DesktopNotificationBackend::Bel(_)
-        ));
+    fn selects_explicit_notification_method() {
+        for method in [
+            NotificationMethod::Osc9,
+            NotificationMethod::Osc777,
+            NotificationMethod::Bel,
+        ] {
+            assert_eq!(detect_backend(method).method(), method);
+        }
     }
 
     #[test]
     fn supports_osc9_for_supported_terminals() {
-        for name in [
-            TerminalName::Ghostty,
-            TerminalName::Iterm2,
-            TerminalName::Kitty,
-            TerminalName::WarpTerminal,
-            TerminalName::WezTerm,
+        for (name, limit) in [
+            (TerminalName::Ghostty, 255),
+            (TerminalName::Iterm2, usize::MAX),
+            (TerminalName::Kitty, usize::MAX),
+            (TerminalName::WarpTerminal, usize::MAX),
+            (TerminalName::WezTerm, usize::MAX),
         ] {
-            assert!(
-                supports_osc9(&test_terminal(name)),
-                "{name:?} should support OSC 9"
-            );
+            let caps = NotificationCapabilities::for_terminal(&test_terminal(name));
+            assert_eq!((caps.osc9, caps.max_body_bytes), (true, limit), "{name:?}");
         }
     }
 
@@ -126,7 +112,7 @@ mod tests {
             TerminalName::WindowsTerminal,
         ] {
             assert_eq!(
-                supports_osc9(&test_terminal(name)),
+                NotificationCapabilities::for_terminal(&test_terminal(name)).osc9,
                 false,
                 "{name:?} should not support OSC 9"
             );

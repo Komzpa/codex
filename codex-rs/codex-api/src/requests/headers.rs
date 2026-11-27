@@ -1,11 +1,36 @@
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSource;
+use codex_utils_string::to_ascii_json_string;
 use http::HeaderMap;
 use http::HeaderValue;
 
-pub fn build_conversation_headers(conversation_id: Option<String>) -> HeaderMap {
+pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+
+/// Correlate both the media call and its observer with the same thread and session tree.
+pub fn build_realtime_thread_headers(
+    session_id: String,
+    thread_id: String,
+    thread_source: Option<ThreadSource>,
+) -> HeaderMap {
+    let mut headers = build_session_headers(Some(session_id), Some(thread_id));
+    // Voice calls can span zero or many backing turns. Only the saved thread source applies.
+    if let Some(source) = thread_source
+        && source.as_str().len() <= 256
+        && let Ok(metadata) = to_ascii_json_string(&serde_json::json!({ "thread_source": source }))
+        && let Ok(value) = HeaderValue::from_str(&metadata)
+    {
+        headers.insert(X_CODEX_TURN_METADATA_HEADER, value);
+    }
+    headers
+}
+
+pub fn build_session_headers(session_id: Option<String>, thread_id: Option<String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if let Some(id) = conversation_id {
-        insert_header(&mut headers, "session_id", &id);
+    if let Some(id) = session_id {
+        insert_header(&mut headers, "session-id", &id);
+    }
+    if let Some(id) = thread_id {
+        insert_header(&mut headers, "thread-id", &id);
     }
     headers
 }

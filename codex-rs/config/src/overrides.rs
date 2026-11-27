@@ -1,3 +1,5 @@
+use crate::merge::merge_toml_values;
+use crate::merge::structured_feature_toggle_field;
 use toml::Value as TomlValue;
 
 pub(crate) fn default_empty_table() -> TomlValue {
@@ -18,13 +20,48 @@ fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) {
 
     let mut current = root;
     let mut segments_iter = path.split('.').peekable();
+    let mut traversed_segments = Vec::new();
 
     while let Some(segment) = segments_iter.next() {
+        traversed_segments.push(segment);
         let is_last = segments_iter.peek().is_none();
 
         if is_last {
             match current {
                 TomlValue::Table(table) => {
+                    if let Some(toggle_field) = structured_feature_toggle_field(&traversed_segments)
+                        && let Some(existing) = table.get_mut(segment)
+                    {
+                        match (&mut *existing, &value) {
+                            (TomlValue::Table(feature), TomlValue::Boolean(enabled)) => {
+                                feature
+                                    .insert(toggle_field.to_string(), TomlValue::Boolean(*enabled));
+                                return;
+                            }
+                            (TomlValue::Boolean(enabled), TomlValue::Table(_)) => {
+                                *existing = TomlValue::Table(Table::from_iter([(
+                                    toggle_field.to_string(),
+                                    TomlValue::Boolean(*enabled),
+                                )]));
+                                merge_toml_values(existing, &value);
+                                return;
+                            }
+                            (TomlValue::Table(_), TomlValue::Table(_)) => {
+                                merge_toml_values(existing, &value);
+                                return;
+                            }
+                            (
+                                TomlValue::String(_)
+                                | TomlValue::Integer(_)
+                                | TomlValue::Float(_)
+                                | TomlValue::Boolean(_)
+                                | TomlValue::Datetime(_)
+                                | TomlValue::Array(_)
+                                | TomlValue::Table(_),
+                                _,
+                            ) => {}
+                        }
+                    }
                     table.insert(segment.to_string(), value);
                 }
                 _ => {
@@ -41,6 +78,14 @@ fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) {
                 current = table
                     .entry(segment.to_string())
                     .or_insert_with(|| TomlValue::Table(Table::new()));
+                if let Some(toggle_field) = structured_feature_toggle_field(&traversed_segments)
+                    && let TomlValue::Boolean(enabled) = current
+                {
+                    *current = TomlValue::Table(Table::from_iter([(
+                        toggle_field.to_string(),
+                        TomlValue::Boolean(*enabled),
+                    )]));
+                }
             }
             _ => {
                 *current = TomlValue::Table(Table::new());

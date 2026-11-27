@@ -1,55 +1,167 @@
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Weak;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_utils_cache::BlockingLruCache;
-use codex_utils_cache::sha1_digest;
 use image::ColorType;
 use image::DynamicImage;
 use image::GenericImageView;
+use image::ImageDecoder;
 use image::ImageEncoder;
 use image::ImageFormat;
+use image::ImageReader;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
+
+const DATA_URL_PREFIX: &str = "data:";
+pub const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
 /// Maximum width or height used when resizing images before uploading.
 pub const MAX_DIMENSION: u32 = 2048;
+/// Maximum accepted byte length for prompt image input representations.
+///
+/// This is a high sanity guard against pathological inputs, not a protocol
+/// requirement or target upload size.
+pub const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+/// Use the same byte limit for input and output so a saved image fits on replay.
+/// At the pixel limit, 16-bit RGBA uses 81,920,000 bytes. Round up for PNG overhead.
+pub const MAX_SANITIZED_IMAGE_BYTES: usize = 79 * 1024 * 1024;
+const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub mod error;
+mod sanitizer;
 
 pub use crate::error::ImageProcessingError;
 
 #[derive(Debug, Clone)]
 pub struct EncodedImage {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
     pub mime: String,
+    pub source_width: u32,
+    pub source_height: u32,
     pub width: u32,
     pub height: u32,
 }
 
 impl EncodedImage {
     pub fn into_data_url(self) -> String {
-        let encoded = BASE64_STANDARD.encode(&self.bytes);
-        format!("data:{};base64,{encoded}", self.mime)
+        data_url_from_bytes(&self.mime, &self.bytes)
     }
+}
+
+/// Wraps image bytes in a data URL without decoding or validating them.
+pub fn data_url_from_bytes(mime: &str, bytes: &[u8]) -> String {
+    let encoded = BASE64_STANDARD.encode(bytes);
+    format!("data:{mime};base64,{encoded}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PromptImageMode {
     ResizeToFit,
     Original,
+    ResizeWithLimits(PromptImageResizeLimits),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PromptImageDecoder {
+    #[default]
+    Legacy,
+    Sanitizer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PromptImageResizeLimits {
+    pub max_dimension: u32,
+    pub max_patches: usize,
+}
+
+impl PromptImageMode {
+    /// Resize policy for high-detail prompt images.
+    pub const HIGH_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 2048,
+        max_patches: 2_500,
+    });
+    /// Resize policy for original-detail prompt images.
+    pub const ORIGINAL_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 6000,
+        max_patches: 10_000,
+    });
+}
+
+struct ImageMetadata {
+    icc_profile: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ImageCacheKey {
-    digest: [u8; 20],
+    // A hit can authorize reusing the supplied bytes, so the key must resist collisions.
+    digest: blake3::Hash,
     mode: PromptImageMode,
+    decoder: PromptImageDecoder,
 }
 
-static IMAGE_CACHE: LazyLock<BlockingLruCache<ImageCacheKey, EncodedImage>> =
+/// A source entry records a successful pixel decode that needed no resizing or re-encoding.
+/// Other results, including sanitized images, always retain the decoder's output.
+#[derive(Clone)]
+enum PreparedImage {
+    Source {
+        // The Vec's buffer is separate from the Arc allocation kept alive by this Weak.
+        bytes: Weak<Vec<u8>>,
+        format: ImageFormat,
+        width: u32,
+        height: u32,
+        encoded_len: usize,
+    },
+    Encoded(EncodedImage),
+}
+
+impl PreparedImage {
+    /// Count the full allocation for retained buffers. Source entries keep their
+    /// original encoded length for eviction even after the last caller drops the bytes.
+    fn cache_cost_bytes(&self) -> usize {
+        match self {
+            Self::Source { encoded_len, .. } => *encoded_len,
+            Self::Encoded(image) => image.bytes.capacity(),
+        }
+    }
+
+    /// Take the matching input buffer only if no caller still owns the source bytes.
+    /// Leave unused input with the caller so it can be freed outside the cache lock.
+    fn resolve(&mut self, source: &mut Vec<u8>) -> EncodedImage {
+        match self {
+            Self::Source {
+                bytes,
+                format,
+                width,
+                height,
+                ..
+            } => EncodedImage {
+                bytes: bytes.upgrade().unwrap_or_else(|| {
+                    let shared = Arc::new(std::mem::take(source));
+                    *bytes = Arc::downgrade(&shared);
+                    shared
+                }),
+                mime: format_to_mime(*format),
+                source_width: *width,
+                source_height: *height,
+                width: *width,
+                height: *height,
+            },
+            Self::Encoded(image) => image.clone(),
+        }
+    }
+}
+
+type ImageCache = BlockingLruCache<ImageCacheKey, PreparedImage>;
+
+static IMAGE_CACHE: LazyLock<ImageCache> =
     LazyLock::new(|| BlockingLruCache::new(NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN)));
 
 pub fn load_for_prompt_bytes(
@@ -57,65 +169,271 @@ pub fn load_for_prompt_bytes(
     file_bytes: Vec<u8>,
     mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
-    let path_buf = path.to_path_buf();
+    load_for_prompt_bytes_with_decoder(path, file_bytes, mode, PromptImageDecoder::Legacy)
+}
 
+fn load_for_prompt_bytes_with_decoder(
+    path: &Path,
+    mut file_bytes: Vec<u8>,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
     let key = ImageCacheKey {
-        digest: sha1_digest(&file_bytes),
+        digest: blake3::hash(&file_bytes),
         mode,
+        decoder,
     };
 
-    IMAGE_CACHE.get_or_try_insert_with(key, move || {
-        let format = match image::guess_format(&file_bytes) {
-            Ok(ImageFormat::Png) => Some(ImageFormat::Png),
-            Ok(ImageFormat::Jpeg) => Some(ImageFormat::Jpeg),
-            Ok(ImageFormat::Gif) => Some(ImageFormat::Gif),
-            Ok(ImageFormat::WebP) => Some(ImageFormat::WebP),
-            _ => None,
-        };
+    if let Some(image) = IMAGE_CACHE.with_mut(|cache| {
+        cache
+            .get_mut(&key)
+            .map(|entry| entry.resolve(&mut file_bytes))
+    }) {
+        return Ok(image);
+    }
 
-        let dynamic = image::load_from_memory(&file_bytes)
-            .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
+    let image = prepare_for_prompt(path, &file_bytes, mode, decoder)?;
+    Ok(cache_image(
+        &IMAGE_CACHE,
+        key,
+        image,
+        file_bytes,
+        MAX_IMAGE_CACHE_BYTES,
+    ))
+}
 
-        let (width, height) = dynamic.dimensions();
+/// Validate the pixels before deciding whether the caller can reuse the source bytes.
+fn prepare_for_prompt(
+    path: &Path,
+    file_bytes: &[u8],
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<PreparedImage, ImageProcessingError> {
+    if decoder == PromptImageDecoder::Sanitizer {
+        return sanitizer::sanitize(path, file_bytes, mode).map(PreparedImage::Encoded);
+    }
+    let guessed_format = image::guess_format(file_bytes)
+        .map_err(|source| ImageProcessingError::decode_error(path, source))?;
+    let mut decoder = ImageReader::with_format(Cursor::new(file_bytes), guessed_format)
+        .into_decoder()
+        .map_err(|source| ImageProcessingError::decode_error(path, source))?;
+    // Preserve the metadata most important for rendering prompt images faithfully: the color
+    // profile and EXIF data, including orientation. Other format-specific metadata is
+    // intentionally not copied.
+    let metadata = ImageMetadata {
+        // Only RGB profiles are safe across every re-encoding path. For example, JPEG decoding
+        // can convert CMYK/YCCK pixels to RGB while retaining the source profile; copying it
+        // would mislabel the output. Bytes 16..20 are the ICC data color space signature.
+        icc_profile: decoder
+            .icc_profile()
+            .ok()
+            .flatten()
+            .filter(|profile| profile.get(16..20) == Some(b"RGB ")),
+        exif: decoder.exif_metadata().ok().flatten(),
+    };
+    let dynamic = DynamicImage::from_decoder(decoder)
+        .map_err(|source| ImageProcessingError::decode_error(path, source))?;
 
-        let encoded = if mode == PromptImageMode::Original
-            || (width <= MAX_DIMENSION && height <= MAX_DIMENSION)
-        {
-            if let Some(format) = format.filter(|format| can_preserve_source_bytes(*format)) {
-                let mime = format_to_mime(format);
-                EncodedImage {
-                    bytes: file_bytes,
-                    mime,
-                    width,
-                    height,
-                }
-            } else {
-                let (bytes, output_format) = encode_image(&dynamic, ImageFormat::Png)?;
-                let mime = format_to_mime(output_format);
-                EncodedImage {
-                    bytes,
-                    mime,
-                    width,
-                    height,
-                }
-            }
-        } else {
-            let resized = dynamic.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
-            let target_format = format
-                .filter(|format| can_preserve_source_bytes(*format))
-                .unwrap_or(ImageFormat::Png);
-            let (bytes, output_format) = encode_image(&resized, target_format)?;
-            let mime = format_to_mime(output_format);
-            EncodedImage {
-                bytes,
-                mime,
-                width: resized.width(),
-                height: resized.height(),
-            }
-        };
+    let (width, height) = dynamic.dimensions();
 
-        Ok(encoded)
+    let resized = resize_for_prompt(&dynamic, mode);
+    let target_format = if can_preserve_source_bytes(guessed_format) {
+        if resized.is_none() {
+            return Ok(PreparedImage::Source {
+                bytes: Weak::new(),
+                format: guessed_format,
+                width,
+                height,
+                encoded_len: file_bytes.len(),
+            });
+        }
+        guessed_format
+    } else {
+        ImageFormat::Png
+    };
+    let output = resized.as_ref().unwrap_or(&dynamic);
+    let (bytes, output_format) = encode_image(output, target_format, metadata)?;
+    Ok(PreparedImage::Encoded(EncodedImage {
+        bytes: Arc::new(bytes),
+        mime: format_to_mime(output_format),
+        source_width: width,
+        source_height: height,
+        width: output.width(),
+        height: output.height(),
+    }))
+}
+
+fn cache_image(
+    cache: &ImageCache,
+    key: ImageCacheKey,
+    mut entry: PreparedImage,
+    mut source: Vec<u8>,
+    byte_capacity: usize,
+) -> EncodedImage {
+    if entry.cache_cost_bytes() > byte_capacity {
+        return entry.resolve(&mut source);
+    }
+
+    cache.with_mut(|cache| {
+        // Another caller may have inserted the same image while we decoded it.
+        if let Some(existing) = cache.get_mut(&key) {
+            return existing.resolve(&mut source);
+        }
+        let image = entry.resolve(&mut source);
+        cache.put(key, entry);
+        let mut cached_bytes = cache
+            .iter()
+            .map(|(_, image)| image.cache_cost_bytes())
+            .sum::<usize>();
+        while cached_bytes > byte_capacity {
+            let Some((_, evicted)) = cache.pop_lru() else {
+                break;
+            };
+            cached_bytes -= evicted.cache_cost_bytes();
+        }
+        image
     })
+}
+
+pub fn load_data_url_for_prompt(
+    image_url: &str,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
+    let bytes = decode_data_url(image_url, decoder)?;
+    load_for_prompt_bytes_with_decoder(Path::new("<data-url-image>"), bytes, mode, decoder)
+}
+
+pub fn load_data_url_for_prompt_uncached(
+    image_url: &str,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
+    let mut bytes = decode_data_url(image_url, decoder)?;
+    Ok(
+        prepare_for_prompt(Path::new("<data-url-image>"), &bytes, mode, decoder)?
+            .resolve(&mut bytes),
+    )
+}
+
+fn decode_data_url(
+    image_url: &str,
+    decoder: PromptImageDecoder,
+) -> Result<Vec<u8>, ImageProcessingError> {
+    let rest = image_url
+        .get(..DATA_URL_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(DATA_URL_PREFIX))
+        .and_then(|_| image_url.get(DATA_URL_PREFIX.len()..))
+        .ok_or_else(|| ImageProcessingError::InvalidDataUrl {
+            reason: "missing data: prefix".to_string(),
+        })?;
+    let (metadata, encoded) =
+        rest.split_once(',')
+            .ok_or_else(|| ImageProcessingError::InvalidDataUrl {
+                reason: "missing comma separator".to_string(),
+            })?;
+    if !metadata
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return Err(ImageProcessingError::InvalidDataUrl {
+            reason: "only base64 data URLs are supported".to_string(),
+        });
+    }
+
+    let (max_bytes, max_base64_bytes) = match decoder {
+        PromptImageDecoder::Legacy => (MAX_PROMPT_IMAGE_INPUT_BYTES, MAX_PROMPT_IMAGE_INPUT_BYTES),
+        PromptImageDecoder::Sanitizer => (
+            MAX_SANITIZED_IMAGE_BYTES,
+            MAX_SANITIZED_IMAGE_BYTES.div_ceil(3) * 4,
+        ),
+    };
+    if encoded.len() > max_base64_bytes {
+        return Err(ImageProcessingError::ImageTooLarge {
+            representation: "base64 payload",
+            size: encoded.len(),
+            max: max_base64_bytes,
+        });
+    }
+    let file_bytes =
+        BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|source| ImageProcessingError::InvalidDataUrl {
+                reason: format!("invalid base64 payload: {source}"),
+            })?;
+    if file_bytes.len() > max_bytes {
+        return Err(ImageProcessingError::ImageTooLarge {
+            representation: "decoded input",
+            size: file_bytes.len(),
+            max: max_bytes,
+        });
+    }
+
+    Ok(file_bytes)
+}
+
+fn resize_for_prompt(image: &DynamicImage, mode: PromptImageMode) -> Option<DynamicImage> {
+    let (width, height) = image.dimensions();
+    match mode {
+        PromptImageMode::ResizeToFit if width > MAX_DIMENSION || height > MAX_DIMENSION => {
+            Some(image.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle))
+        }
+        PromptImageMode::ResizeWithLimits(limits) => {
+            let (target_width, target_height) =
+                prompt_image_output_dimensions_for_limits(width, height, limits);
+            if (target_width, target_height) == (width, height) {
+                return None;
+            }
+            Some(image.resize_exact(target_width, target_height, FilterType::Triangle))
+        }
+        PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
+    }
+}
+
+fn prompt_image_output_dimensions_for_limits(
+    width: u32,
+    height: u32,
+    limits: PromptImageResizeLimits,
+) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    if prompt_image_dimensions_fit(width, height, limits) {
+        return (width, height);
+    }
+
+    let max_dimension_scale =
+        (f64::from(limits.max_dimension) / f64::from(width.max(height))).min(1.0);
+    let width = ((f64::from(width) * max_dimension_scale).round() as u32).max(1);
+    let height = ((f64::from(height) * max_dimension_scale).round() as u32).max(1);
+    if prompt_image_dimensions_fit(width, height, limits) {
+        return (width, height);
+    }
+
+    let width_f64 = f64::from(width);
+    let height_f64 = f64::from(height);
+    let patch_size = f64::from(PROMPT_IMAGE_PATCH_SIZE);
+    let mut scale =
+        (patch_size * patch_size * limits.max_patches as f64 / width_f64 / height_f64).sqrt();
+    // Match Responses patch-budget math: shrink by area, then round the scaled
+    // patch grid down so integer output dimensions remain within the budget.
+    let scaled_patches_wide = width_f64 * scale / patch_size;
+    let scaled_patches_high = height_f64 * scale / patch_size;
+    scale *= (scaled_patches_wide.floor() / scaled_patches_wide)
+        .min(scaled_patches_high.floor() / scaled_patches_high);
+
+    (
+        ((width_f64 * scale).floor() as u32).max(1),
+        ((height_f64 * scale).floor() as u32).max(1),
+    )
+}
+
+fn prompt_image_dimensions_fit(width: u32, height: u32, limits: PromptImageResizeLimits) -> bool {
+    let patches_wide = width.div_ceil(PROMPT_IMAGE_PATCH_SIZE);
+    let patches_high = height.div_ceil(PROMPT_IMAGE_PATCH_SIZE);
+    let patch_count = u64::from(patches_wide) * u64::from(patches_high);
+    width <= limits.max_dimension
+        && height <= limits.max_dimension
+        && patch_count <= limits.max_patches as u64
 }
 
 fn can_preserve_source_bytes(format: ImageFormat) -> bool {
@@ -130,6 +448,7 @@ fn can_preserve_source_bytes(format: ImageFormat) -> bool {
 fn encode_image(
     image: &DynamicImage,
     preferred_format: ImageFormat,
+    metadata: ImageMetadata,
 ) -> Result<(Vec<u8>, ImageFormat), ImageProcessingError> {
     let target_format = match preferred_format {
         ImageFormat::Jpeg => ImageFormat::Jpeg,
@@ -138,11 +457,13 @@ fn encode_image(
     };
 
     let mut buffer = Vec::new();
+    let ImageMetadata { icc_profile, exif } = metadata;
 
     match target_format {
         ImageFormat::Png => {
             let rgba = image.to_rgba8();
-            let encoder = PngEncoder::new(&mut buffer);
+            let mut encoder = PngEncoder::new(&mut buffer);
+            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
             encoder
                 .write_image(
                     rgba.as_raw(),
@@ -157,6 +478,7 @@ fn encode_image(
         }
         ImageFormat::Jpeg => {
             let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
+            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
             encoder
                 .encode_image(image)
                 .map_err(|source| ImageProcessingError::Encode {
@@ -166,7 +488,8 @@ fn encode_image(
         }
         ImageFormat::WebP => {
             let rgba = image.to_rgba8();
-            let encoder = WebPEncoder::new_lossless(&mut buffer);
+            let mut encoder = WebPEncoder::new_lossless(&mut buffer);
+            apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
             encoder
                 .write_image(
                     rgba.as_raw(),
@@ -185,6 +508,31 @@ fn encode_image(
     Ok((buffer, target_format))
 }
 
+fn apply_image_metadata(
+    encoder: &mut impl ImageEncoder,
+    icc_profile: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+    format: ImageFormat,
+) -> Result<(), ImageProcessingError> {
+    if let Some(icc_profile) = icc_profile {
+        encoder
+            .set_icc_profile(icc_profile)
+            .map_err(|source| ImageProcessingError::Encode {
+                format,
+                source: image::ImageError::Unsupported(source),
+            })?;
+    }
+    if let Some(exif) = exif {
+        encoder
+            .set_exif_metadata(exif)
+            .map_err(|source| ImageProcessingError::Encode {
+                format,
+                source: image::ImageError::Unsupported(source),
+            })?;
+    }
+    Ok(())
+}
+
 fn format_to_mime(format: ImageFormat) -> String {
     match format {
         ImageFormat::Jpeg => "image/jpeg".to_string(),
@@ -195,155 +543,5 @@ fn format_to_mime(format: ImageFormat) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use super::*;
-    use image::GenericImageView;
-    use image::ImageBuffer;
-    use image::Rgba;
-
-    fn image_bytes(image: &ImageBuffer<Rgba<u8>, Vec<u8>>, format: ImageFormat) -> Vec<u8> {
-        let mut encoded = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image.clone())
-            .write_to(&mut encoded, format)
-            .expect("encode image to bytes");
-        encoded.into_inner()
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn returns_original_image_when_within_bounds() {
-        for (format, mime) in [
-            (ImageFormat::Png, "image/png"),
-            (ImageFormat::WebP, "image/webp"),
-        ] {
-            let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
-            let original_bytes = image_bytes(&image, format);
-
-            let encoded = load_for_prompt_bytes(
-                Path::new("in-memory-image"),
-                original_bytes.clone(),
-                PromptImageMode::ResizeToFit,
-            )
-            .expect("process image");
-
-            assert_eq!(encoded.width, 64);
-            assert_eq!(encoded.height, 32);
-            assert_eq!(encoded.mime, mime);
-            assert_eq!(encoded.bytes, original_bytes);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn downscales_large_image() {
-        for (format, mime) in [
-            (ImageFormat::Png, "image/png"),
-            (ImageFormat::WebP, "image/webp"),
-        ] {
-            let image = ImageBuffer::from_pixel(4096, 2048, Rgba([200u8, 10, 10, 255]));
-            let original_bytes = image_bytes(&image, format);
-
-            let processed = load_for_prompt_bytes(
-                Path::new("in-memory-image"),
-                original_bytes,
-                PromptImageMode::ResizeToFit,
-            )
-            .expect("process image");
-
-            assert!(processed.width <= MAX_DIMENSION);
-            assert!(processed.height <= MAX_DIMENSION);
-            assert_eq!(processed.mime, mime);
-
-            let detected_format =
-                image::guess_format(&processed.bytes).expect("detect resized output format");
-            assert_eq!(detected_format, format);
-
-            let loaded = image::load_from_memory(&processed.bytes)
-                .expect("read resized bytes back into image");
-            assert_eq!(loaded.dimensions(), (processed.width, processed.height));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn downscales_tall_image_to_fit_square_bounds() {
-        let image = ImageBuffer::from_pixel(1024, 4096, Rgba([200u8, 10, 10, 255]));
-        let original_bytes = image_bytes(&image, ImageFormat::Png);
-
-        let processed = load_for_prompt_bytes(
-            Path::new("in-memory-image"),
-            original_bytes,
-            PromptImageMode::ResizeToFit,
-        )
-        .expect("process image");
-
-        assert_eq!(processed.width, 512);
-        assert_eq!(processed.height, MAX_DIMENSION);
-        assert_eq!(processed.mime, "image/png");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn preserves_large_image_in_original_mode() {
-        let image = ImageBuffer::from_pixel(4096, 2048, Rgba([180u8, 30, 30, 255]));
-        let original_bytes = image_bytes(&image, ImageFormat::Png);
-
-        let processed = load_for_prompt_bytes(
-            Path::new("in-memory-image"),
-            original_bytes.clone(),
-            PromptImageMode::Original,
-        )
-        .expect("process image");
-
-        assert_eq!(processed.width, 4096);
-        assert_eq!(processed.height, 2048);
-        assert_eq!(processed.mime, "image/png");
-        assert_eq!(processed.bytes, original_bytes);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fails_cleanly_for_invalid_images() {
-        let err = load_for_prompt_bytes(
-            Path::new("in-memory-image"),
-            b"not an image".to_vec(),
-            PromptImageMode::ResizeToFit,
-        )
-        .expect_err("invalid image should fail");
-        assert!(matches!(
-            err,
-            ImageProcessingError::Decode { .. }
-                | ImageProcessingError::UnsupportedImageFormat { .. }
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reprocesses_updated_file_contents() {
-        {
-            IMAGE_CACHE.clear();
-        }
-
-        let first_image = ImageBuffer::from_pixel(32, 16, Rgba([20u8, 120, 220, 255]));
-        let first_bytes = image_bytes(&first_image, ImageFormat::Png);
-
-        let first = load_for_prompt_bytes(
-            Path::new("in-memory-image"),
-            first_bytes,
-            PromptImageMode::ResizeToFit,
-        )
-        .expect("process first image");
-
-        let second_image = ImageBuffer::from_pixel(96, 48, Rgba([50u8, 60, 70, 255]));
-        let second_bytes = image_bytes(&second_image, ImageFormat::Png);
-
-        let second = load_for_prompt_bytes(
-            Path::new("in-memory-image"),
-            second_bytes,
-            PromptImageMode::ResizeToFit,
-        )
-        .expect("process updated image");
-
-        assert_eq!(first.width, 32);
-        assert_eq!(first.height, 16);
-        assert_eq!(second.width, 96);
-        assert_eq!(second.height, 48);
-        assert_ne!(second.bytes, first.bytes);
-    }
-}
+#[path = "image_tests.rs"]
+mod tests;

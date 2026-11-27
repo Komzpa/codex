@@ -1,6 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -14,6 +14,7 @@ use codex_app_server_protocol::FsWatchResponse;
 use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
+use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -35,14 +36,18 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn initialized_mcp(codex_home: &TempDir) -> Result<McpProcess> {
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+async fn initialized_mcp(codex_home: &TempDir) -> Result<TestAppServer> {
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     Ok(mcp)
 }
 
 async fn expect_error_message(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     request_id: i64,
     expected_message: &str,
 ) -> Result<()> {
@@ -55,7 +60,6 @@ async fn expect_error_message(
     Ok(())
 }
 
-#[allow(clippy::expect_used)]
 fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
     assert!(
         path.is_absolute(),
@@ -66,7 +70,7 @@ fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
+async fn fs_get_metadata_returns_file_size() -> Result<()> {
     let codex_home = TempDir::new()?;
     let file_path = codex_home.path().join("note.txt");
     std::fs::write(&file_path, "hello")?;
@@ -83,23 +87,6 @@ async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
     )
     .await??;
 
-    let result = response
-        .result
-        .as_object()
-        .context("fs/getMetadata result should be an object")?;
-    let mut keys = result.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(
-        keys,
-        vec![
-            "createdAtMs".to_string(),
-            "isDirectory".to_string(),
-            "isFile".to_string(),
-            "isSymlink".to_string(),
-            "modifiedAtMs".to_string(),
-        ]
-    );
-
     let stat: FsGetMetadataResponse = to_response(response)?;
     assert_eq!(
         stat,
@@ -109,12 +96,48 @@ async fn fs_get_metadata_returns_only_used_fields() -> Result<()> {
             is_symlink: false,
             created_at_ms: stat.created_at_ms,
             modified_at_ms: stat.modified_at_ms,
+            size_bytes: Some(5),
         }
     );
     assert!(
         stat.modified_at_ms > 0,
         "modifiedAtMs should be populated for existing files"
     );
+
+    let request_id = mcp
+        .send_fs_get_metadata_request(codex_app_server_protocol::FsGetMetadataParams {
+            path: absolute_path(codex_home.path().to_path_buf()),
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(response.result.get("sizeBytes"), Some(&json!(null)));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_methods_return_error_when_local_environment_is_disabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let absolute_file = codex_home.path().join("absolute.txt");
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let read_id = mcp
+        .send_fs_read_file_request(codex_app_server_protocol::FsReadFileParams {
+            path: absolute_path(absolute_file),
+        })
+        .await?;
+    expect_error_message(&mut mcp, read_id, "local filesystem is not configured").await?;
 
     Ok(())
 }
@@ -141,9 +164,16 @@ async fn fs_get_metadata_reports_symlink() -> Result<()> {
     .await??;
 
     let stat: FsGetMetadataResponse = to_response(response)?;
-    assert_eq!(stat.is_directory, false);
-    assert_eq!(stat.is_file, true);
-    assert_eq!(stat.is_symlink, true);
+    assert_eq!(
+        stat,
+        FsGetMetadataResponse {
+            is_directory: false,
+            is_file: true,
+            is_symlink: true,
+            size_bytes: Some(5),
+            ..stat
+        }
+    );
 
     Ok(())
 }
@@ -830,7 +860,7 @@ fn fs_changed_notification(notification: JSONRPCNotification) -> Result<FsChange
 }
 
 async fn maybe_fs_changed_notification(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
 ) -> Result<Option<FsChangedNotification>> {
     match timeout(
         OPTIONAL_FS_CHANGE_TIMEOUT,

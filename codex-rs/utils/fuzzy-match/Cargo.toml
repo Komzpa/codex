@@ -6,3 +6,9 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+nucleo = { workspace = true }
